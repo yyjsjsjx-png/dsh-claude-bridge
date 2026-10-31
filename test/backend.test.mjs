@@ -12,6 +12,31 @@ import { createHash } from 'node:crypto'
 
 const provider = 'claude-sdk-remote'
 
+test('上下文默认值仅本设备持久保存，下轮透传且旧服务器明确拒绝自定义值', async t => {
+  const requests = []
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { autoCompactWindow: true } }
+    requests.push(params)
+    return { sessionId: params.sessionId, status: 'completed' }
+  } }, async close() {} }))
+  await f.backend.state.ready
+  assert.deepEqual(f.backend.contextPreferences(), { autoCompactWindowTokens: null })
+  await f.backend.saveContextPreferences({ autoCompactWindowTokens: 200000 })
+  const restored = new BridgeState(f.backend.directory)
+  await restored.ready
+  assert.equal(restored.value.contextPreferences.autoCompactWindowTokens, 200000)
+  const other = await fixture(t, async () => { throw new Error('不需要连接') })
+  await other.backend.state.ready
+  assert.equal(other.backend.contextPreferences().autoCompactWindowTokens, null)
+  await assert.rejects(f.backend.saveContextPreferences({ autoCompactWindowTokens: 99999 }), { code: 'INVALID_CONTEXT_PREFERENCES' })
+  await f.backend.runStep(f.agent, f.decision)
+  assert.deepEqual(requests[0].contextPreferences, { autoCompactWindowTokens: 200000 })
+  f.backend.initialized = { capabilities: {} }
+  assert.throws(() => f.backend.contextRequestPreferences(), { code: 'CONTEXT_SETTINGS_UNSUPPORTED' })
+  await f.backend.saveContextPreferences({ autoCompactWindowTokens: null })
+  assert.deepEqual(f.backend.contextRequestPreferences(), {})
+})
+
 test('清除连接关闭传输并保留设备和会话；活动任务、准备阶段和历史同步均拒绝清除', async t => {
   let closed = 0, cleared = 0, release
   const f = await fixture(t, async () => ({ peer: { async request() { return { protocolVersion: 1, authenticated: true } } },

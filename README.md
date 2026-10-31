@@ -43,7 +43,7 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.1
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.2
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
@@ -53,10 +53,10 @@
 已有安装可保留数据原地升级。完全退出 DSH 后，在 PowerShell 执行一行：
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
 ```
 
-也可下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.1/dsh-claude-bridge-0.2.1.zip)，解压后双击 **`更新插件.cmd`**。请保留安装目录。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
+也可下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.2/dsh-claude-bridge-0.2.2.zip)，解压后双击 **`更新插件.cmd`**。请保留安装目录。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
 
 设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销你其他设备上保存的同一口令。
 
@@ -72,10 +72,12 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.1
+dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.2
 ```
 
 ## 版本说明
+
+v0.2.2 修复中文界面的插件详情语言匹配，在在线更新命令下载前启用 TLS 1.2，并新增“上下文与自动压缩”设置：跟随模型默认，或指定本设备全部远程会话共用的自动压缩窗口。自定义窗口需要同步更新服务器代码。
 
 v0.2.1 为插件包及五个组件补齐中英文名称、用途和图标，并提供 PowerShell 一行在线更新。客户端更新后生效，服务器无需升级。
 
@@ -88,6 +90,7 @@ v0.1.5 起服务器默认不再设置每轮 SDK 美元预算；仍运行 v0.1.4 
 - 本机 DSH 工具经结构化双向 RPC 提供给 SDK，保留原审批、提问、路径权限和取消。
 - 文本、图片附件、本机路径读图、思考摘要、模型和 effort 目录；模型列表可自行筛选。
 - 底栏精简上下文浮层、SDK 原生 `/compact`、5h 额度及明细浮层。周额度和专用额度仅在接口实际返回时显示；额度读取依赖 SDK 的实验接口，SDK 变化后可能不可用。
+- 自动压缩窗口可在插件设置中选择跟随模型默认，或设置 100,000–1,000,000 tokens。适用于本设备全部远程会话，从下一轮生效，不跨设备同步；实际窗口不超过模型自身上限。
 - 额度前台每 60 秒检查，自动请求至少间隔 30 秒，轮末延迟 3 秒；隐藏、离线暂停。失败退避，鉴权失效暂停；过期数据不继续显示。
 - 短断接回原 worker，按序补漏、确认和去重；本机工具等待连接恢复，离线停止优先。SSH 启动脚本只重建自己管理的转发。
 - Host、worker 或服务崩溃后，从 SDK 原生记录补齐云端尾部，核对本机已保存结果及匹配的云端工具回执。界面显示恢复情况，用户可直接发下一条消息。

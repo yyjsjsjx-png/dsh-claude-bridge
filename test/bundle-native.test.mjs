@@ -4,6 +4,7 @@ import { readFile, access, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promise
 import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import vm from 'node:vm'
 
 const native = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
 test('实际 rc5：标准 bundle 接受不同版本号并检查实际 Host 能力', { skip: !native }, async () => {
@@ -46,6 +47,13 @@ test('实际 rc5：包及五组件使用原生展示信息，客户端只由界�
   const boot = await import(pathToFileURL(join(base, 'dsh-app-boot/lib/index.js')).href)
   const { ClientModuleRegistry } = await import(pathToFileURL(join(base, 'dsh-client-modules/lib/index.js')).href)
   const { ModuleLoader } = await import(pathToFileURL(join(base, 'cordis-plugin-loader/lib/index.js')).href)
+  let localeEntry
+  vm.runInNewContext(await readFile(join(base, 'dsh-client-locale/lib/client.js'), 'utf8'), {
+    window: { __ModuleLoader__: { load: entry => { localeEntry = entry } } },
+  })
+  const { LocaleRuntime } = localeEntry.factory(() => ({}))
+  const locale = new LocaleRuntime({ emit: () => {} }, undefined, { languages: ['zh-CN'], preference: 'zh' })
+  assert.equal(locale.getSnapshot().active, 'zh')
   const parent = pathToFileURL(join(root, 'package.json')).href
   const rows = boot.composeEntries([boot.loadOverlayPatches('dsh', join(root, 'patches/bundle.patch.yml')).filter(row => row.insert)])
   const registry = Object.create(ClientModuleRegistry.prototype)
@@ -57,6 +65,13 @@ test('实际 rc5：包及五组件使用原生展示信息，客户端只由界�
     assert.ok(meta.title['zh-cn']?.length)
     assert.ok(meta.description['zh-cn']?.length)
     assert.ok(meta.title.en?.length)
+    const chinese = JSON.parse(await readFile(boot.resolvePluginResource(`${row.name}/locale/zh-CN.json`, parent), 'utf8')).meta
+    assert.equal(locale.resolveText(meta.title), chinese.title)
+    assert.equal(locale.resolveText(meta.description), chinese.description)
+    locale.setLocale('en')
+    assert.equal(locale.resolveText(meta.title), meta.title.en)
+    assert.equal(locale.resolveText(meta.description), meta.description.en)
+    locale.setLocale('zh')
     assert.match(meta.icon, /^data:image\/svg\+xml;base64,/)
     const client = registry.resolveMeta(row.name, parent)
     const originalUrl = pathToFileURL(boot.resolvePluginResource(row.name, parent)).href

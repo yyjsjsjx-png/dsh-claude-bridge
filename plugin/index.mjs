@@ -158,6 +158,7 @@ let ClaudeBridgeService = (() => {
     let _modelPreferences_decorators;
     let _visibleModels_decorators;
     let _saveModelPreferences_decorators;
+    let _saveContextPreferences_decorators;
     return class ClaudeBridgeService extends _classSuper {
         static {
             const _metadata = typeof Symbol === "function" && Symbol.metadata ? Object.create(_classSuper[Symbol.metadata] ?? null) : void 0;
@@ -170,6 +171,7 @@ let ClaudeBridgeService = (() => {
             _modelPreferences_decorators = [Remote('modelPreferences')];
             _visibleModels_decorators = [Remote('visibleModels')];
             _saveModelPreferences_decorators = [Remote('saveModelPreferences')];
+            _saveContextPreferences_decorators = [Remote('saveContextPreferences')];
             __esDecorate(this, null, _status_decorators, { kind: "method", name: "status", static: false, private: false, access: { has: obj => "status" in obj, get: obj => obj.status }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _saveConnection_decorators, { kind: "method", name: "saveConnection", static: false, private: false, access: { has: obj => "saveConnection" in obj, get: obj => obj.saveConnection }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _clearConnection_decorators, { kind: "method", name: "clearConnection", static: false, private: false, access: { has: obj => "clearConnection" in obj, get: obj => obj.clearConnection }, metadata: _metadata }, null, _instanceExtraInitializers);
@@ -179,6 +181,7 @@ let ClaudeBridgeService = (() => {
             __esDecorate(this, null, _modelPreferences_decorators, { kind: "method", name: "modelPreferences", static: false, private: false, access: { has: obj => "modelPreferences" in obj, get: obj => obj.modelPreferences }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _visibleModels_decorators, { kind: "method", name: "visibleModels", static: false, private: false, access: { has: obj => "visibleModels" in obj, get: obj => obj.visibleModels }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _saveModelPreferences_decorators, { kind: "method", name: "saveModelPreferences", static: false, private: false, access: { has: obj => "saveModelPreferences" in obj, get: obj => obj.saveModelPreferences }, metadata: _metadata }, null, _instanceExtraInitializers);
+            __esDecorate(this, null, _saveContextPreferences_decorators, { kind: "method", name: "saveContextPreferences", static: false, private: false, access: { has: obj => "saveContextPreferences" in obj, get: obj => obj.saveContextPreferences }, metadata: _metadata }, null, _instanceExtraInitializers);
             if (_metadata) Object.defineProperty(this, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });
         }
         static inject = ['tools', 'systemPrompt', 'sessions', 'llm', 'approval', 'fs',
@@ -317,6 +320,10 @@ let ClaudeBridgeService = (() => {
             await this.backend.saveModelPreferences(value);
             this.catalogRegistration?.replace?.([CLAUDE_PROVIDER]);
             return { saved: true };
+        }
+        async saveContextPreferences(value) {
+            this.assertOwner();
+            return this.backend.saveContextPreferences(value);
         }
     };
 })();

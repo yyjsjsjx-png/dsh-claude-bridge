@@ -10,6 +10,7 @@ import { sdkErrorDetail } from './errors.mjs'
 import { createHistoryReader, createRunStore } from './history.mjs'
 import { createDiagnostics } from '../src/diagnostics.mjs'
 import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
+import { validateContextPreferences } from '../src/context-preferences.mjs'
 
 const MAX_PROMPT_BYTES = 3 * 1024 * 1024
 const MAX_INSTRUCTION_BYTES = 1024 * 1024
@@ -425,6 +426,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         perDeviceSessions: true,
         contextSummary: true,
         manualCompact: true,
+        autoCompactWindow: true,
         planUsage: true,
         historySync: typeof sdk.getSessionMessages === 'function',
         nativeFileAndShellTools: false,
@@ -501,12 +503,15 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     }
     try {
       requireObject(params, '请求')
-      const allowedKeys = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action'])
+      const allowedKeys = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences'])
       if (Object.keys(params).some((key) => !allowedKeys.has(key))) {
         throw new WorkerError('UNSUPPORTED_REQUEST_FIELD', '请求包含暂不支持的字段')
       }
       if (params.action !== undefined && params.action !== 'compact') throw new WorkerError('UNSUPPORTED_ACTION', '不支持该会话操作')
       const compact = params.action === 'compact'
+      let contextPreferences
+      try { contextPreferences = validateContextPreferences(params.contextPreferences) }
+      catch (error) { throw new WorkerError(error.code, error.message) }
       if (compact && (params.resume !== true || ['prompt', 'systemPrompt', 'instructions', 'tools', 'maxTurns'].some(key => params[key] !== undefined))) {
         throw new WorkerError('INVALID_COMPACT_REQUEST', '主动压缩只能操作已有 SDK 会话，不接受自定义消息、工具或提示词')
       }
@@ -858,7 +863,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         const sdkOptions = {
           cwd,
           pathToClaudeCodeExecutable: cliPath,
-          env: childEnv,
+          env: { ...childEnv, ...(contextPreferences.autoCompactWindowTokens === null ? {} : {
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(contextPreferences.autoCompactWindowTokens),
+          }) },
           settingSources: [],
           strictMcpConfig: true,
           verbatimPrompts: !compact,

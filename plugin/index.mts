@@ -266,6 +266,12 @@ export class ClaudeBridgeService extends TypertRemoteService {
     this.catalogRegistration?.replace?.([CLAUDE_PROVIDER]);
     return { saved: true };
   }
+
+  @Remote('saveContextPreferences')
+  async saveContextPreferences(value) {
+    this.assertOwner();
+    return this.backend.saveContextPreferences(value);
+  }
 }
 
 export default ClaudeBridgeService;

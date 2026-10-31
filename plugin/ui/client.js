@@ -255,6 +255,10 @@ exports.apply = async function apply(ctx) {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ModelPreferences',
       create: () => z.object({ enabledIds: z.array(z.string().min(1)) }),
     } }]),
+    descriptor('saveContextPreferences', [{ name: 'value', wire: 'value', source: 'json', codec: {
+      mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ContextPreferences',
+      create: () => z.object({ autoCompactWindowTokens: z.number().int().min(100000).max(1000000).nullable() }),
+    } }]),
   ] });
   // This namespace is created by the mount above, so declaring it in the
   // outer inject list would deadlock. Its child scope owns every UI closure.
@@ -280,7 +284,8 @@ exports.apply = async function apply(ctx) {
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
-    modelError: '', usingModelDefaults: true });
+    modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
+    contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
   let generation = 0;
   let disposed = false;
   let modelRequest;
@@ -361,10 +366,13 @@ exports.apply = async function apply(ctx) {
   let statusRequest;
   let statusGeneration = 0;
   let urlEdited = false;
+  let contextEdited = false;
+  let contextRevision = 0;
   function readStatus(force = false) {
     if (!force && settingsStore.getSnapshot().busy) return Promise.resolve();
     if (statusRequest) return statusRequest;
     const generation = statusGeneration;
+    const contextGeneration = contextRevision;
     const request = (async () => {
       try {
         const response = await ctx.remote.claudeBridge.status();
@@ -375,7 +383,10 @@ exports.apply = async function apply(ctx) {
           connected: status.connected === true, authentication: status.authentication ?? 'unknown',
           compatibility: status.compatibility ?? [], disabledFeatures: status.disabledFeatures ?? [],
           convertedFeatures: status.convertedFeatures ?? [], activeRuns: status.activeRuns ?? 0,
-          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '' });
+          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
+          autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
+          ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
+            contextWindow: String(status.contextPreferences?.autoCompactWindowTokens ?? 200000), contextDirty: false } : {}) });
       } catch (error) {
         if (!disposed && generation === statusGeneration) updateSettings({ statusError: textError(error) });
       }
@@ -471,6 +482,31 @@ exports.apply = async function apply(ctx) {
       await loadModelPreferences(true);
       updateSettings({ message: '模型显示设置已保存。' });
     } catch (error) { updateSettings({ modelError: textError(error) }); }
+    finally { updateSettings({ busy: false }); }
+  }
+
+  function editContext(patch) {
+    contextEdited = true;
+    contextRevision++;
+    updateSettings({ ...patch, contextDirty: true, contextError: '', contextMessage: '' });
+  }
+
+  async function saveContextPreferences() {
+    const state = settingsStore.getSnapshot();
+    if (state.busy) return;
+    const tokens = state.contextMode === 'default' ? null : Number(state.contextWindow);
+    if (tokens !== null && (!/^\d+$/.test(state.contextWindow) || !Number.isSafeInteger(tokens) || tokens < 100000 || tokens > 1000000)) {
+      updateSettings({ contextError: '请输入 100,000–1,000,000 之间的整数。' }); return;
+    }
+    updateSettings({ busy: true, contextError: '', contextMessage: '' });
+    try {
+      const response = await ctx.remote.claudeBridge.saveContextPreferences({ autoCompactWindowTokens: tokens });
+      if (!response.ok) throw new Error(response.error.message);
+      contextEdited = false;
+      updateSettings({ contextMode: tokens === null ? 'default' : 'custom', contextWindow: String(tokens ?? 200000), contextDirty: false });
+      await readStatus(true);
+      updateSettings({ contextMessage: '已保存；从下一轮远程会话运行起生效。' });
+    } catch (error) { updateSettings({ contextError: textError(error) }); }
     finally { updateSettings({ busy: false }); }
   }
 
@@ -799,7 +835,8 @@ exports.apply = async function apply(ctx) {
         onClick: () => { void submit(); } }, state.busy ? '正在创建…' : '创建'))));
   }
 
-  function Settings({ useSettings, editUrl, save, clear, refresh, refreshStatus, loadModels, toggleVisibleModel, saveModels }) {
+  function Settings({ useSettings, editUrl, save, clear, refresh, refreshStatus, loadModels, toggleVisibleModel, saveModels,
+    editContextMode, editContextWindow, saveContext }) {
     const state = useSettings(value => value);
     const [token, setToken] = React.useState('');
     React.useEffect(() => { if (state.configured) void loadModels(); }, [state.configured, loadModels]);
@@ -895,6 +932,25 @@ exports.apply = async function apply(ctx) {
           && h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', disabled: state.busy,
             onClick: () => { void loadModels(); } }, '读取模型列表'))),
       h('div', { className: 'dcb-card' },
+        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '上下文与自动压缩'),
+          h('span', { className: 'dcb-card-meta' }, '本设备全部远程会话')),
+        h('p', { className: 'dcb-card-desc' }, '设置各模型共用的自动压缩窗口，由服务器上的 Claude 原生压缩。保存后从下一轮起生效，当前运行继续使用原设置。'),
+        h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '自动压缩方式'),
+          h('select', { className: 'dcb-input', value: state.contextMode, disabled: state.busy,
+            onChange: event => editContextMode(event.target.value) },
+          h('option', { value: 'default' }, '跟随模型默认'), h('option', { value: 'custom' }, '自定义压缩窗口'))),
+        state.contextMode === 'custom' && h('label', { className: 'dcb-field' },
+          h('span', { className: 'dcb-label' }, '自动压缩窗口（tokens）'),
+          h('input', { className: 'dcb-input', type: 'number', inputMode: 'numeric', min: 100000, max: 1000000, step: 1000,
+            value: state.contextWindow, disabled: state.busy, onChange: event => editContextWindow(event.target.value) }),
+          h('span', { className: 'dcb-hint' }, '支持 100,000–1,000,000 tokens，例如 200,000。实际窗口不超过模型自身上限；底栏百分比仍按 SDK 返回的模型上下文统计。')),
+        state.autoCompactWindowSupported === false && h('p', { className: 'dcb-notice' }, '当前服务器需要更新后才能使用自定义窗口；跟随模型默认仍可用。'),
+        h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', 'data-variant': 'primary',
+          disabled: state.busy || !state.contextDirty || (state.contextMode === 'custom' && state.autoCompactWindowSupported === false),
+          onClick: () => { void saveContext(); } }, '保存上下文设置')),
+        state.contextMessage && h('p', { role: 'status', className: 'dcb-notice' }, state.contextMessage),
+        state.contextError && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.contextError)),
+      h('div', { className: 'dcb-card' },
         h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '本设备用量'),
           h('span', { className: 'dcb-card-meta' }, '本设备统计，不是账单')),
         state.activeRuns > 0 && h('p', { role: 'status', className: 'dcb-notice' }, `正在执行 ${displayNumber(state.activeRuns)} 轮，用量在运行结束后计入。`),
@@ -950,7 +1006,9 @@ exports.apply = async function apply(ctx) {
     name: 'settings.section', id: 'dsh-claude-bridge', order: 15, label: '远程会话',
     inject: () => ({ hooks: { settings: settingsStore }, editUrl: url => { urlEdited = true; updateSettings({ url }); },
       save: saveConnection, clear: clearConnection, refresh: refreshCatalog, refreshStatus: readStatus,
-      loadModels: loadModelPreferences, toggleVisibleModel: toggleModel, saveModels: saveModelPreferences }),
+      loadModels: loadModelPreferences, toggleVisibleModel: toggleModel, saveModels: saveModelPreferences,
+      editContextMode: mode => editContext({ contextMode: mode }), editContextWindow: value => editContext({ contextWindow: value }),
+      saveContext: saveContextPreferences }),
   }, Settings));
   void readStatus();
   ctx.effect(() => () => { disposed = true; close(); }, '远程会话选择器');

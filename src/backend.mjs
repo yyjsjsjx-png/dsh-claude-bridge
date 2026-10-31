@@ -18,6 +18,7 @@ import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, known
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
+import { validateContextPreferences } from './context-preferences.mjs'
 
 function failure(code, message) {
   const error = new Error(`[${code}] ${message}`)
@@ -125,7 +126,29 @@ export class BridgeBackend {
     const settings = await (await this.settings()).read()
     return { ...settings, connected: this.connection?.connected ?? Boolean(this.connection), compatibility: this.compatibility,
       diagnosticsPath: this.diagnostics.path, activeRuns: this.runs.size,
-      authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary() }
+      authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary(),
+      contextPreferences: this.contextPreferences(),
+      autoCompactWindowSupported: this.initialized ? this.initialized.capabilities?.autoCompactWindow === true : null }
+  }
+
+  contextPreferences() {
+    return validateContextPreferences(this.state.value.contextPreferences)
+  }
+
+  async saveContextPreferences(value) {
+    const preferences = validateContextPreferences(value)
+    await this.state.ready
+    await this.state.update(state => { state.contextPreferences = preferences })
+    return preferences
+  }
+
+  contextRequestPreferences() {
+    const preferences = this.contextPreferences()
+    if (preferences.autoCompactWindowTokens === null) return {}
+    if (this.initialized?.capabilities?.autoCompactWindow !== true) {
+      throw failure('CONTEXT_SETTINGS_UNSUPPORTED', '当前服务器不支持自定义自动压缩窗口，请更新服务器或恢复跟随模型默认。')
+    }
+    return { contextPreferences: preferences }
   }
 
   usageSummary() {
@@ -551,6 +574,7 @@ export class BridgeBackend {
         if (this.initialized?.capabilities?.manualCompact !== true) {
           throw failure('COMPACT_UNAVAILABLE', '当前服务器版本尚未接入主动压缩。')
         }
+        const contextPreferences = this.contextRequestPreferences()
         const runId = randomUUID()
         await this.state.beginRun(agent.id, runId, 'compact')
         this.verifiedHistory.delete(agent.session)
@@ -573,6 +597,7 @@ export class BridgeBackend {
           signal.throwIfAborted()
           run.requestStarted = true
           const result = await transport.peer.request('query', { action: 'compact', runId,
+            ...contextPreferences,
             deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
             projectPath: binding.projectPath, resume: true, model: selected.model,
             ...(selected.reasoningEffort ? { effort: selected.reasoningEffort } : {}),
@@ -667,6 +692,7 @@ export class BridgeBackend {
     timing('start')
     let binding = await this.state.binding(agent.id, agent.session.header.cwd)
     const transport = await this.connect({ signal })
+    const contextPreferences = this.contextRequestPreferences()
     timing('connected')
     if (this.initialized?.capabilities?.historySync === true) {
       const deadline = Date.now() + 120_000
@@ -771,6 +797,7 @@ export class BridgeBackend {
       run.requestStarted = true
       timing('request_sent')
       const result = await transport.peer.request('query', {
+        ...contextPreferences,
         runId, deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
         resume: binding.started, projectPath: binding.projectPath, prompt, systemPrompt,
         tools: converted.tools,

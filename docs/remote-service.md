@@ -8,7 +8,7 @@
 
 | 组件 | 本项目要求或实测基线 |
 | --- | --- |
-| 客户端插件 | `v0.2.1` |
+| 客户端插件 | `v0.2.2` |
 | DSH Desktop | 实测 `0.2.1-rc.5`，其他版本按接口能力检查，仍需实际确认 |
 | 服务器 Node.js | `>=24.9`，须准备可独立执行的 Node 和 npm |
 | Claude Agent SDK | 锁定 `0.3.314` |
@@ -16,14 +16,16 @@
 
 这些是本项目的兼容范围，不表示它们是上游最新版。不要为升级本插件顺便升级 SDK 或 CLI；其他版本需要重新验证。
 
+客户端的自定义自动压缩窗口需要 v0.2.2 或更新的服务器代码。服务器按每轮请求单独向官方 CLI 传入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`，不会写入 Claude 登录配置，也不会共享或覆盖其他设备的阈值。跟随模型默认时不设置该变量。官方允许 100,000–1,000,000 tokens，并按模型上下文上限约束实际窗口，见 [自动压缩窗口说明](https://code.claude.com/docs/en/model-config#set-the-auto-compact-window)。
+
 ## 目录与依赖
 
 由服务器管理员先准备独立非 root 用户，例如 `bridge`，以及供账号所有者完成官方交互登录的服务器桌面环境。不要复用其他 Claude、网关或日常服务的账号目录。以下下载、依赖安装、生成口令和登录操作均以该服务用户执行；systemd 安装命令才使用管理员权限。
 
-从 [v0.2.1 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.1) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
+从 [v0.2.1 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.2) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
 
 ```sh
-git clone --branch v0.2.1 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
+git clone --branch v0.2.2 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
 cd /home/bridge/dsh-claude-bridge
 chmod 700 /home/bridge/dsh-claude-bridge
 ```

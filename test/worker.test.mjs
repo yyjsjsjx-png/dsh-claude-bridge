@@ -10,6 +10,25 @@ const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
 const OTHER_DEVICE = 'a4270ab7-90c7-440c-8fdc-5601b47dd29b'
 
+test('自动压缩窗口按本轮设置注入 CLI，恢复默认不继承上轮或其他会话设置', async t => {
+  const f = await fixture(t, async function* ({ prompt }, state) {
+    await prompt.next(); state.exists = true
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  assert.equal((await f.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.autoCompactWindow, true)
+  const custom = await f.worker.handlers.query({ ...f.params, contextPreferences: { autoCompactWindowTokens: 200000 } }, f.context)
+  assert.equal(custom.status, 'completed')
+  const resumed = { ...f.params, runId: 'context-default', resume: true }
+  assert.equal((await f.worker.handlers.query(resumed, f.context)).status, 'completed')
+  assert.equal(f.state.queries[0].options.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '200000')
+  assert.equal(Object.hasOwn(f.state.queries[1].options.env, 'CLAUDE_CODE_AUTO_COMPACT_WINDOW'), false)
+  const bad = await f.worker.handlers.query({ ...resumed, runId: 'context-invalid', contextPreferences: { autoCompactWindowTokens: '200000' } }, f.context)
+  assert.equal(bad.code, 'INVALID_CONTEXT_PREFERENCES')
+  const extra = await f.worker.handlers.query({ ...resumed, runId: 'context-extra', contextPreferences: { autoCompactWindowTokens: 200000, env: {} } }, f.context)
+  assert.equal(extra.code, 'INVALID_CONTEXT_PREFERENCES')
+  assert.equal(f.state.queries.length, 2)
+})
+
 test('云端性能日志独立落盘，区分思考与正文并仅保存白名单耗时', async t => {
   const f = await fixture(t, async function* ({ prompt }, state) {
     await prompt.next(); state.exists = true

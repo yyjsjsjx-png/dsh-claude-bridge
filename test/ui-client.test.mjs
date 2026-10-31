@@ -63,11 +63,14 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   let catalogCalls = 0;
   let saved;
   let modelIds = ['haiku'];
+  let contextPreferences = { autoCompactWindowTokens: null };
+  let contextSaves = 0;
   const ctx = {
     workspaces: {}, uiWorkspace: {},
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured, url: 'wss://example.test/',
         connected: false, authentication: 'unknown', diagnosticsPath: 'local-diagnostics',
+        contextPreferences, autoCompactWindowSupported: true,
         disabledFeatures: [{ name: '规划模式', status: 'disabled', reason: '测试原因' }],
         usageSummary: { sessions: 1, runs: 2, inputTokens: 3, outputTokens: 4,
           cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCostUsd: 0.01, costKind: 'sdk-estimate' } } }),
@@ -77,6 +80,7 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
         { value: 'haiku', displayName: 'Haiku' }, { value: 'sonnet', displayName: 'Sonnet' },
       ], enabledIds: modelIds, usingDefaults: false } }),
       saveModelPreferences: async value => { modelIds = Array.from(value.enabledIds); return { ok: true, value: { saved: true } }; },
+      saveContextPreferences: async value => { contextSaves++; contextPreferences = { ...value }; return { ok: true, value }; },
     } },
     slots: { inject: (_name, register) => register(), register: (options, component) => {
       slots.set(options.id, { options, component }); return () => {};
@@ -90,6 +94,18 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.equal(JSON.stringify(settings.hooks.settings.getSnapshot()).includes(saved.token), false);
   assert.equal(settings.hooks.settings.getSnapshot().disabledFeatures[0].name, '规划模式');
   assert.equal(settings.hooks.settings.getSnapshot().usageSummary.runs, 2);
+  settings.editContextMode('custom'); settings.editContextWindow('200000');
+  await settings.refreshStatus();
+  assert.equal(settings.hooks.settings.getSnapshot().contextWindow, '200000');
+  assert.equal(settings.hooks.settings.getSnapshot().contextMode, 'custom');
+  await settings.saveContext();
+  assert.equal(contextPreferences.autoCompactWindowTokens, 200000);
+  assert.equal(settings.hooks.settings.getSnapshot().contextDirty, false);
+  settings.editContextWindow('99999'); await settings.saveContext();
+  assert.equal(contextSaves, 1);
+  assert.match(settings.hooks.settings.getSnapshot().contextError, /100,000/);
+  settings.editContextMode('default'); await settings.saveContext();
+  assert.equal(contextPreferences.autoCompactWindowTokens, null);
   await settings.refresh();
   assert.equal(catalogCalls, 1);
   assert.equal(settings.hooks.settings.getSnapshot().models.length, 2);

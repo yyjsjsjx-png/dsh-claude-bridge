@@ -7,19 +7,25 @@
 完全退出 DSH（包括托盘程序）后，粘贴并执行：
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
 ```
 
 命令自动获取 GitHub 最新正式版本、校验安装包、调用现有更新器并清理临时下载文件。无需手动下载或解压，也无需另装 Git 或 Node.js。会话、连接和设备身份保留，程序仍使用 DSH 自带的包管理器。
 
-在线安装目录默认位于 `%LOCALAPPDATA%\DSHClaudeBridge\clients`；更新成功后会显示实际位置。该目录保存正在使用的插件，请保留。旧版本目录可以在确认新版本正常后清理。网络无法访问 GitHub 时，可通过 `-Proxy` 参数传入自己的代理；首次获取脚本的 `irm` 同样需要相应代理设置。
+在线安装目录默认位于 `%LOCALAPPDATA%\DSHClaudeBridge\clients`；更新成功后会显示实际位置。该目录保存正在使用的插件，请保留。旧版本目录可以在确认新版本正常后清理。
 
-支持 `-Version 0.2.1` 指定正式版本，或用 `-DshExecutable`、`-DshHome`、`-Profile` 指定安装程序及配置。目标版本已经安装时直接提示，无需重复下载安装。
+命令在首次下载前为当前 PowerShell 启用 TLS 1.2，兼容旧版 Windows PowerShell 的 HTTPS 设置。若刚开始就报“基础连接已经关闭”或 SSL/TLS 错误，尚未开始安装；请核对系统时间与到 GitHub 的连接。需要代理时，先开启代理软件的系统代理，再重新打开 PowerShell；也可为首次获取脚本的 `irm` 和更新器分别传入相同的 `-Proxy`。下面以本机 HTTP/Mixed 端口 `7897` 为例，实际端口以自己的代理配置为准：
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1' -Proxy 'http://127.0.0.1:7897').TrimStart([char]0xFEFF))) -Proxy 'http://127.0.0.1:7897'
+```
+
+默认升级到 GitHub 最新正式版，不限定当前安装版本；以后发布新版仍使用同一条命令。支持 `-Version 0.2.1` 指定正式版本，或用 `-DshExecutable`、`-DshHome`、`-Profile` 指定安装程序及配置。目标版本已经安装时直接提示，无需重复下载安装。
 
 ## Windows Desktop
 
 1. 等待任务结束，完全退出 DSH，包括托盘中的程序。
-2. 下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.1/dsh-claude-bridge-0.2.1.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
+2. 下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.2/dsh-claude-bridge-0.2.2.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
 3. 双击包根目录的 **`更新插件.cmd`**。更新结果窗口会保留；Windows 确实要求提升权限时才请求管理员 UAC，提权前确定的安装位置、配置和数据目录保持不变。取消 UAC 时会明确提示本次更新未执行。
 4. 看到版本更新成功后，按回车关闭更新窗口，再启动 DSH。在插件页核对目标版本，再打开原会话继续使用。
 
