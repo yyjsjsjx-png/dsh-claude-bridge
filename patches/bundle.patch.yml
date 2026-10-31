@@ -1,4 +1,4 @@
-# DSH 0.2.1-rc.5 bundle. Enable in a dedicated profile.
+# DSH bundle with runtime capability checks. Enable in a dedicated profile.
 - id: agent-loop
   disabled: true
 - id: session-controller

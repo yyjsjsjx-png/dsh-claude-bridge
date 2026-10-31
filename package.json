@@ -1,6 +1,6 @@
 {
   "name": "dsh-claude-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -9,6 +9,6 @@
   "files": ["plugin", "src", "patches", "remote/*.mjs", "remote/package.json", "remote/package-lock.json", "deploy/bridge.service.example", "scripts/launch-isolated.mjs", "scripts/build-plugin.mjs", "scripts/connect-ssh.ps1", "scripts/connect-ssh.sh", "docs/remote-service.md", "docs/compatibility-inventory.md", "README.md", "LICENSE", "THIRD_PARTY.md"],
   "dsh": { "bundle": { "patch": "./patches/bundle.patch.yml" } },
   "description": "本机 DSH 与远端官方 Claude Agent SDK 的独立桥接实验",
-  "engines": { "node": ">=24.9", "dsh": "0.2.1-rc.5" },
+  "engines": { "node": ">=24.9", "dsh": "*" },
   "scripts": { "test": "node --test test/*.test.mjs" }
 }

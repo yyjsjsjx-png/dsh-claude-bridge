@@ -124,7 +124,7 @@ exports.apply = async function apply(ctx) {
   quotaStore.set(UNKNOWN_QUOTA);
   settingsStore.set({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
-    diagnosticsPath: '', busy: false, error: '', message: '',
+    diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
     modelError: '', usingModelDefaults: true });
   let generation = 0;
@@ -203,20 +203,34 @@ exports.apply = async function apply(ctx) {
     return request;
   }
 
-  async function readStatus() {
-    try {
-      const response = await ctx.remote.claudeBridge.status();
-      if (!response.ok) throw new Error(response.error.message);
-      const status = response.value;
-      updateSettings({ url: status.url ?? '', configured: status.configured === true,
-        connected: status.connected === true, authentication: status.authentication ?? 'unknown',
-        compatibility: status.compatibility ?? [], disabledFeatures: status.disabledFeatures ?? [],
-        convertedFeatures: status.convertedFeatures ?? [],
-        usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '' });
-    } catch (error) { updateSettings({ error: textError(error) }); }
+  let statusRequest;
+  let statusGeneration = 0;
+  let urlEdited = false;
+  function readStatus() {
+    if (statusRequest) return statusRequest;
+    const generation = statusGeneration;
+    const request = (async () => {
+      try {
+        const response = await ctx.remote.claudeBridge.status();
+        if (!response.ok) throw new Error(response.error.message);
+        if (disposed || generation !== statusGeneration) return;
+        const status = response.value;
+        updateSettings({ ...(!urlEdited ? { url: status.url ?? '' } : {}), configured: status.configured === true,
+          connected: status.connected === true, authentication: status.authentication ?? 'unknown',
+          compatibility: status.compatibility ?? [], disabledFeatures: status.disabledFeatures ?? [],
+          convertedFeatures: status.convertedFeatures ?? [], activeRuns: status.activeRuns ?? 0,
+          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '' });
+      } catch (error) {
+        if (!disposed && generation === statusGeneration) updateSettings({ statusError: textError(error) });
+      }
+    })();
+    statusRequest = request;
+    void request.finally(() => { if (statusRequest === request) statusRequest = undefined; });
+    return request;
   }
 
   async function saveConnection(value) {
+    statusGeneration++;
     quotaGeneration++;
     quotaLastAttemptAt = 0; quotaFailures = 0; quotaRetryAt = 0;
     quotaStore.set(UNKNOWN_QUOTA);
@@ -226,6 +240,8 @@ exports.apply = async function apply(ctx) {
       if (quotaRequest) await quotaRequest;
       const response = await ctx.remote.claudeBridge.saveConnection(value);
       if (!response.ok) throw new Error(response.error.message);
+      urlEdited = false;
+      if (statusRequest) await statusRequest;
       await readStatus();
       if (settingsStore.getSnapshot().modelsLoaded) await loadModelPreferences();
       updateSettings({ message: '连接设置已保存。' });
@@ -608,6 +624,24 @@ exports.apply = async function apply(ctx) {
     const state = useSettings(value => value);
     const [token, setToken] = React.useState('');
     React.useEffect(() => { if (state.configured) void loadModels(); }, [state.configured, loadModels]);
+    React.useEffect(() => {
+      const page = typeof document === 'undefined' ? undefined : document;
+      const refreshVisible = () => {
+        if (page?.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+        void refreshStatus();
+      };
+      refreshVisible();
+      const timer = window.setInterval?.(refreshVisible, 5000);
+      page?.addEventListener?.('visibilitychange', refreshVisible);
+      window.addEventListener?.('focus', refreshVisible);
+      window.addEventListener?.('online', refreshVisible);
+      return () => {
+        if (timer !== undefined) window.clearInterval(timer);
+        page?.removeEventListener?.('visibilitychange', refreshVisible);
+        window.removeEventListener?.('focus', refreshVisible);
+        window.removeEventListener?.('online', refreshVisible);
+      };
+    }, [refreshStatus]);
     const authentication = state.authentication === 'logged-in' ? '已登录'
       : state.authentication === 'login-required' ? '需在服务器完成登录' : '未验证';
     const statuses = { preserved: '原样支持', converted: '已转换', disabled: '已关闭' };
@@ -639,7 +673,7 @@ exports.apply = async function apply(ctx) {
           onClick: () => { void refresh(); } }, '测试连接并刷新模型')),
       React.createElement('p', null, `配置：${state.configured ? '已配置' : '未配置'}；连接：${state.connected ? '已连接' : '未连接'}；官方登录（最近验证）：${authentication}`),
       state.message && React.createElement('p', { role: 'status' }, state.message),
-      state.error && React.createElement('p', { role: 'alert', style: { color: '#c43c3c' } }, state.error),
+      (state.error || state.statusError) && React.createElement('p', { role: 'alert', style: { color: '#c43c3c' } }, state.error || state.statusError),
       React.createElement('h3', null, '显示的模型'),
       React.createElement('p', null, '选择模型列表中显示的模型；隐藏不会停止已有会话，正在使用的模型会暂时保留在原生列表中。'),
       !state.configured && React.createElement('p', null, '请先保存连接设置，再读取账号模型。'),
@@ -660,24 +694,26 @@ exports.apply = async function apply(ctx) {
       state.configured && !state.modelsLoading && !state.modelsLoaded
         && React.createElement('button', { type: 'button', disabled: state.busy,
           onClick: () => { void loadModels(); } }, '读取模型列表'),
-      React.createElement('h3', null, '功能兼容状态'),
-      state.disabledFeatures.length > 0 && React.createElement('ul', null, ...state.disabledFeatures.map((item, index) =>
-        React.createElement('li', { key: `disabled-${item.name}-${index}` }, `${item.name}：已关闭（${item.reason}）`))),
-      state.convertedFeatures.length > 0 && React.createElement('ul', null, ...state.convertedFeatures.map((item, index) =>
-        React.createElement('li', { key: `converted-${item.name}-${index}` }, `${item.name}：已转换（${item.reason}）`))),
-      React.createElement('p', null, 'DSH 会话和审批、本机工具、远端上下文与附件转换的实际效果需在运行后验证。'),
-      React.createElement('p', null, '以下工具报告来自本设备最近一次运行，仅供兼容性排查。'),
-      state.compatibility.length === 0 ? React.createElement('p', null, '尚未运行。')
-        : React.createElement('ul', null, ...state.compatibility.map((item, index) =>
-          React.createElement('li', { key: `${item.name}-${index}` },
-            `${item.name}：${statuses[item.status] ?? '未知'}${item.reason ? `（${item.reason}）` : ''}`))),
       React.createElement('h3', null, '本设备用量'),
+      state.activeRuns > 0 && React.createElement('p', { role: 'status' }, `正在执行 ${displayNumber(state.activeRuns)} 轮，用量在运行结束后计入。`),
       usage === null ? React.createElement('p', null, '暂无统计。')
-        : React.createElement('div', null,
+        : usage.runs === 0 ? React.createElement('p', null, '暂无已结算的用量记录。')
+          : React.createElement('div', null,
           React.createElement('p', null, `会话 ${displayNumber(usage.sessions)}，运行 ${displayNumber(usage.runs)}；输入 ${displayNumber(usage.inputTokens)}，输出 ${displayNumber(usage.outputTokens)} tokens。`),
           React.createElement('p', null, `缓存读取 ${displayNumber(usage.cacheReadTokens)}，缓存写入 ${displayNumber(usage.cacheWriteTokens)} tokens。`),
           React.createElement('p', null, `SDK 估算 ${Number.isFinite(usage.estimatedCostUsd) ? `$${usage.estimatedCostUsd.toFixed(6)}` : '—'}；本设备统计，不是账单。`)),
-      React.createElement('p', null, `诊断记录：${state.diagnosticsPath || '尚未确定'}`));
+      React.createElement('details', { style: { marginTop: 20 } },
+        React.createElement('summary', { style: { cursor: 'pointer' } }, '兼容性与诊断'),
+        state.disabledFeatures.length > 0 && React.createElement('ul', null, ...state.disabledFeatures.map((item, index) =>
+          React.createElement('li', { key: `disabled-${item.name}-${index}` }, `${item.name}：已关闭（${item.reason}）`))),
+        state.convertedFeatures.length > 0 && React.createElement('ul', null, ...state.convertedFeatures.map((item, index) =>
+          React.createElement('li', { key: `converted-${item.name}-${index}` }, `${item.name}：已转换（${item.reason}）`))),
+        React.createElement('p', null, '工具报告来自本次启动后最近一次运行，仅供排查。'),
+        state.compatibility.length === 0 ? React.createElement('p', null, '本次启动尚未取得工具兼容报告。')
+          : React.createElement('ul', null, ...state.compatibility.map((item, index) =>
+            React.createElement('li', { key: `${item.name}-${index}` },
+              `${item.name}：${statuses[item.status] ?? '未知'}${item.reason ? `（${item.reason}）` : ''}`))),
+        React.createElement('p', null, `诊断记录：${state.diagnosticsPath || '尚未确定'}`)));
   }
 
   ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
@@ -709,7 +745,7 @@ exports.apply = async function apply(ctx) {
   }, Picker));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'dsh-claude-bridge', order: 15, label: '远程 Claude',
-    inject: () => ({ hooks: { settings: settingsStore }, editUrl: url => updateSettings({ url }),
+    inject: () => ({ hooks: { settings: settingsStore }, editUrl: url => { urlEdited = true; updateSettings({ url }); },
       save: saveConnection, refresh: refreshCatalog, refreshStatus: readStatus,
       loadModels: loadModelPreferences, toggleVisibleModel: toggleModel, saveModels: saveModelPreferences }),
   }, Settings));

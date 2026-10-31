@@ -30,6 +30,7 @@ const STEP_END_REPLACEMENT = [
 ].join('\n');
 const IMPORT = "import { createClaudeLoopAgent } from '../claude-agent.mjs';\n";
 const RESOLVER_IMPORT = "import { resolveDshModule } from './resolve-dsh-module.mjs';\n";
+const COMPATIBILITY_IMPORT = "import './check-host.mjs';\n";
 // These are the exact external imports in the verified rc.5 bundle. Using
 // the packaged ESM entry points preserves DSH's real module singletons.
 const OFFICIAL_MODULES = [
@@ -120,7 +121,7 @@ export function adaptAgentLoop(source, officialImports) {
     || original.includes('/* bridge-step-end-start */')) {
     throw new Error('DSH AgentLoop 的 step/end 闭合点不唯一或已被修改。');
   }
-  let adapted = RESOLVER_IMPORT + IMPORT + original.slice(0, first) + REPLACEMENT
+  let adapted = COMPATIBILITY_IMPORT + RESOLVER_IMPORT + IMPORT + original.slice(0, first) + REPLACEMENT
     + original.slice(first + CONSTRUCTION.length);
   adapted = adapted.replace(STEP_END, STEP_END_REPLACEMENT);
   if (officialImports === null || typeof officialImports !== 'object') {
@@ -223,6 +224,7 @@ export async function prepareCompatibility(archivePath) {
   const specifier = name => `await import(resolveDshModule(${JSON.stringify(name)}))`;
   const runtime = Buffer.from([
     '// Generated from the installed rc.5 ASAR; do not edit.',
+    COMPATIBILITY_IMPORT.trimEnd(),
     RESOLVER_IMPORT.trimEnd(),
     `export const { Service } = ${specifier('@deepseek-ai/cordis')};`,
     `export const { default: schema } = ${specifier('@deepseek-ai/schemastery')};`,
@@ -248,7 +250,7 @@ export async function prepareCompatibility(archivePath) {
     adaptedSha256: digest(adapted),
     runtimeSha256: digest(runtime),
     officialImports,
-    changes: ['导入桥接构造器', '替换唯一 Agent 构造调用', '仅远程 Agent 按动态 step 闭合', '将官方依赖绑定到安装版 ESM 单例'],
+    changes: ['导入桥接构造器', '替换唯一 Agent 构造调用', '仅远程 Agent 按动态 step 闭合', '将官方依赖绑定到安装版 ESM 单例', '加载前按 Host 能力检查兼容性'],
   }, null, 2)}\n`);
   const output = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'compat');
   const sessionOutput = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'session-client');

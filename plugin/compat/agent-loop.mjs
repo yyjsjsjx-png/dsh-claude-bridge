@@ -1,3 +1,4 @@
+import './check-host.mjs';
 import { resolveDshModule } from './resolve-dsh-module.mjs';
 import { createClaudeLoopAgent } from '../claude-agent.mjs';
 const { Service } = await import(resolveDshModule("@deepseek-ai/cordis"));

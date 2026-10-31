@@ -2,16 +2,16 @@ import { CLAUDE_PRESET } from './policy.mjs';
 
 /** Explicit limits that are independent of a particular request's tool list. */
 export const REMOTE_PRESET_LIMITATIONS = Object.freeze([
-  Object.freeze({ name: '规划模式', status: 'disabled', reason: '批次 pre-step 正在对接，计划审批切换尚未验收。' }),
-  Object.freeze({ name: 'subagent_fork', status: 'disabled', reason: '按项目范围不提供会话分叉，不能用 DSH 展示历史伪造 SDK 分叉。' }),
-  Object.freeze({ name: 'subagent 工具独立选型', status: 'disabled', reason: '该工具默认继承父会话模型；workflow 可显式选择同一远程引擎的模型。' }),
+  Object.freeze({ name: '计划模式', status: 'disabled', reason: '暂不提供计划模式。' }),
+  Object.freeze({ name: 'subagent_fork', status: 'disabled', reason: '不支持分叉子任务。' }),
+  Object.freeze({ name: '子任务独立选型', status: 'disabled', reason: '子任务默认沿用父会话模型。' }),
   Object.freeze({ name: 'DSH 原生压缩', status: 'disabled', reason: '远程 Claude SDK 负责自身会话的上下文和压缩。' }),
-  Object.freeze({ name: '会话分叉', status: 'disabled', reason: '按项目范围不提供会话分叉；请新建会话。' }),
+  Object.freeze({ name: '会话分叉', status: 'disabled', reason: '请通过新建会话开始其他任务。' }),
 ]);
 export const REMOTE_PRESET_CONVERSIONS = Object.freeze([
-  Object.freeze({ name: '/compact', status: 'converted', reason: '调用远端 SDK 原生命令压缩上下文，保留 DSH 展示历史；需要服务器支持。' }),
-  Object.freeze({ name: 'persona 身份提示', status: 'converted', reason: '改为固定的 Claude SDK 身份描述；具体模型由 SDK 和界面显示，避免切换模型时改变已恢复会话的系统提示。' }),
-  Object.freeze({ name: 'Workflow 深度限制', status: 'converted', reason: '达到 DSH 设置的子代理深度上限时拒绝 workflow；不创建子代理的 workflow 也会受此限制。' }),
+  Object.freeze({ name: '/compact', status: 'converted', reason: '由远程 Claude 压缩上下文，保留对话历史。' }),
+  Object.freeze({ name: '身份提示', status: 'converted', reason: '云端会话使用固定的 Claude 身份提示。' }),
+  Object.freeze({ name: 'Workflow 深度限制', status: 'converted', reason: '沿用 DSH 子任务深度上限。' }),
 ]);
 const REMOTE_PERSONA_PREFIX = 'You are a coding agent powered by Claude through the remote Claude Agent SDK.';
 

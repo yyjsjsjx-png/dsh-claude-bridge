@@ -1,7 +1,9 @@
 # 第三方来源
 
-兼容目标为 DeepSeek Harness `0.2.1-rc.5`，官方提交
+内置兼容代码的来源为 DeepSeek Harness `0.2.1-rc.5`，官方提交
 `b830ec950faba0a46dda564be3e2d854afed94f1`。
+
+此版本用于标注源码来源和复现构建；运行时按 Host 能力检查兼容性，不要求安装相同版本。
 
 - `plugin/compat/agent-loop.original.mjs` 来自该版本的官方安装包；`agent-loop.mjs` 仅适配桥接构造入口和远程轮次收尾。来源和 SHA-256 见同目录 `provenance.json`，许可证见 `LICENSE`。
 - `plugin/session-client/client.js` 为该版本官方客户端原样副本；同目录保留 `provenance.json` 和 MIT `LICENSE`。

@@ -100,6 +100,82 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.deepEqual(Array.from(settings.hooks.settings.getSnapshot().selectedModelIds), ['sonnet']);
 });
 
+test('设置页打开及可见时刷新统计，合并请求并保留地址草稿，诊断默认收起', async () => {
+  const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
+  let entry;
+  const timers = new Map();
+  const listeners = new Map();
+  const effects = [];
+  const page = { hidden: false, addEventListener: (name, fn) => listeners.set(name, fn),
+    removeEventListener: name => listeners.delete(name) };
+  const network = { onLine: true };
+  vm.runInNewContext(source, { document: page, navigator: network, window: {
+    __ModuleLoader__: { load: value => { entry = value; } },
+    setInterval: (fn, delay) => { assert.equal(delay, 5000); timers.set(1, fn); return 1; },
+    clearInterval: id => timers.delete(id),
+    addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name),
+  } });
+  const react = { createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: initial => [initial, () => {}], useEffect: effect => effects.push(effect) };
+  const client = entry.factory(name => name === 'react' ? react : name === 'zod' ? { z: {} } : {});
+  const slots = new Map();
+  let reads = 0;
+  let latest = { configured: false, url: 'wss://saved.test/', compatibility: [],
+    diagnosticsPath: 'local-diagnostics', usageSummary: { sessions: 0, runs: 0 }, activeRuns: 0 };
+  const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
+    remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
+      status: async () => { reads++; return { ok: true, value: latest }; },
+    } }, slots: { inject: (_name, register) => register(), register(options, component) {
+      slots.set(options.id, { options, component }); return () => {};
+    } }, inject: (_services, callback) => callback(ctx), effect() {} };
+  await client.apply(ctx);
+  const slot = slots.get('dsh-claude-bridge');
+  const settings = slot.options.inject();
+  await settings.refreshStatus();
+  const render = () => slot.component({ ...settings,
+    useSettings: select => select(settings.hooks.settings.getSnapshot()) });
+  const textOf = node => node == null || typeof node === 'boolean' ? ''
+    : typeof node === 'string' || typeof node === 'number' ? String(node)
+      : Array.isArray(node) ? node.map(textOf).join(' ') : textOf(node.children);
+  const nodesOf = node => node == null || typeof node !== 'object' ? []
+    : Array.isArray(node) ? node.flatMap(nodesOf) : [node, ...nodesOf(node.children)];
+  const initial = render();
+  assert.match(textOf(initial), /暂无已结算的用量记录/u);
+  assert.match(textOf(initial), /本次启动尚未取得工具兼容报告/u);
+  assert.doesNotMatch(textOf(initial), /尚未运行。/u);
+  assert.equal(nodesOf(initial).find(node => node.type === 'details').props.open, undefined);
+  latest = { ...latest, usageSummary: { sessions: 1, runs: 2, inputTokens: 15, outputTokens: 8,
+    cacheReadTokens: 3, cacheWriteTokens: 4, estimatedCostUsd: 0.02 } };
+  const beforeMount = reads;
+  const cleanup = effects.slice().map(effect => effect()).filter(value => typeof value === 'function');
+  await settings.refreshStatus();
+  assert.equal(reads, beforeMount + 1);
+  assert.equal(settings.hooks.settings.getSnapshot().usageSummary.runs, 2);
+  assert.equal(timers.size, 1);
+  assert.match(textOf(render()), /会话 1，运行 2/u);
+  settings.editUrl('wss://draft.test/');
+  const beforePoll = reads;
+  timers.get(1)();
+  await settings.refreshStatus();
+  assert.equal(reads, beforePoll + 1);
+  assert.equal(settings.hooks.settings.getSnapshot().url, 'wss://draft.test/');
+  page.hidden = true;
+  timers.get(1)();
+  assert.equal(reads, beforePoll + 1);
+  page.hidden = false;
+  network.onLine = false;
+  listeners.get('focus')();
+  assert.equal(reads, beforePoll + 1);
+  network.onLine = true;
+  latest = { ...latest, activeRuns: 1 };
+  listeners.get('online')();
+  await settings.refreshStatus();
+  assert.match(textOf(render()), /正在执行 1 轮/u);
+  for (const dispose of cleanup) dispose();
+  assert.equal(timers.size, 0);
+  assert.equal(listeners.size, 0);
+});
+
 test('上下文底栏只显示百分比，浮层展示同源用量与精简分类，停止状态保留', async () => {
   const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
   let entry;

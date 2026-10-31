@@ -1,4 +1,5 @@
 // Generated from the installed rc.5 ASAR; do not edit.
+import './check-host.mjs';
 import { resolveDshModule } from './resolve-dsh-module.mjs';
 export const { Service } = await import(resolveDshModule("@deepseek-ai/cordis"));
 export const { default: schema } = await import(resolveDshModule("@deepseek-ai/schemastery"));

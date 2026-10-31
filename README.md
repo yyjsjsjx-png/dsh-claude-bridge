@@ -4,25 +4,25 @@
 
 本项目面向个人账号的生产试用。客户端不需要安装 Claude Code 或 Agent SDK。
 
-## 固定版本
+## 兼容版本
 
 | 组件 | 版本 |
 | --- | --- |
-| DSH Desktop | **[0.2.1-rc.5](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.5)** |
-| 对应 DSH 提交 | `b830ec950faba0a46dda564be3e2d854afed94f1` |
+| DSH Desktop 实测基线 | **[0.2.1-rc.5](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.5)** |
+| 兼容代码来源提交 | `b830ec950faba0a46dda564be3e2d854afed94f1` |
 | Claude Agent SDK（仅服务器） | `0.3.314` |
 | Claude Code（仅服务器） | `2.1.314` |
 | Node.js（服务器或开发启动脚本） | `>=24.9` |
 
-插件包含构建好的运行文件。DSH 的内部接口同时核对版本与源码摘要，其他版本会明确拒绝加载。
+插件包含构建好的运行文件。DSH 版本号不设白名单，也不再要求安装版源码摘要相同；启动时检查必需接口、RPC 参数及原生会话回放协议，标准预设按当前安装版读取并检查结构。普通更新和新增接口可以继续加载，发现不兼容接口时会明确提示“远程 Claude 插件无法加载”及原因。上表是实测基线，其他版本仍需实际使用验证；服务器 SDK 和 CLI 继续固定版本。
 
 ## 安装与连接
 
-1. 安装上述版本的 DSH。已有日常数据时使用独立配置和数据目录；全新测试虚拟机可直接使用新安装。
+1. 安装 DSH。已有日常数据时使用独立配置和数据目录；全新测试虚拟机可直接使用新安装。
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.0
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.1
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
@@ -43,7 +43,7 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.0
+dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.1
 ```
 
 ## 已实现
@@ -55,6 +55,7 @@ dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-c
 - 短断接回原 worker，按序补漏、确认和去重；本机工具等待连接恢复，离线停止优先。SSH 启动脚本只重建自己管理的转发。
 - Host、worker 或服务崩溃后，从 SDK 原生记录补齐云端尾部，核对本机已保存结果及匹配的云端工具回执。界面显示恢复情况，用户可直接发下一条消息。
 - 无法确认的工具结果保留为“待核实”，不重发原请求。下一条用户输入可附带已核实的恢复事实和只读核实建议，成功送达后去重，不额外发模型请求。
+- 设置页打开时刷新本设备用量，前台每 5 秒更新，隐藏或离线暂停；兼容性和诊断明细默认收起。
 
 ## 恢复边界
 

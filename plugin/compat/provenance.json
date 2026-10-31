@@ -5,8 +5,8 @@
   "repository": "https://github.com/deepseek-ai/deepseek-harness",
   "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
   "sourceSha256": "cf57e3ecd487ac5c2553455aaa5cef2c6fb41e6bd61be5aa455675d1d7193033",
-  "adaptedSha256": "53062adbc641806ac0ec72766fdb95ebc39dd82931326b24db211f29e8d484ff",
-  "runtimeSha256": "a4c468f2f2409fc808382d4735893b2a64ca0049dadfa698c2dccd256042730d",
+  "adaptedSha256": "41b37197f487f7548f4258e98595e45be5962cce130f2163795efc66c3a2cec8",
+  "runtimeSha256": "005f1dc80bd20452bcd4440c2c8d11c79c21ff778498b992df902b7712bdda7f",
   "officialImports": {
     "@deepseek-ai/cordis": "dsh/node_modules/@deepseek-ai/cordis/lib/index.js",
     "@deepseek-ai/schemastery": "dsh/node_modules/@deepseek-ai/schemastery/lib/index.mjs",
@@ -32,6 +32,7 @@
     "导入桥接构造器",
     "替换唯一 Agent 构造调用",
     "仅远程 Agent 按动态 step 闭合",
-    "将官方依赖绑定到安装版 ESM 单例"
+    "将官方依赖绑定到安装版 ESM 单例",
+    "加载前按 Host 能力检查兼容性"
   ]
 }
