@@ -1,11 +1,25 @@
 # 保留数据原地更新
 
-更新插件不需要还原快照，也不需要卸载 DSH。还原纯净快照会同时丢失旧会话及本机设备身份，无法用于检查连续升级。
+更新插件不需要还原快照，也不需要卸载 DSH。直接升级可以保留旧会话及本机设备身份。
+
+## PowerShell 一行更新
+
+完全退出 DSH（包括托盘程序）后，粘贴并执行：
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
+```
+
+命令自动获取 GitHub 最新正式版本、校验安装包、调用现有更新器并清理临时下载文件。无需手动下载或解压，也无需另装 Git 或 Node.js。会话、连接和设备身份保留，程序仍使用 DSH 自带的包管理器。
+
+在线安装目录默认位于 `%LOCALAPPDATA%\DSHClaudeBridge\clients`；更新成功后会显示实际位置。该目录保存正在使用的插件，请保留。旧版本目录可以在确认新版本正常后清理。网络无法访问 GitHub 时，可通过 `-Proxy` 参数传入自己的代理；首次获取脚本的 `irm` 同样需要相应代理设置。
+
+支持 `-Version 0.2.1` 指定正式版本，或用 `-DshExecutable`、`-DshHome`、`-Profile` 指定安装程序及配置。目标版本已经安装时直接提示，无需重复下载安装。
 
 ## Windows Desktop
 
 1. 等待任务结束，完全退出 DSH，包括托盘中的程序。
-2. 下载 [v0.2.0 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.0/dsh-claude-bridge-0.2.0.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
+2. 下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.1/dsh-claude-bridge-0.2.1.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
 3. 双击包根目录的 **`更新插件.cmd`**。更新结果窗口会保留；Windows 确实要求提升权限时才请求管理员 UAC，提权前确定的安装位置、配置和数据目录保持不变。取消 UAC 时会明确提示本次更新未执行。
 4. 看到版本更新成功后，按回车关闭更新窗口，再启动 DSH。在插件页核对目标版本，再打开原会话继续使用。
 
@@ -13,7 +27,7 @@
 
 未指定程序路径时，更新器读取 Windows 安装记录、开始菜单/桌面快捷方式及已有默认安装位置，并核对文件实际存在。自定义盘符不需要改脚本；多个不同安装或未找到程序时明确拒绝，使用下面的 `-DshExecutable` 参数指定目标。安装位置、Home 和包目录在 UAC 前固定，提权后不重新猜测。
 
-从 GitHub 安装的旧版本更新时，更新器使用带包名的 `dsh-claude-bridge@link:本地目录` 替换依赖。若旧更新器报 `ERR_PNPM_NO_OFFLINE_TARBALL` 并指向旧 GitHub 压缩包，请换用 v0.1.5 完整更新包再运行；无需下载旧版本或关闭离线模式。安装阶段失败时，脚本会直接显示错误摘要和实际 `pnpm.log` 路径；不要把该日志与更新器外层 `.err` 混淆。安装失败不会触发自动提权或重试。
+从 GitHub 安装的旧版本更新时，更新器使用带包名的 `dsh-claude-bridge@link:本地目录` 替换依赖。若旧更新器报 `ERR_PNPM_NO_OFFLINE_TARBALL` 并指向旧 GitHub 压缩包，请使用上面的一行更新命令或最新完整更新包；无需下载旧版本或关闭离线模式。安装阶段失败时，脚本会直接显示错误摘要和实际 `pnpm.log` 路径；不要把该日志与更新器外层 `.err` 混淆。安装失败不会触发自动提权或重试。
 
 ## 高级命令行
 

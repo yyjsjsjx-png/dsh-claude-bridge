@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote execution engine",
+    "description": "Runs remote sessions and connects local tools, approvals, and cancellation."
+  }
+}

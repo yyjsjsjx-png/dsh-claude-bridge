@@ -3,16 +3,16 @@
   disabled: true
 - insert:
     - id: claude-agent-loop
-      name: '../plugin/compat/agent-loop.mjs'
+      name: dsh-claude-bridge/agent-loop
       config:
         agents: []
     - id: claude-bridge
-      name: '../plugin/index.mjs'
+      name: dsh-claude-bridge/bridge
       config:
         transport: wss
     - id: claude-session-controller
-      name: '../plugin/session-controller.mjs'
+      name: dsh-claude-bridge/session-policy
     - id: preset-claude-sdk-remote
-      name: '../plugin/preset-service.mjs'
+      name: dsh-claude-bridge/preset
     - id: claude-bridge-ui
-      name: '../plugin/ui/index.mjs'
+      name: dsh-claude-bridge

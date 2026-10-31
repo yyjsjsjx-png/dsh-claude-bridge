@@ -1,14 +1,79 @@
 {
   "name": "dsh-claude-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "license": "MIT",
-  "main": "./plugin/bundle.mjs",
-  "exports": { ".": "./plugin/bundle.mjs", "./package.json": "./package.json" },
-  "files": ["plugin", "src", "patches", "remote/*.mjs", "remote/package.json", "remote/package-lock.json", "deploy/bridge.service.example", "更新插件.cmd", "scripts/start-update.ps1", "scripts/resolve-dsh-executable.ps1", "scripts/launch-isolated.mjs", "scripts/build-plugin.mjs", "scripts/connect-ssh.ps1", "scripts/connect-ssh.sh", "scripts/collect-performance.mjs", "scripts/update-plugin.ps1", "scripts/update-plugin.mjs", "scripts/repair-history.mjs", "docs/getting-started.md", "docs/remote-service.md", "docs/compatibility-inventory.md", "docs/performance.md", "docs/updating.md", "README.md", "LICENSE", "THIRD_PARTY.md"],
-  "dsh": { "bundle": { "patch": "./patches/bundle.patch.yml" } },
+  "main": "./plugin/ui/index.mjs",
+  "exports": {
+    ".": "./plugin/ui/index.mjs",
+    "./package.json": "./package.json",
+    "./client": "./plugin/ui/client.js",
+    "./locale/*": "./plugin/metadata/bundle/locale/*",
+    "./icon": "./plugin/metadata/bundle/icon.svg",
+    "./agent-loop": "./plugin/compat/agent-loop.mjs",
+    "./agent-loop/locale/*": "./plugin/metadata/agent-loop/locale/*",
+    "./agent-loop/icon": "./plugin/metadata/agent-loop/icon.svg",
+    "./bridge": "./plugin/index.mjs",
+    "./bridge/locale/*": "./plugin/metadata/bridge/locale/*",
+    "./bridge/icon": "./plugin/metadata/bridge/icon.svg",
+    "./session-policy": "./plugin/session-controller.mjs",
+    "./session-policy/locale/*": "./plugin/metadata/session-policy/locale/*",
+    "./session-policy/icon": "./plugin/metadata/session-policy/icon.svg",
+    "./preset": "./plugin/preset-service.mjs",
+    "./preset/locale/*": "./plugin/metadata/preset/locale/*",
+    "./preset/icon": "./plugin/metadata/preset/icon.svg"
+  },
+  "files": [
+    "plugin",
+    "src",
+    "patches",
+    "remote/*.mjs",
+    "remote/package.json",
+    "remote/package-lock.json",
+    "deploy/bridge.service.example",
+    "更新插件.cmd",
+    "scripts/start-update.ps1",
+    "scripts/resolve-dsh-executable.ps1",
+    "scripts/launch-isolated.mjs",
+    "scripts/build-plugin.mjs",
+    "scripts/connect-ssh.ps1",
+    "scripts/connect-ssh.sh",
+    "scripts/collect-performance.mjs",
+    "scripts/update-plugin.ps1",
+    "scripts/update-plugin.mjs",
+    "scripts/repair-history.mjs",
+    "docs/getting-started.md",
+    "docs/remote-service.md",
+    "docs/compatibility-inventory.md",
+    "docs/performance.md",
+    "docs/updating.md",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY.md",
+    "scripts/update-online.ps1"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./patches/bundle.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller"
+      ]
+    }
+  },
   "description": "本机 DSH 与本人服务器上官方 Claude Agent SDK 的个人自用桥接实验（非 Anthropic 官方项目）",
-  "engines": { "node": ">=24.9", "dsh": "*" },
-  "scripts": { "test": "node --test test/*.test.mjs" }
+  "engines": {
+    "node": ">=24.9",
+    "dsh": "*"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "icon": "./plugin/metadata/bundle/icon.svg"
 }

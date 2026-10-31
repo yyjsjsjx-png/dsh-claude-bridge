@@ -8,7 +8,7 @@ test('DSH 会话菜单先选择模型和强度，再创建远程会话', async (
   const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
   let entry;
   vm.runInNewContext(source, { window: { __ModuleLoader__: { load: value => { entry = value; } } } });
-  assert.equal(entry.id, 'dsh-claude-bridge-ui');
+  assert.equal(entry.id, 'dsh-claude-bridge');
   const exports = entry.factory(name => {
     if (name === 'react') return { createElement: () => null };
     if (name === 'react-dom' || name === '@deepseek-ai/dsh-client-ui-primitives') return {};

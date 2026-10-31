@@ -1,0 +1,6 @@
+{
+  "name": "dsh-claude-bridge-host",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module"
+}

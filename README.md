@@ -43,14 +43,20 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.0
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.1
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
 3. 在 **设置 → 远程会话** 保存你在自己服务器上部署的 **`wss://…` 地址**和你自己生成的**桥接口令**，点击“测试连接并刷新模型”。公网 WSS 直接连接，不需要 SSH、密钥文件或额外启动脚本。
 4. 在会话首页点击“新建远程会话”，选择账号实际返回的模型与推理强度，再开始对话。之后默认沿用上次成功选择；型号或强度不可用时回退为重新选择或模型默认强度。
 
-已有安装可保留数据原地升级，无须还原快照。下载 [v0.2.0 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.0/dsh-claude-bridge-0.2.0.zip)，解压并完全退出 DSH，双击包根目录的 **`更新插件.cmd`**。结果窗口会保留，Windows 确实要求管理员权限时才请求 UAC。请保留解压目录。自定义路径、高级命令行、备份及失败处理见 [更新说明](docs/updating.md)。
+已有安装可保留数据原地升级。完全退出 DSH 后，在 PowerShell 执行一行：
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
+```
+
+也可下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.1/dsh-claude-bridge-0.2.1.zip)，解压后双击 **`更新插件.cmd`**。请保留安装目录。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
 
 设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销你其他设备上保存的同一口令。
 
@@ -66,10 +72,12 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.0
+dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.1
 ```
 
 ## 版本说明
+
+v0.2.1 为插件包及五个组件补齐中英文名称、用途和图标，并提供 PowerShell 一行在线更新。客户端更新后生效，服务器无需升级。
 
 v0.2.0 主要更新文档口径与界面：补充使用边界与合规说明，明确当前只支持本人订阅登录；设置页和新建对话框改为与 DSH 原生设置一致的样式；界面功能名统一为“远程会话”。只改了一条服务器报错文案，服务器不必为此更新。早期版本（v0.1.x）已撤下，其中的旧表述作废，以本版本文档为准。
 
@@ -116,15 +124,15 @@ v0.1.5 起服务器默认不再设置每轮 SDK 美元预算；仍运行 v0.1.4 
 
 普通新建子代理与会话分叉不同，`subagent_fork` 仍关闭。设备、窗口和子代理共享服务器资源与同一 Claude 账号额度，可能受到上游限流；订阅额度的设定前提是普通的个人使用。本项目不提供多人权限隔离或账号级公平排队；服务默认最多保留 16 个连接槽位（含短断保留项），这不是模型会话并发数保证。复杂并发父子崩溃恢复和容量压测尚未验证。
 
-## 部署与验证
+## 部署与开发
 
-服务器部署、systemd 和私有数据边界见 [远程服务部署](docs/remote-service.md)；功能状态和证据范围见 [兼容清单](docs/compatibility-inventory.md)。第三方兼容代码的来源与许可证见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+服务器部署、systemd 和私有数据边界见 [远程服务部署](docs/remote-service.md)；支持的功能与限制见 [功能与兼容性](docs/compatibility-inventory.md)。第三方兼容代码的来源与许可证见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
 ```sh
 npm test
 ```
 
-普通检查不安装 SDK。ASAR 专用检查使用已有 DSH Electron 的 Node 模式。`scripts/recovery-e2e.mjs` 使用实际 SSH、WebSocket、worker、DSH 持久化和本机工具进程，仅 SDK 是确定性替身；它需要你自己的独立测试服务器，运行方法见兼容清单。
+ASAR 专用检查使用已有 DSH Electron 的 Node 模式。
 
 开发用隔离 Host 可用 `node scripts/launch-isolated.mjs <DSH-resources目录> --ssh-target <已有SSH别名>` 启动，数据保存在本项目 `.local/harness`。该目录内的数据须保密。
 

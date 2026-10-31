@@ -4,12 +4,13 @@ param(
     [string]$DshHome,
     [string]$Profile = 'desktop',
     [string]$PackageDirectory,
-    [switch]$Elevated
+    [switch]$Elevated,
+    [switch]$NoPause
 )
 
 $ErrorActionPreference = 'Stop'
 $BridgeExitCode = 1
-$BridgeWaitForClose = $true
+$BridgeWaitForClose = -not $NoPause
 try {
     Write-Host 'DSH 远程会话桥接插件更新' -ForegroundColor Cyan
     Write-Host '请先完全退出 DSH，包括托盘中的程序。'

@@ -62,7 +62,7 @@ function Start-Process {
     $process | Add-Member -MemberType ScriptMethod -Name Refresh -Value {}
     return $process
 }
-function Invoke-LauncherCase([string]$Scenario, [bool]$UseDefaults = $false, [bool]$CancelUac = $false, [bool]$AlreadyElevated = $false) {
+function Invoke-LauncherCase([string]$Scenario, [bool]$UseDefaults = $false, [bool]$CancelUac = $false, [bool]$AlreadyElevated = $false, [bool]$SkipPause = $false) {
     $env:LOCALAPPDATA = $fakeLocalAppData
     $env:DSH_HOME = $fakeHome
     $launcherState.uacCalls = 0; $launcherState.pauses = 0; $launcherState.cancel = $CancelUac; $launcherState.arguments = ''
@@ -71,6 +71,7 @@ function Invoke-LauncherCase([string]$Scenario, [bool]$UseDefaults = $false, [bo
     $parameters = @{}
     if (-not $UseDefaults) { $parameters = @{ DshExecutable = $fakeExecutable; DshHome = $fakeHome; Profile = 'custom-profile'; PackageDirectory = $candidate } }
     if ($AlreadyElevated) { $parameters.Elevated = $true }
+    if ($SkipPause) { $parameters.NoPause = $true }
     $output = @(& $launcher @parameters 6>&1)
     $resultCode = $LASTEXITCODE
     $calls = @(Get-Content -LiteralPath (Join-Path $candidate 'calls.jsonl') -Encoding UTF8 | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
@@ -117,7 +118,10 @@ try {
     $result = Invoke-LauncherCase 'success' $false $false $true
     Assert-Launcher ($result.code -eq 0 -and $launcherState.pauses -eq 1 -and $launcherState.uacCalls -eq 0) '管理员成功窗口未等待关闭'
     Write-Output '管理员成功窗口等待关闭：通过'
-    Write-Output ('Windows PowerShell {0}：双击入口纯模拟 7/7 通过；真实 UAC、DSH 及用户 Home 操作均为 0。' -f $PSVersionTable.PSVersion)
+    $result = Invoke-LauncherCase 'success' $false $false $false $true
+    Assert-Launcher ($result.code -eq 0 -and $launcherState.pauses -eq 0) '命令行入口不应等待关闭'
+    Write-Output '在线调用无需额外回车：通过'
+    Write-Output ('Windows PowerShell {0}：双击入口纯模拟 8/8 通过；真实 UAC、DSH 及用户 Home 操作均为 0。' -f $PSVersionTable.PSVersion)
 }
 finally {
     $env:LOCALAPPDATA = $originalLocalAppData

@@ -1,5 +1,5 @@
 /* DSH rc.5 client bundle: register one lazy factory with the existing shell. */
-window.__ModuleLoader__.load({ id: 'dsh-claude-bridge-ui', factory: (require) => {
+window.__ModuleLoader__.load({ id: 'dsh-claude-bridge', factory: (require) => {
 const module = { exports: {} };
 const exports = module.exports;
 const React = require('react');

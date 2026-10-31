@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote Session Bridge",
+    "description": "Use Claude on your own server with local settings, model selection, usage, and session status."
+  }
+}

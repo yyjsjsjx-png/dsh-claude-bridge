@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session management and recovery",
+    "description": "Validates session bindings and model selection while protecting history and recovery."
+  }
+}

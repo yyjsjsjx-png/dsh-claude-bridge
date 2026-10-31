@@ -17,7 +17,7 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 | 本机 | 自己的服务器 |
 | --- | --- |
 | DSH Desktop，实测基线 `0.2.1-rc.5` | Linux VPS、独立非 root 服务用户及独立部署目录 |
-| `v0.2.0` 插件 | Node.js `>=24.9`、npm、锁定 SDK `0.3.314` |
+| `v0.2.1` 插件 | Node.js `>=24.9`、npm、锁定 SDK `0.3.314` |
 | 无需安装 Claude Code 或 SDK | 官方 CLI `2.1.314` 和本人具备使用权限的 `claude.ai` 登录 |
 
 上表是本项目的要求及维护者实测范围，不是最新版声明，也不构成兼容性承诺。DSH 其他版本会按实际接口能力检查，仍需确认使用效果；服务器 SDK/CLI 不应静默升级。
@@ -37,10 +37,10 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 2. 在“插件 → 添加插件”填入固定标签：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.0
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.1
    ```
 
-   如果 GitHub 安装路径不可用，从 [v0.2.0 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.0) 下载插件 ZIP，解压后添加其中包含 `package.json` 的目录。启用 bundle，并按 DSH 提示重载。Release 已包含运行文件，无需编译。
+   如果 GitHub 安装路径不可用，从 [v0.2.1 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.1) 下载插件 ZIP，解压后添加其中包含 `package.json` 的目录。启用 bundle，并按 DSH 提示重载。Release 已包含运行文件，无需编译。
 3. 打开“设置 → 远程会话”，填写自己的服务器地址和桥接口令，保存后点击“测试连接并刷新模型”。这一步核对连接、官方登录及目录，不发送聊天提示词。
 4. 在会话首页点“新建远程会话”，选择账号目录实际返回的明确模型和受支持强度，再创建会话。不要依赖未知账号默认模型；普通原生“新会话”也不等价于此专用入口。
 5. 先用一条简短消息确认实际回复和本机工具权限。开始真实对话及工具任务会消耗你自己的 Claude 账号额度；模型目录成功不能代替对话验收。
@@ -55,7 +55,7 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 
 ## Windows 保留数据更新
 
-1. 下载 [v0.2.0 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.0/dsh-claude-bridge-0.2.0.zip)，解压到 DSH 数据目录以外。
+1. 下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.1/dsh-claude-bridge-0.2.1.zip)，解压到 DSH 数据目录以外。
 2. 等当前任务结束，完全退出 DSH，包括托盘程序。
 3. 双击包根目录的 **`更新插件.cmd`**。结果窗口会保留；仅在 Windows 确实要求提升权限时请求 UAC，提权前确定的目标目录不变。拒绝 UAC 会明确提示未执行，安装失败不会自动重复执行。
 4. 看到成功版本后，按回车关闭窗口并重启 DSH，核对插件版本及原会话。
@@ -94,4 +94,4 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 | 工具显示“待核实” | 先核对文件、进程或外部状态；不要把“没有回执”当成“没有执行” |
 | 运行中发消息却未立刻照做 | hook 附加上下文的响应由模型决定；需要结束当前操作时使用停止按钮 |
 
-更详细的部署故障检查见 [远程服务部署](remote-service.md)，功能验证与未覆盖范围见 [兼容与验收清单](compatibility-inventory.md)。
+更详细的部署故障检查见 [远程服务部署](remote-service.md)，支持的功能与限制见 [功能与兼容性](compatibility-inventory.md)。

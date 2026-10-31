@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Server connection and models",
+    "description": "Manages server connections, authentication status, models, history, and usage."
+  }
+}

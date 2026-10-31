@@ -26,17 +26,49 @@ test('实际 rc5：标准 bundle 接受不同版本号并检查实际 Host 能�
   const rows = boot.composeEntries([patches.filter(patch => patch.insert)])
   assert.equal(rows.length, 5)
   for (const row of rows) {
-    assert.ok(row.name.startsWith(pathToFileURL(resolve(root)).href + '/'))
-    await access(fileURLToPath(row.name))
+    assert.ok(row.name === manifest.name || row.name.startsWith(manifest.name + '/'))
+    await access(boot.resolvePluginResource(row.name, pathToFileURL(join(root, 'package.json')).href))
   }
   assert.equal(patches.some(row => ['session-controller', 'agent-preset-registry'].includes(row.id) && row.disabled), false)
   assert.equal(rows.some(row => row.id === 'claude-session-client'), false)
   for (const id of ['claude-bridge-ui']) {
     const row = rows.find(item => item.id === id)
-    const meta = JSON.parse(await readFile(join(dirname(fileURLToPath(row.name)), 'package.json'), 'utf8'))
+    const meta = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
     assert.equal(meta.dsh.client.platform, 'web')
     assert.equal(typeof meta.exports['./client'], 'string')
-    await access(join(dirname(fileURLToPath(row.name)), meta.exports['./client']))
+    await access(join(root, meta.exports['./client']))
+  }
+})
+
+test('实际 rc5：包及五组件使用原生展示信息，客户端只由界面组件加载', { skip: !native }, async () => {
+  const root = dirname(dirname(fileURLToPath(import.meta.url)))
+  const base = join(process.env.DSH_CLAUDE_BRIDGE_RESOURCES, 'app.asar/dsh/node_modules/@deepseek-ai')
+  const boot = await import(pathToFileURL(join(base, 'dsh-app-boot/lib/index.js')).href)
+  const { ClientModuleRegistry } = await import(pathToFileURL(join(base, 'dsh-client-modules/lib/index.js')).href)
+  const { ModuleLoader } = await import(pathToFileURL(join(base, 'cordis-plugin-loader/lib/index.js')).href)
+  const parent = pathToFileURL(join(root, 'package.json')).href
+  const rows = boot.composeEntries([boot.loadOverlayPatches('dsh', join(root, 'patches/bundle.patch.yml')).filter(row => row.insert)])
+  const registry = Object.create(ClientModuleRegistry.prototype)
+  Object.defineProperty(registry, 'ctx', { value: { loader: { internal: ModuleLoader.fromInternal() } } })
+  registry.pkgMeta = new Map()
+  for (const row of rows) {
+    const meta = boot.readPluginMeta(row.name, parent)
+    assert.equal(meta.error, undefined)
+    assert.ok(meta.title['zh-cn']?.length)
+    assert.ok(meta.description['zh-cn']?.length)
+    assert.ok(meta.title.en?.length)
+    assert.match(meta.icon, /^data:image\/svg\+xml;base64,/)
+    const client = registry.resolveMeta(row.name, parent)
+    const originalUrl = pathToFileURL(boot.resolvePluginResource(row.name, parent)).href
+    const directClient = registry.resolveMeta(originalUrl, parent)
+    if (row.id === 'claude-bridge-ui') {
+      assert.equal(client.packageName, 'dsh-claude-bridge')
+      assert.equal(resolve(client.meta.clientPath), join(root, 'plugin/ui/client.js'))
+      assert.equal(directClient.packageName, client.packageName)
+    } else {
+      assert.equal(client, null)
+      assert.equal(directClient, null)
+    }
   }
 })
 
