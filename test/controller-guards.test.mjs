@@ -109,7 +109,11 @@ test('预设守卫在首轮之前也拒绝更改且不会重组', async () => {
   const session = { id: 's', header: { agentPreset: 'standard' } };
   const agent = { id: 's', session };
   const registry = new Registry({ sessionProjections: { stateOf: () => 'standard' } }, {});
-  await assert.rejects(registry.select(agent, 'claude-sdk-remote'), /不能切换预设/);
+  await assert.rejects(registry.select(agent, 'claude-sdk-remote'), error => {
+    assert.equal(error.code, 'agent-preset/locked');
+    assert.equal(error.message, '请通过“新建远程 Claude”创建会话。');
+    return true;
+  });
   assert.equal(await registry.select(agent, 'standard'), 'standard');
   assert.equal(calls, 0);
 });

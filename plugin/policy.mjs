@@ -134,7 +134,9 @@ export function assertPresetUnchanged(currentPreset, requestedPreset) {
   const current = requiredName(currentPreset, '会话预设');
   const preset = requiredName(requestedPreset, '会话预设');
   if (preset !== current) {
-    fail('PRESET_LOCKED', '会话创建后不能切换预设，请新建会话。');
+    fail('PRESET_LOCKED', preset === CLAUDE_PRESET
+      ? '请通过“新建远程 Claude”创建会话。'
+      : '会话创建后不能切换预设，请新建会话。');
   }
   return current;
 }

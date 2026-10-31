@@ -78,7 +78,7 @@ export function createRemoteClaudePreset(standard) {
   return {
     id: CLAUDE_PRESET,
     name: '远程 Claude',
-    description: '使用远程 Claude Agent SDK 和本机 DSH 工具。',
+    description: '请通过“新建远程 Claude”创建会话。',
     order: 5,
     plugins,
   };

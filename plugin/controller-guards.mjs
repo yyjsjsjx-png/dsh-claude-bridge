@@ -201,9 +201,9 @@ export function makeLockedPresetRegistry(Base, RemoteError) {
       this.bridgeContext = ctx;
     }
 
-    async select(agent, requestedPreset) {
+    async select(agent, agentPreset) {
       const current = presetForAgent(this.bridgeContext, RemoteError, agent);
-      try { assertPresetUnchanged(current, requestedPreset); }
+      try { assertPresetUnchanged(current, agentPreset); }
       catch (error) { policyFailure(RemoteError, error, agent.id); }
       // Re-selecting the same preset is a no-op; do not recompose or append.
       return current;
