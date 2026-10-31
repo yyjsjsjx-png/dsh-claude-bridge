@@ -10,6 +10,27 @@ const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
 const OTHER_DEVICE = 'a4270ab7-90c7-440c-8fdc-5601b47dd29b'
 
+test('云端性能日志独立落盘，区分思考与正文并仅保存白名单耗时', async t => {
+  const f = await fixture(t, async function* ({ prompt }, state) {
+    await prompt.next(); state.exists = true
+    yield { type: 'stream_event', event: { type: 'message_start', message: { id: 'performance-test' } } }
+    yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0,
+      delta: { type: 'thinking_delta', thinking: 'PRIVATE_THINKING' } } }
+    yield { type: 'assistant', message: { id: 'performance-test', content: [{ type: 'text', text: 'PRIVATE_ANSWER' }] } }
+    yield { type: 'result', subtype: 'success', ttft_stream_ms: 120, first_content_frame_ms: 125,
+      duration_api_ms: 9000, unknown_duration_ms: 123, result: 'PRIVATE_ANSWER' }
+  })
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.status, 'completed')
+  const body = await readFile(join(f.config.sessionRoot, '_diagnostics', DEVICE, 'bridge.jsonl'), 'utf8')
+  assert.doesNotMatch(body, /PRIVATE_|unknown_duration_ms|prompt|account/)
+  const rows = body.trim().split('\n').map(JSON.parse)
+  const marks = rows.filter(row => row.event === 'perf.remote').map(row => row.stage)
+  assert.deepEqual(marks, ['start', 'hooks_verified', 'toolset_verified', 'first_model_event', 'first_token', 'first_text', 'completed'])
+  assert.equal(rows.find(row => row.event === 'perf.sdk' && row.stage === 'ttft_stream_ms').durationMs, 120)
+  assert.equal(rows.find(row => row.event === 'perf.sdk' && row.stage === 'duration_api_ms').durationMs, 9000)
+})
+
 test('额度 RPC 不发提示词或扫描聊天，只回传窗口并声明能力', async t => {
   const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
   f.state.planUsage = { rate_limits_available: true, rate_limits: {
@@ -165,7 +186,7 @@ async function fixture(t, queryImplementation) {
       const inner = queryImplementation(request, state)
       const generator = (async function* () {
         const names = request.options.mcpServers.dsh.instance.tools.map((tool) => `mcp__dsh__${tool.name}`)
-        yield { type: 'system', subtype: 'init', session_id: SESSION, tools: state.initTools ?? names }
+        yield { type: 'system', subtype: 'init', session_id: request.options.sessionId ?? request.options.resume ?? SESSION, tools: state.initTools ?? names }
         yield* inner
       })()
       generator.initializationResult = async () => ({ hooks_applied: state.hooksApplied ?? true, commands: state.commands ?? [] })
@@ -419,6 +440,26 @@ test('恢复会话必须匹配系统提示基线；旧基线缺失不猜测', as
   const legacy = await f.worker.handlers.query({ ...f.params, runId: 'run-legacy', resume: true }, f.context)
   assert.equal(legacy.code, 'SYSTEM_PROMPT_BASELINE_MISSING')
   assert.equal(f.state.queries.length, 1)
+})
+
+test('同一设备的不同会话可以同时执行且分别持有会话锁', { timeout: 3000 }, async t => {
+  let release, started, count = 0
+  const blocked = new Promise(resolve => { release = resolve })
+  const ready = new Promise(resolve => { started = resolve })
+  t.after(() => release())
+  const f = await fixture(t, async function* ({ prompt, options }) {
+    await prompt.next()
+    if (++count === 2) started()
+    await blocked
+    yield { type: 'result', subtype: 'success', session_id: options.sessionId }
+  })
+  const first = f.worker.handlers.query(f.params, f.context)
+  const second = f.worker.handlers.query({ ...f.params, runId: 'run-2',
+    sessionId: '8d04801d-7b17-4c52-9535-e10a9cc9358a', dshSessionId: 'dsh-session-2' }, f.context)
+  await ready
+  assert.equal(count, 2)
+  release()
+  assert.deepEqual((await Promise.all([first, second])).map(result => result.status), ['completed', 'completed'])
 })
 
 test('两个独立 worker 不能同时写入同一 SDK 会话', async (t) => {

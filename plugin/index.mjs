@@ -151,6 +151,7 @@ let ClaudeBridgeService = (() => {
     let _instanceExtraInitializers = [];
     let _status_decorators;
     let _saveConnection_decorators;
+    let _clearConnection_decorators;
     let _planUsage_decorators;
     let _syncSession_decorators;
     let _refreshCatalog_decorators;
@@ -162,6 +163,7 @@ let ClaudeBridgeService = (() => {
             const _metadata = typeof Symbol === "function" && Symbol.metadata ? Object.create(_classSuper[Symbol.metadata] ?? null) : void 0;
             _status_decorators = [Remote('status')];
             _saveConnection_decorators = [Remote('saveConnection')];
+            _clearConnection_decorators = [Remote('clearConnection')];
             _planUsage_decorators = [Remote('planUsage')];
             _syncSession_decorators = [Remote('syncSession')];
             _refreshCatalog_decorators = [Remote('refreshCatalog')];
@@ -170,6 +172,7 @@ let ClaudeBridgeService = (() => {
             _saveModelPreferences_decorators = [Remote('saveModelPreferences')];
             __esDecorate(this, null, _status_decorators, { kind: "method", name: "status", static: false, private: false, access: { has: obj => "status" in obj, get: obj => obj.status }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _saveConnection_decorators, { kind: "method", name: "saveConnection", static: false, private: false, access: { has: obj => "saveConnection" in obj, get: obj => obj.saveConnection }, metadata: _metadata }, null, _instanceExtraInitializers);
+            __esDecorate(this, null, _clearConnection_decorators, { kind: "method", name: "clearConnection", static: false, private: false, access: { has: obj => "clearConnection" in obj, get: obj => obj.clearConnection }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _planUsage_decorators, { kind: "method", name: "planUsage", static: false, private: false, access: { has: obj => "planUsage" in obj, get: obj => obj.planUsage }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _syncSession_decorators, { kind: "method", name: "syncSession", static: false, private: false, access: { has: obj => "syncSession" in obj, get: obj => obj.syncSession }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _refreshCatalog_decorators, { kind: "method", name: "refreshCatalog", static: false, private: false, access: { has: obj => "refreshCatalog" in obj, get: obj => obj.refreshCatalog }, metadata: _metadata }, null, _instanceExtraInitializers);
@@ -269,6 +272,12 @@ let ClaudeBridgeService = (() => {
             const result = await this.backend.saveConnection(value);
             this.catalogRegistration?.replace?.([CLAUDE_PROVIDER]);
             return { url: result.url, configured: result.configured, status: result.status };
+        }
+        async clearConnection() {
+            this.assertOwner();
+            const result = await this.backend.clearConnection();
+            this.catalogRegistration?.replace?.([CLAUDE_PROVIDER]);
+            return { configured: result.configured, status: result.status };
         }
         async planUsage(refresh) {
             this.assertOwner();

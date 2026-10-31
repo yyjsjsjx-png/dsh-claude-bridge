@@ -100,6 +100,53 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.deepEqual(Array.from(settings.hooks.settings.getSnapshot().selectedModelIds), ['sonnet']);
 });
 
+test('清除按钮清空凭据草稿和连接缓存，迟到的状态、模型和额度响应不能恢复旧配置', async () => {
+  const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
+  let entry, tokenDraft = 'unsaved-test-credential', configured = true, blocked = false, clicked;
+  const replies = new Map(), slots = new Map();
+  vm.runInNewContext(source, { window: { __ModuleLoader__: { load: value => { entry = value; } } } });
+  const react = { createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: () => [tokenDraft, value => { tokenDraft = value; }], useEffect() {} };
+  const client = entry.factory(name => name === 'react' ? react : name === 'zod' ? { z: {} } : {});
+  const status = () => ({ ok: true, value: { configured, url: configured ? 'wss://example.test/' : '',
+    connected: configured, authentication: configured ? 'logged-in' : 'unknown' } });
+  const pending = (name, value) => blocked ? new Promise(resolve => replies.set(name, () => resolve(value))) : Promise.resolve(value);
+  const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
+    remote: { $mount: async ({ descriptors }) => {
+      assert.ok(descriptors.some(item => item.method === 'clearConnection')); return () => {};
+    }, session: {}, claudeBridge: {
+      status: () => pending('status', status()),
+      modelPreferences: () => pending('models', { ok: true, value: { models: [{ value: 'haiku' }], enabledIds: ['haiku'] } }),
+      planUsage: () => pending('quota', { ok: true, value: { status: 'available', windows: [{ id: 'five_hour' }] } }),
+      clearConnection: async () => { configured = false; blocked = false; return { ok: true, value: { configured: false } }; },
+    } }, slots: { inject: (_name, register) => register(), register(options, component) {
+      slots.set(options.id, { options, component }); return () => {};
+    } }, inject: (_services, callback) => callback(ctx), effect() {} };
+  await client.apply(ctx);
+  const slot = slots.get('dsh-claude-bridge'), settings = slot.options.inject();
+  await settings.refreshStatus(); await settings.loadModels();
+  blocked = true;
+  const previousStatus = settings.refreshStatus(), previousModels = settings.loadModels();
+  const quota = slots.get('dsh-claude-quota').options.inject('s');
+  const previousQuota = quota.readQuota('manual');
+  const tree = slot.component({ ...settings, clear: () => { clicked = settings.clear(); return clicked; },
+    useSettings: select => select(settings.hooks.settings.getSnapshot()) });
+  const nodes = node => node == null || typeof node !== 'object' ? []
+    : Array.isArray(node) ? node.flatMap(nodes) : [node, ...nodes(node.children)];
+  const button = nodes(tree).find(node => node.type === 'button' && node.children.includes('清除已保存连接'));
+  assert.equal(button.props.disabled, false);
+  button.props.onClick(); await clicked;
+  assert.equal(tokenDraft, '');
+  for (const release of replies.values()) release();
+  await Promise.all([previousStatus, previousModels, previousQuota]);
+  const state = settings.hooks.settings.getSnapshot();
+  assert.equal(state.configured, false); assert.equal(state.connected, false);
+  assert.equal(state.url, ''); assert.equal(state.authentication, 'unknown');
+  assert.deepEqual(Array.from(state.models), []); assert.equal(state.modelsLoaded, false);
+  assert.equal(quota.hooks.quota.getSnapshot().status, 'unavailable');
+  assert.match(state.message, /已清除/u);
+});
+
 test('设置页打开及可见时刷新统计，合并请求并保留地址草稿，诊断默认收起', async () => {
   const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
   let entry;
@@ -384,4 +431,61 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   await quota.readQuota('manual');
   assert.equal(reads.length, 9);
   assert.equal(quota.hooks.quota.getSnapshot().status, 'available');
+});
+
+test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行中暂停并清理', async () => {
+  const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
+  let entry, nextTimer = 0, reads = 0, release;
+  const timers = new Map(), listeners = new Map(), effects = [];
+  const page = { hidden: false, body: {}, addEventListener: (name, fn) => listeners.set(name, fn),
+    removeEventListener: name => listeners.delete(name) };
+  const network = { onLine: true };
+  const setTimer = (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; };
+  vm.runInNewContext(source, { document: page, navigator: network, setTimeout: setTimer,
+    clearTimeout: id => timers.delete(id), window: { __ModuleLoader__: { load: value => { entry = value; } },
+      addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name) } });
+  const react = { createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: value => [value, () => {}], useRef: () => ({ current: null }), useEffect: effect => effects.push(effect) };
+  const client = entry.factory(name => name === 'react' ? react : name === 'react-dom'
+    ? { createPortal: value => value } : name === '@deepseek-ai/dsh-client-ui-primitives'
+      ? { useAnchoredPosition: () => ({}), useDismissOnOutsidePointer() {} } : { z: {} });
+  const slots = new Map();
+  const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
+    remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
+      status: async () => ({ ok: true, value: { configured: false } }),
+      syncSession: async () => { reads++; if (reads === 1) await new Promise(resolve => { release = resolve; });
+        return { ok: true, value: { status: 'ready' } }; },
+    } }, slots: { inject: (_name, register) => register(), register(options, component) {
+      slots.set(options.id, { options, component }); return () => {};
+    } }, inject: (_services, callback) => callback(ctx), effect() {} };
+  await client.apply(ctx);
+  const meter = slots.get('dsh-claude-context');
+  const render = phase => meter.component({ useBridgeStatus: select => select({ phase }), syncSession: meter.options.inject('test').syncSession });
+  render('completed');
+  const cleanup = effects.splice(0).map(effect => effect()).filter(value => typeof value === 'function');
+  assert.equal(reads, 1);
+  listeners.get('online')();
+  assert.equal(reads, 1);
+  release();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  assert.equal([...timers.values()][0].delay, 30_000);
+  await [...timers.values()][0].fn();
+  assert.equal(reads, 2);
+  page.hidden = true;
+  await listeners.get('visibilitychange')();
+  assert.equal(timers.size, 0);
+  assert.equal(reads, 2);
+  page.hidden = false; network.onLine = false;
+  await listeners.get('visibilitychange')();
+  assert.equal(reads, 2);
+  network.onLine = true;
+  await listeners.get('online')();
+  assert.equal(reads, 3);
+  for (const dispose of cleanup) dispose();
+  assert.equal(timers.size, 0);
+  assert.equal(listeners.size, 0);
+  render('running');
+  for (const effect of effects.splice(0)) effect();
+  assert.equal(reads, 3);
+  assert.equal(timers.size, 0);
 });

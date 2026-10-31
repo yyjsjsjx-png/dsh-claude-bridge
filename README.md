@@ -22,12 +22,14 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.1
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.2
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
 3. 在 **设置 → 远程 Claude** 保存服务提供方给出的 **`wss://…` 服务器地址**和**独立桥接口令**，点击“测试连接并刷新模型”。公网 WSS 直接连接，不需要 SSH、密钥文件或额外启动脚本。
 4. 在会话首页点击“新建远程 Claude”，选择账号实际返回的模型与推理强度，再开始对话。
+
+设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销其他设备持有的同一口令。
 
 如果服务器只提供回环入口，可选择 SSH 转发。标准内网端口为 `18944`；专用测试入口以提供方说明为准：
 
@@ -43,7 +45,7 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.1
+dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.2
 ```
 
 ## 已实现
@@ -56,6 +58,9 @@ dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-c
 - Host、worker 或服务崩溃后，从 SDK 原生记录补齐云端尾部，核对本机已保存结果及匹配的云端工具回执。界面显示恢复情况，用户可直接发下一条消息。
 - 无法确认的工具结果保留为“待核实”，不重发原请求。下一条用户输入可附带已核实的恢复事实和只读核实建议，成功送达后去重，不额外发模型请求。
 - 设置页打开时刷新本设备用量，前台每 5 秒更新，隐藏或离线暂停；兼容性和诊断明细默认收起。
+- 停轮后的续聊沿用连续流式序号；原生回复以完整快照结算，精确过滤 CLI 的合成 `No response requested.` 占位。普通同文回复和其他错误保留。
+- 当前会话轮末、恢复连接及重新可见时核对原生历史，前台空闲每 30 秒增量核对；升级后首次完整核对可修复旧版只保存尾部的展示。
+- 两端分段耗时、SDK 原始耗时字段、脱敏收集及性能报告。报告区分首 token 和首段正文，使用方式及虚拟机 agent 采集提示词见 [性能诊断](docs/performance.md)。
 
 ## 恢复边界
 
@@ -64,6 +69,19 @@ dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-c
 `/bridge-recovery` 可查看未知状态；用户核实后可用 `/bridge-recovery confirm` 解除后续运行门禁，原未知结果保持原样。停止不代表撤销已经产生的副作用。
 
 会话分叉、`subagent_fork`、计划模式和 DSH 本机压缩保持关闭。步骤和工具附加上下文只接受文本。多设备各自拥有独立历史，device ID 不是多用户授权边界。
+
+## 多设备与并发
+
+同一服务地址和桥接口令可以供账号所有者自己的多台设备使用。各设备首次运行时生成独立 device ID；只复制连接地址和口令，不复制整个 DSH 数据目录。
+
+| 场景 | 行为 |
+| --- | --- |
+| 多台设备 | 每台设备独立 worker 和会话绑定，可以同时使用；历史不自动跨设备共享 |
+| 同一 Host 的多个窗口或会话 | 共享一条桥接连接；不同会话可并行，同一会话的运行和维护串行 |
+| 普通 DSH 子代理 | 新建独立会话，继承父代理模型；可与其他会话并行，沿用 DSH 深度限制 |
+| 同一 device ID 启动两个独立 Host | 已有连接仍活跃时拒绝后者；不允许两端抢写相同设备状态 |
+
+普通新建子代理与会话分叉不同，`subagent_fork` 仍关闭。设备、窗口和子代理共享服务器资源与同一 Claude 账号额度，可能受到上游限流。本版本没有账号级公平排队器；服务默认最多保留 16 个连接槽位（含短断保留项），这不是模型会话并发数保证。基础设备隔离、不同会话并行及同会话锁已有确定性测试；复杂并发父子崩溃恢复和容量压测尚未验收。
 
 ## 部署与验证
 

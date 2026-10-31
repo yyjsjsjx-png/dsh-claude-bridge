@@ -65,6 +65,22 @@ test('远程地址要求 WSS，拒绝地址凭据、查询参数与不安全 WS'
   ]) assert.throws(() => validateServerUrl(url))
 })
 
+test('清除连接移除地址和专属凭据，重复清除安全且重新保存沿用设备身份', async t => {
+  const deviceId = randomUUID()
+  const { directory, credentials, settings } = await fixture(t, { deviceId })
+  await credentials.modifyRecord('other-plugin/connection', () => ({ kind: 'grant', payload: { unrelated: true } }))
+  await settings.save({ url: 'wss://example.test/', token: 'C'.repeat(43) })
+  await settings.clear()
+  assert.deepEqual(await settings.read(), { url: undefined, configured: false, status: 'missing' })
+  assert.deepEqual(await readdir(directory), [])
+  assert.equal(await credentials.readRecord('dsh-claude-bridge/connection'), undefined)
+  assert.equal((await credentials.readRecord('other-plugin/connection')).payload.unrelated, true)
+  await assert.rejects(settings.resolve(), { code: 'SETTINGS_MISSING' })
+  await settings.clear()
+  await settings.save({ url: 'wss://example.test/', token: 'D'.repeat(43) })
+  assert.equal((await settings.resolve()).deviceId, deviceId)
+})
+
 test('地址与凭据不匹配时停止连接，失败保存不覆盖已有凭据', async (t) => {
   const { configPath, credentials, settings } = await fixture(t)
   const token = 'A'.repeat(43)

@@ -1,6 +1,7 @@
 import { open, readFile, rename, unlink } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ID = /^(?!__proto__$|constructor$|prototype$)[A-Za-z0-9_.:-]{1,256}$/
@@ -136,6 +137,7 @@ export function createHistoryReader({ sdk, sessionRoot, authorizedDeviceId, acqu
         const body = item.message
         if (!body || typeof body !== 'object') throw problem('HISTORY_INVALID', 'SDK 历史消息无法读取')
         if (item.type === 'assistant') {
+          if (isNoResponsePlaceholder(body)) continue
           const content = []
           for (const block of Array.isArray(body.content) ? body.content : []) {
             if (!object(block)) throw problem('HISTORY_INVALID', 'SDK 历史内容无效')

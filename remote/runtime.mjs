@@ -8,6 +8,8 @@ import { CatalogError, createCatalogReader, validateModelSelection } from './cat
 import { AuthError, createAuthReader } from './auth.mjs'
 import { sdkErrorDetail } from './errors.mjs'
 import { createHistoryReader, createRunStore } from './history.mjs'
+import { createDiagnostics } from '../src/diagnostics.mjs'
+import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 
 const MAX_PROMPT_BYTES = 3 * 1024 * 1024
 const MAX_INSTRUCTION_BYTES = 1024 * 1024
@@ -361,6 +363,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   const activeSessions = new Set()
   const activeRuns = new Map()
   const completedRuns = new Map()
+  const diagnosticLogs = new Map()
   const childEnv = cleanChildEnvironment({ homeDir, configDir, cliPath, userName })
   const catalogReader = createCatalogReader({ sdk, sessionRoot, cliPath, childEnv })
   const planUsageReader = createPlanUsageReader({ sdk, sessionRoot, cliPath, childEnv })
@@ -468,15 +471,24 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     let lockLost = false
     let onAbort
     let authFlowFailed = false
-    const started = Date.now()
+    let diagnosticLog
+    const started = performance.now()
+    const elapsed = () => Math.round(performance.now() - started)
     const diagnose = (stage, event, code) => {
       if (!runId) return
+      diagnosticLog?.event(event, { runId, stage, durationMs: elapsed(), ...(code ? { code } : {}) })
       try {
         context.peer.notify('diagnostic', {
-          runId, stage, event, durationMs: Date.now() - started,
+          runId, stage, event, durationMs: elapsed(),
           ...(code === undefined ? {} : { code }),
         })
       } catch { /* A broken transport is handled by the active query signal. */ }
+    }
+    const timing = (stage, durationMs = elapsed(), event = 'perf.remote') => {
+      const fields = { runId, stage, durationMs, model: params.model, effort: params.effort,
+        method: params.action === 'compact' ? 'compact' : 'query' }
+      diagnosticLog?.event(event, fields)
+      try { context.peer.notify('diagnostic', { event, ...fields }) } catch {}
     }
     try {
       requireObject(params, '请求')
@@ -544,6 +556,10 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       await requireAuth(controller.signal)
       const models = await catalogReader.read({ signal: controller.signal })
       const selectedModel = validateModelSelection(models, params.model, params.effort)
+      if (!diagnosticLogs.has(deviceId)) diagnosticLogs.set(deviceId,
+        createDiagnostics({ directory: join(sessionRoot, '_diagnostics', deviceId) }))
+      diagnosticLog = diagnosticLogs.get(deviceId)
+      timing('start')
       diagnose('validation', 'complete')
       throwIfAborted(controller.signal)
       if (activeSessions.has(sessionId)) {
@@ -934,6 +950,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         let compactMetadata
         let assistantError
         let toolsetVerified = false
+        let firstModelEvent = false, firstToken = false, firstText = false
         const sdkQuery = sdk.query({ prompt: promptStream(), options: sdkOptions })
         try {
           const initialized = await verifyHooksApplied(sdkQuery, controller)
@@ -941,6 +958,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             throw new WorkerError('COMPACT_UNAVAILABLE', '当前 SDK 会话未提供官方 compact 命令')
           }
           diagnose('sdk', 'hooks-verified')
+          timing('hooks_verified')
           beginPrompt()
           for await (const message of sdkQuery) {
           throwIfAborted(controller.signal)
@@ -951,9 +969,27 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             verifyToolset(message, sessionId, qualifiedNames)
             toolsetVerified = true
             diagnose('sdk', 'toolset-verified')
+            timing('toolset_verified')
           }
           if (!toolsetVerified && (message?.type === 'assistant' || message?.type === 'stream_event')) {
             throw new WorkerError('SDK_TOOLSET_UNVERIFIED', 'SDK 未提供可验证的工具清单')
+          }
+          if (!compact && (message?.type === 'stream_event'
+            || (message?.type === 'assistant' && !isNoResponsePlaceholder(message.message)))) {
+            if (!firstModelEvent) { firstModelEvent = true; timing('first_model_event') }
+            const delta = message.event?.type === 'content_block_delta' ? message.event.delta : undefined
+            const token = delta?.type === 'text_delta' ? delta.text : delta?.type === 'thinking_delta'
+              ? delta.thinking : delta?.type === 'input_json_delta' ? delta.partial_json : undefined
+            const full = message.type === 'assistant' ? message.message?.content : undefined
+            if (!firstToken && ((typeof token === 'string' && token.length)
+              || full?.some(block => (block.type === 'text' && block.text?.length)
+                || (block.type === 'thinking' && block.thinking?.length) || block.type === 'tool_use'))) {
+              firstToken = true; timing('first_token')
+            }
+            if (!firstText && ((delta?.type === 'text_delta' && delta.text?.length)
+              || full?.some(block => block.type === 'text' && block.text?.length))) {
+              firstText = true; timing('first_text')
+            }
           }
           if (compact && message?.type === 'system' && message.subtype === 'compact_boundary'
             && message.compact_metadata?.trigger === 'manual') {
@@ -1001,6 +1037,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           }
           if (message?.type === 'result') {
             result = message
+            if (!compact) for (const key of ['ttft_ms', 'ttft_stream_ms', 'time_to_request_ms', 'first_content_frame_ms', 'duration_ms', 'duration_api_ms']) {
+              if (Number.isFinite(message[key]) && message[key] >= 0) timing(key, message[key], 'perf.sdk')
+            }
             if (message.subtype === 'success' && message.is_error !== true) contextSummary = await readContextSummary(sdkQuery, diagnose)
             releasePrompt()
           }
@@ -1038,6 +1077,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           return run.outcome
         }
         diagnose('sdk', 'completed')
+        timing('completed')
         const metrics = resultMetrics(result, runId, contextSummary)
         run.outcome = { sessionId, status: 'completed', ...(metrics ? { metrics } : {}),
           ...(compact ? { compaction: compactMetadata ?? { status: 'unchanged' } } : {}) }
@@ -1092,6 +1132,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       }
       if (onAbort) context.signal?.removeEventListener('abort', onAbort)
       if (active) activeSessions.delete(sessionId)
+      if (diagnosticLog) await diagnosticLog.flush().catch(() => {
+        try { context.peer.notify('diagnostic', { event: 'diagnostics.failed', runId, code: 'DIAGNOSTIC_WRITE_FAILED' }) } catch {}
+      })
     }
   }
 

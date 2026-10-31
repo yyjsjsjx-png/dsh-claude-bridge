@@ -1,5 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import vm from 'node:vm'
 import { SdkProjection } from '../src/sdk-projection.mjs'
 
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
@@ -16,7 +18,7 @@ async function fixture() {
     dispatch: { emit(type, value) { frames.push({ type, ...value }) } },
   }
   const projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'haiku', async onUsage() {} })
-  return { records, frames, projection }
+  return { records, frames, projection, agent, helpers }
 }
 
 test('实际 rc5 helper：整轮停止保留已收到文本，冻结后续流和完整消息', { skip: !available }, async () => {
@@ -181,8 +183,87 @@ test('实际 rc5 helper：相同 SDK message ID 的不同工具块均保留', { 
       { type: 'tool_use', id, name: 'mcp__dsh__local_smoke', input: {} },
     ] } })
   }
-  const blocks = records.filter((record) => record.type === 'assistant/message').flatMap((record) => record.data.message.content)
+  const blocks = records.filter((record) => record.type === 'assistant/message').at(-1).data.message.content
   assert.deepEqual(blocks.filter((block) => block.type === 'tool-call').map((block) => block.id), ['toolu_one', 'toolu_two'])
+})
+
+test('实际原生客户端：停止后两次续聊 revision 连续，完整答复从流式结算后不消失', { skip: !available }, async () => {
+  const f = await fixture()
+  const source = await readFile(new URL('../plugin/session-client/client.js', import.meta.url), 'utf8')
+  const start = source.indexOf('var ClientAssistantStream = class')
+  const end = source.indexOf('//#endregion', start)
+  assert.ok(start > 0 && end > start)
+  // Run the shipped native fold without modifying the vendored module.
+  const fold = vm.runInNewContext(`${source.slice(start, end)}; new ClientAssistantStream()`)
+  fold.replace([])
+  const visible = []
+  let seq = 0
+  const decision = result => {
+    assert.notEqual(result?.type, 'rebaseline')
+    if (result?.entry?.event.type === 'assistant/message') visible.push(result.entry.event)
+  }
+  f.agent.session.append = (type, data, intent) => {
+    const event = { seq: seq++, time: Date.now(), type, data, ...intent }
+    f.records.push(event)
+    decision(fold.acceptDurable({ type: 'durable', event }))
+    return event
+  }
+  f.agent.dispatch.emit = (type, value) => {
+    const frame = { ...value.frame, ...(value.frame.type === 'start' ? { startedAfterSeq: seq - 1 } : {}) }
+    f.frames.push(frame)
+    decision(fold.acceptFrame(frame))
+  }
+  const stream = async (projection, id, text) => {
+    await projection.accept({ type: 'stream_event', event: { type: 'message_start', message: { id, model: 'haiku' } } })
+    await projection.accept({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text' } } })
+    await projection.accept({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } })
+  }
+  await stream(f.projection, 'stopped', '停止前输出')
+  f.projection.interrupt()
+  f.agent.session.append('step/end', { turn: 1, step: 1 })
+  for (const turn of [2, 3]) {
+    const projection = new SdkProjection({ agent: f.agent, helpers: f.helpers, turn, step: 1, model: 'haiku' })
+    const text = `续聊完整回复-${turn}`
+    await projection.accept({ type: 'assistant', message: { id: 'synthetic', model: '<synthetic>', content: [{ type: 'text', text: 'No response requested.' }] } })
+    await stream(projection, `answer-${turn}`, text)
+    // Actual CLI emits the full text before its content_block_stop.
+    await projection.accept({ type: 'assistant', message: { id: `answer-${turn}`, model: 'haiku', content: [{ type: 'text', text }] } })
+    await projection.accept({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
+    await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 4 } } })
+    await projection.accept({ type: 'stream_event', event: { type: 'message_stop' } })
+    assert.equal(visible.at(-1).data.message.content[0].text, text)
+    const settled = visible.length
+    await projection.accept({ type: 'assistant', message: { id: 'late-synthetic', model: '<synthetic>', content: [{ type: 'text', text: 'No response requested.' }] } })
+    await projection.accept({ type: 'result', subtype: 'success', usage: { input_tokens: 1, output_tokens: 4 } })
+    assert.equal(visible.length, settled)
+    f.agent.session.append('step/end', { turn, step: 1 })
+  }
+  assert.equal(visible.length, 3)
+  assert.deepEqual(f.frames.map(frame => frame.revision), f.frames.map((_, index) => index + 1))
+})
+
+test('实际 rc5 helper：同一步多个工具片段结算为累计快照，后续 usage 不创建空回复', { skip: !available }, async () => {
+  const { records, projection } = await fixture()
+  for (const [id, text] of [['one', '工具前文本'], ['two', '第二段说明']]) {
+    await projection.accept({ type: 'assistant', message: { id: 'shared-api', model: 'haiku', content: [
+      { type: 'text', text }, { type: 'tool_use', id, name: 'mcp__dsh__local_smoke', input: {} },
+    ] } })
+  }
+  const before = records.length
+  await projection.accept({ type: 'result', usage: { output_tokens: 3 } })
+  assert.equal(records.length, before)
+  assert.deepEqual(records.at(-1).data.message.content.map(block => block.text ?? block.id), ['工具前文本', 'one', '第二段说明', 'two'])
+})
+
+test('实际 rc5 helper：首 token 和首正文分开计时，每轮只各报告一次', { skip: !available }, async () => {
+  const { projection } = await fixture()
+  const times = []
+  projection.onFirstToken = type => times.push(type)
+  projection.onFirstText = () => times.push('body')
+  await projection.accept({ type: 'assistant', message: { id: 'timed', content: [{ type: 'thinking', thinking: '合成分析' }] } })
+  await projection.accept({ type: 'assistant', message: { id: 'timed', content: [{ type: 'text', text: '合成正文' }] } })
+  await projection.accept({ type: 'result' })
+  assert.deepEqual(times, ['reasoning-delta', 'body'])
 })
 
 test('实际 rc5 helper：部分流只有文本时仍补全完整消息里的工具块', { skip: !available }, async () => {

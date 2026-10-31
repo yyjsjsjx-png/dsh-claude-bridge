@@ -20,10 +20,39 @@ test('恢复合并 SDK 同消息分段，补齐中断尾部且重复同步不重
     { type: 'assistant', apiId: 'api-1', uuid: 'part-2', model: 'fixture', content: [{ type: 'text', text: '和完整尾部' }] },
   ])
   assert.equal(restoreAssistant(f.session, merged[0], history, f.helpers, 'fixture'), 1)
-  assert.equal(f.events.at(-1).data.message.content[0].text, '和完整尾部')
+  assert.deepEqual(f.events.at(-1).data.message.content, merged[0].content)
   assert.equal(restoreAssistant(f.session, merged[0], history, f.helpers, 'fixture'), 0)
   assert.equal(restoreAssistant(f.session, merged[0], localHistory(f.session), f.helpers, 'fixture'), 0)
   assert.throws(() => restoreAssistant(f.session, { ...merged[0], content: [{ type: 'text', text: '不一致的替代正文' }] }, history, f.helpers, 'fixture'), { code: 'HISTORY_DIVERGED' })
+})
+
+test('恢复旧版补尾记录为完整快照，保留原步骤并修复被占位消息遮挡的回复', () => {
+  const f = fixture()
+  const append = (content, step = 3, id = assistantIdentity('api-old', content)) => f.session.append('assistant/message', {
+    turn: 2, step, message: { id, content },
+  })
+  append([{ type: 'text', text: '合成开头' }])
+  append([{ type: 'text', text: '补齐尾部' }])
+  append([{ type: 'text', text: 'No response requested.' }], 3, 'synthetic-placeholder')
+  const record = { type: 'assistant', apiId: 'api-old', model: 'fixture', content: [{ type: 'text', text: '合成开头补齐尾部' }] }
+  const history = localHistory(f.session)
+  history.turn = 9; history.step = 1
+  assert.equal(restoreAssistant(f.session, record, history, f.helpers), 1)
+  assert.equal(f.events.at(-1).data.turn, 2)
+  assert.equal(f.events.at(-1).data.step, 3)
+  assert.deepEqual(f.events.at(-1).data.message.content, record.content)
+  assert.equal(restoreAssistant(f.session, record, localHistory(f.session), f.helpers), 0)
+})
+
+test('仅忽略 CLI 的精确合成占位，普通同文回复和其他 synthetic 错误保留', () => {
+  const f = fixture(), history = localHistory(f.session)
+  const record = { type: 'assistant', apiId: 'placeholder', uuid: 'p', model: '<synthetic>',
+    content: [{ type: 'text', text: 'No response requested.' }] }
+  assert.equal(restoreAssistant(f.session, record, history, f.helpers), 0)
+  assert.equal(coalesceHistory([record]).length, 0)
+  assert.equal(restoreAssistant(f.session, { ...record, apiId: 'real', model: 'fixture' }, history, f.helpers), 1)
+  history.step++
+  assert.equal(restoreAssistant(f.session, { ...record, apiId: 'error', content: [{ type: 'text', text: 'Other error' }] }, history, f.helpers), 1)
 })
 
 test('未知占位结果不能冒充真实结果，实际已保存的失败结果仍是可核实结果', () => {

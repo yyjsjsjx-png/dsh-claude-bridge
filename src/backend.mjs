@@ -14,7 +14,8 @@ import { defaultVisibleIds, validateVisibleIds } from './model-preferences.mjs'
 import { imageCapability } from './model-capabilities.mjs'
 import { contextSnapshot, initialSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
-import { localHistory, coalesceHistory, restoreAssistant, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
 
 function failure(code, message) {
@@ -49,6 +50,10 @@ export class BridgeBackend {
     this.compatibility = []
     this.connection = undefined
     this.connecting = undefined
+    this.connectionRevision = 0
+    this.connectionAbort = new AbortController()
+    this.connectionUsers = 0
+    this.connectionChanging = false
     this.disposed = false
     this.lifetime = new AbortController()
   }
@@ -63,14 +68,52 @@ export class BridgeBackend {
   }
 
   async saveConnection(value) {
-    if (this.runs.size) throw failure('BRIDGE_BUSY', '请等待当前任务结束后更改服务器。')
-    const accepted = await (await this.settings()).save(value)
-    if (this.connection) await this.connection.close()
+    return this.changeConnection(settings => settings.save(value))
+  }
+
+  async clearConnection() {
+    return this.changeConnection(settings => settings.clear())
+  }
+
+  async changeConnection(operation) {
+    if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
+    if (this.connectionChanging || this.connectionUsers || this.runs.size || this.syncing.size) {
+      throw failure('BRIDGE_BUSY', '请等待当前任务或历史同步结束后更改连接。')
+    }
+    this.connectionChanging = true
+    this.connectionRevision++
+    this.connectionAbort.abort()
+    this.connectionAbort = new AbortController()
+    const transport = this.connection
+    const connecting = this.connecting
     this.connection = undefined
+    this.connecting = undefined
+    this.initialized = undefined
     this.authentication = 'unknown'
     this.catalogCache = undefined
+    this.catalogPending = undefined
     this.planUsageCache = undefined
-    return accepted
+    this.planUsagePending = undefined
+    let closeError
+    const closing = Promise.all([
+      Promise.resolve().then(() => transport?.close()).catch(error => { closeError = error }),
+      connecting?.catch(() => {}),
+    ])
+    try {
+      const accepted = await operation(await this.settings())
+      await closing
+      if (closeError) throw failure('CONNECTION_CLOSE_FAILED', '连接设置已更新，但旧连接未能确认关闭，请重载插件。')
+      return accepted
+    } finally {
+      await closing
+      this.connectionChanging = false
+    }
+  }
+
+  async useConnection(operation) {
+    if (this.connectionChanging) throw failure('BRIDGE_BUSY', '连接设置正在更改，请稍后重试。')
+    this.connectionUsers++
+    try { return await operation() } finally { this.connectionUsers-- }
   }
 
   async status() {
@@ -101,9 +144,11 @@ export class BridgeBackend {
 
   async refreshAuthentication() {
     this.planUsageCache = undefined
+    const revision = this.connectionRevision
     const transport = await this.connect()
     try {
       const status = await transport.peer.request('authStatus', { refresh: true }, { timeoutMs: 30000 })
+      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (status.status === 'failed' || typeof status.loggedIn !== 'boolean') {
         throw failure(status.code ?? 'AUTH_STATUS_UNAVAILABLE', status.message ?? '无法验证服务器上的 Claude 登录状态。')
       }
@@ -111,27 +156,33 @@ export class BridgeBackend {
       if (status.loggedIn !== true) throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
       return status
     } catch (error) {
-      this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
+      if (revision === this.connectionRevision) this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
       throw error
     }
   }
 
   async connect({ signal } = {}) {
     if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
+    if (this.connectionChanging) throw failure('BRIDGE_BUSY', '连接设置正在更改，请稍后重试。')
     if (this.connection) return this.connection
     if (this.connecting) return this.connecting
-    this.connecting = (async () => {
+    const revision = this.connectionRevision
+    const connectionSignal = this.connectionAbort.signal
+    const pending = (async () => {
       await this.state.ready
       const options = {
-        signal: AbortSignal.any([signal, this.lifetime.signal].filter(Boolean)),
+        signal: AbortSignal.any([signal, this.lifetime.signal, connectionSignal].filter(Boolean)),
         handlers: {
           'tool.execute': (params, context) => this.dispatchTool(params, context),
           'approval.request': (params, context) => this.dispatchApproval(params, context),
           'step.prepare': (params, context) => this.prepareStep(params, context),
         },
         onNotification: (method, params) => this.notification(method, params),
-        onClose: () => { this.connection = undefined; this.planUsageCache = undefined },
+        onClose: () => {
+          if (revision === this.connectionRevision) { this.connection = undefined; this.planUsageCache = undefined }
+        },
         onConnectionState: connection => {
+          if (revision !== this.connectionRevision) return
           for (const run of this.runs.values()) {
             try { this.sessionStatus(run.agent, { connection }) }
             catch { this.diagnostics.event('run.connection_status_failed', { runId: run.runId, code: 'STATUS_FAILED' }) }
@@ -153,7 +204,9 @@ export class BridgeBackend {
         transport = await createWebSocketTransport({ ...options, ...configured, initialConnectWindowMs: 60_000 })
       }
       try {
+        if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         const initialized = await transport.peer.request('initialize', { protocolVersion: 1 }, { timeoutMs: 30000 })
+        if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         if (initialized.protocolVersion !== 1) throw failure('PROTOCOL_MISMATCH', '服务器协议不兼容。')
         this.initialized = initialized
         this.authentication = initialized.authenticated === true ? 'logged-in' : initialized.authenticated === false ? 'login-required' : 'unknown'
@@ -162,18 +215,21 @@ export class BridgeBackend {
         return transport
       } catch (error) { await transport.close(); throw error }
     })()
-    try { return await this.connecting } finally { this.connecting = undefined }
+    this.connecting = pending
+    try { return await pending } finally { if (this.connecting === pending) this.connecting = undefined }
   }
 
   async catalog({ refresh = false } = {}) {
     if (!refresh && this.catalogCache && Date.now() - this.catalogCache.time < 30000) return structuredClone(this.catalogCache.reply)
     if (this.catalogPending) return this.catalogPending
+    const revision = this.connectionRevision
     const pending = (async () => {
       const transport = await this.connect()
       // Automatic model resolution may call this once for every catalog row.
       // Only the explicit refresh action forces a fresh CLI auth check.
       if (refresh) await this.refreshAuthentication()
       const reply = await transport.peer.request('catalog', { refresh }, { timeoutMs: 45000 })
+      if (revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (reply.status !== 'ok') throw failure(reply.code ?? 'CATALOG_UNAVAILABLE', reply.message ?? '无法获取当前账号模型目录。')
       this.catalogCache = { time: Date.now(), reply: structuredClone(reply) }
       return reply
@@ -186,6 +242,7 @@ export class BridgeBackend {
     if (typeof refresh !== 'boolean') return { status: 'unavailable', code: 'INVALID_REQUEST' }
     if (!refresh && this.planUsageCache?.until > Date.now()) return structuredClone(this.planUsageCache.value)
     if (this.planUsagePending) return this.planUsagePending
+    const revision = this.connectionRevision
     const pending = (async () => {
       let value
       try {
@@ -197,6 +254,7 @@ export class BridgeBackend {
         if (this.connection !== transport) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
         value = sanitizePlanUsage(reply)
       } catch (error) { value = sanitizePlanUsage({ status: 'unavailable', code: error.code ?? 'QUOTA_READ_FAILED' }) }
+      if (revision !== this.connectionRevision) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
       if (['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(value.code)) this.authentication = 'login-required'
       this.planUsageCache = { value, until: value.status === 'available' ? planUsageFreshUntil(value) : Date.now() + 30_000 }
       return structuredClone(value)
@@ -245,6 +303,11 @@ export class BridgeBackend {
       throw failure('UNEXPECTED_RUN_EVENT', '收到不属于当前运行的 SDK 事件。')
     }
     if (run.kind === 'compact') return
+    if (!run.firstModelEvent && (params.message?.type === 'stream_event'
+      || (params.message?.type === 'assistant' && !isNoResponsePlaceholder(params.message.message)))) {
+      run.firstModelEvent = true
+      run.timing('first_model_event')
+    }
     await run.projection.accept(params.message)
     await this.checkpoint(run.agent.session)
   }
@@ -256,6 +319,7 @@ export class BridgeBackend {
   }
 
   async syncSession(agent, { signal, withinRun = false } = {}) {
+    if (this.connectionChanging) throw failure('BRIDGE_BUSY', '连接设置正在更改，请稍后同步。')
     if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { status: 'not-remote' }
     if (this.syncing.has(agent.id)) return this.syncing.get(agent.id)
     if ([...this.runs.values()].some(run => run.agent.id === agent.id)) return { status: 'active' }
@@ -277,7 +341,9 @@ export class BridgeBackend {
         local.turn = pending.findLast(run => Number.isSafeInteger(run.turn))?.turn
           ?? Math.max(1, local.turn - (withinRun ? 1 : 0))
         const cloudResults = new Map()
-        let cursor = pending.some(run => !run.reconciledAt) ? { offset: 0, lastUuid: null }
+        // Reconcile once in full after upgrading from the old tail-only
+        // projection so an already hidden answer can be repaired as well.
+        let cursor = binding.historyCursor?.projectionVersion !== 2 || pending.some(run => !run.reconciledAt) ? { offset: 0, lastUuid: null }
           : binding.historyCursor ?? { offset: 0, lastUuid: null }
         let cloudRuns = {}, added = 0, bytes = 0, reset = false, done = false
         const records = []
@@ -310,8 +376,13 @@ export class BridgeBackend {
             if (record.type === 'prompt' && binding.runs?.[record.uuid]?.turn) {
               local.turn = binding.runs[record.uuid].turn; local.step = binding.runs[record.uuid].step
             } else if (record.type === 'assistant') {
+              const previous = local.assistants.findLast(event => event.data.message.id.startsWith(assistantPrefix(record.apiId)))
+              if (previous) { local.turn = previous.data.turn; local.step = previous.data.step }
               added += restoreAssistant(agent.session, record, local, this.helpers,
                 agent._bridgeStatus?.model ?? selectionFor(this.ctx, agent).model)
+              // Each distinct main-agent API response owns a DSH step. Tool
+              // results and split transcript blocks must not collapse them.
+              local.step++
             } else if (record.type === 'tool-result') cloudResults.set(record.callId, record)
         }
         const updates = []
@@ -346,7 +417,7 @@ export class BridgeBackend {
             ? observed : run.status === 'prepared' ? 'not-sent' : 'unknown', tools })
         }
         await this.checkpoint(agent.session)
-        await this.state.reconcileRecovery(agent.id, updates, cursor)
+        await this.state.reconcileRecovery(agent.id, updates, { ...cursor, projectionVersion: 2 })
         await this.state.markStarted(agent.id)
         const previous = agent._bridgeStatus ?? this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
         const interrupted = pending.length > 0 || ['running', 'stopping', 'unknown'].includes(previous?.phase)
@@ -405,7 +476,7 @@ export class BridgeBackend {
       if (agent.phase?.kind !== 'idle' || typeof agent.runMaintenance !== 'function') {
         throw failure('BRIDGE_BUSY', '请等待当前运行结束后再压缩。')
       }
-      return await agent.runMaintenance(async maintenanceSignal => {
+      return await this.useConnection(() => agent.runMaintenance(async maintenanceSignal => {
         const signal = AbortSignal.any([maintenanceSignal, commandSignal])
         signal.throwIfAborted()
         const selected = selectionFor(this.ctx, agent)
@@ -478,7 +549,7 @@ export class BridgeBackend {
           await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'), Boolean(run.journalError))
           await this.diagnostics.flush()
         }
-      })
+      }))
     } catch (error) {
       const messages = { BRIDGE_BUSY: '请等待当前运行结束后再压缩。',
         NATIVE_CONTEXT_MISSING: '会话尚未建立可恢复的远端上下文。',
@@ -514,13 +585,25 @@ export class BridgeBackend {
   }
 
   async runStep(agent, decision) {
+    return this.useConnection(() => this.performRunStep(agent, decision))
+  }
+
+  async performRunStep(agent, decision) {
+    const enteredAt = performance.now()
     const phase = agent.phase
     if (phase?.kind !== 'running') throw failure('INVALID_AGENT_PHASE', '会话尚未进入执行阶段。')
     const { turn, step, abort: { signal } } = phase
     signal.throwIfAborted()
     const selected = selectionFor(this.ctx, agent)
+    const runId = randomUUID()
+    const timing = (stage, method) => this.diagnostics.event('perf.local', {
+      runId, sessionId: agent.id, model: selected.model, effort: selected.reasoningEffort,
+      stage, durationMs: Math.round(performance.now() - enteredAt), ...(method ? { method } : {}),
+    })
+    timing('start')
     let binding = await this.state.binding(agent.id, agent.session.header.cwd)
     const transport = await this.connect({ signal })
+    timing('connected')
     if (this.initialized?.capabilities?.historySync === true) {
       const deadline = Date.now() + 120_000
       let retries = 0
@@ -532,7 +615,7 @@ export class BridgeBackend {
       }
       binding = await this.state.binding(agent.id, agent.session.header.cwd)
     }
-    const runId = randomUUID()
+    timing('history_checked')
     const converted = await this.convertTools(decision.assembly, selected)
     this.compatibility = converted.compatibility
     const refreshed = this.ctx.systemPrompt.refreshContext(decision.assembly, this.helpers.assembleContextFor(agent, signal))
@@ -568,11 +651,13 @@ export class BridgeBackend {
       agent.session.append('system/message', { turn, step, message }, intent)
     }
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-    const run = { runId, agent, turn, step, signal, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
+    const run = { runId, agent, turn, step, signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: JSON.stringify(converted.tools),
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
     run.projection = new SdkProjection({ agent, helpers: this.helpers, turn, step, model: selected.model,
       onStarted: () => this.state.markStarted(agent.id),
+      onFirstToken: type => timing('first_token', type),
+      onFirstText: () => timing('first_text'),
       onModelStart: async () => {
         if (signal.aborted) return
         if (!run.modelStarted) { run.modelStarted = true; return run.step }
@@ -614,6 +699,7 @@ export class BridgeBackend {
       await this.state.markRunSent(agent.id, runId)
       signal.throwIfAborted()
       run.requestStarted = true
+      timing('request_sent')
       const result = await transport.peer.request('query', {
         runId, deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
         resume: binding.started, projectPath: binding.projectPath, prompt, systemPrompt,
@@ -633,6 +719,7 @@ export class BridgeBackend {
       await this.checkpoint(agent.session)
       run.journalStatus = 'completed'
       this.diagnostics.event('run.completed', { runId, sessionId: agent.id, durationMs: Date.now() - startedAt })
+      timing('completed')
       return { kind: 'completed' }
     } catch (error) {
       if (run.preparationError && !signal.aborted) error = run.preparationError

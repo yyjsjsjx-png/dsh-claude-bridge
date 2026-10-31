@@ -211,6 +211,14 @@ export class ClaudeBridgeService extends TypertRemoteService {
     return { url: result.url, configured: result.configured, status: result.status };
   }
 
+  @Remote('clearConnection')
+  async clearConnection() {
+    this.assertOwner();
+    const result = await this.backend.clearConnection();
+    this.catalogRegistration?.replace?.([CLAUDE_PROVIDER]);
+    return { configured: result.configured, status: result.status };
+  }
+
   @Remote('planUsage')
   async planUsage(refresh) {
     this.assertOwner();

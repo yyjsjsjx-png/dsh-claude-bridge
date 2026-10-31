@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { isNoResponsePlaceholder } from './sdk-message.mjs'
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 export const assistantPrefix = apiId => `claude-sdk:${apiId}:`
@@ -13,6 +14,7 @@ export function coalesceHistory(records) {
   const output = [], assistants = new Map(), seen = new Map()
   for (const record of records) {
     if (record.type !== 'assistant') { output.push(record); continue }
+    if (isNoResponsePlaceholder(record)) continue
     if (seen.has(record.uuid)) {
       if (seen.get(record.uuid) !== hash(record)) throw diverged()
       continue
@@ -50,8 +52,12 @@ export function localHistory(session) {
   return { assistants, calls, results, turn, step, matchedLegacy: new Set() }
 }
 
-/** Append only missing native output, including the tail of a partial message. */
+/** DSH renders the last assistant message of a step as a complete snapshot.
+ * Old bridge versions appended tails; fold both tails and newer snapshots when
+ * checking consistency, then repair the visible step with the whole message. */
 export function restoreAssistant(session, record, history, helpers, fallbackModel) {
+  // Older servers can still return the CLI's interrupted-turn placeholder.
+  if (isNoResponsePlaceholder(record)) return 0
   const prefix = assistantPrefix(record.apiId)
   let existing = history.assistants.filter(event => event.data.message.id.startsWith(prefix))
   if (!existing.length) {
@@ -68,14 +74,20 @@ export function restoreAssistant(session, record, history, helpers, fallbackMode
           && record.content.some(next => next.type === block.type && next.text.startsWith(block.text))))
     if (candidate) { existing = [candidate]; history.matchedLegacy.add(candidate.seq) }
   }
-  const previous = existing.flatMap(event => event.data.message.content)
-  const extra = []
-  const consumed = new Map()
+  let missing = !existing.length
   for (const type of ['text', 'reasoning']) {
     const complete = record.content.filter(item => item.type === type).map(item => item.text).join('')
-    const known = previous.filter(item => item.type === type).map(item => item.text).join('')
+    let known = ''
+    for (const event of existing) {
+      const next = event.data.message.content.filter(item => item.type === type).map(item => item.text).join('')
+      if (next.startsWith(known)) known = next
+      else if (!known.startsWith(next)) known += next
+    }
     if (!known.startsWith(complete) && !complete.startsWith(known)) throw diverged()
-    consumed.set(type, known.length)
+    // A cursor can point into a split SDK message. Never replace a longer
+    // locally saved answer with that incomplete cloud fragment.
+    if (known.length > complete.length) return 0
+    if (complete.length > known.length) missing = true
   }
   for (const block of record.content) {
     if (block.type === 'tool-call') {
@@ -86,19 +98,17 @@ export function restoreAssistant(session, record, history, helpers, fallbackMode
         if (!same) throw diverged()
         continue
       }
-      extra.push(block)
-      continue
+      missing = true
     }
-    const skip = consumed.get(block.type) ?? 0
-    consumed.set(block.type, Math.max(0, skip - block.text.length))
-    const text = block.text.slice(skip)
-    if (text) extra.push({ type: block.type, text })
   }
-  if (!extra.length) return 0
-  const message = helpers.createAssistantMessage({ content: extra,
+  const anchor = existing.at(-1)?.data
+  const turn = anchor?.turn ?? history.turn, step = anchor?.step ?? history.step
+  const visible = history.assistants.findLast(event => event.data.turn === turn && event.data.step === step)
+  if (!missing && visible && hash(visible.data.message.content) === hash(record.content)) return 0
+  const message = helpers.createAssistantMessage({ content: record.content,
     source: { provider: 'claude-sdk-remote', model: record.model ?? fallbackModel } })
-  const event = session.append('assistant/message', { turn: history.turn, step: history.step,
-    message: { ...message, id: assistantIdentity(record.apiId, extra) }, stream: [] }, { surfaceOp: 'append' })
+  const event = session.append('assistant/message', { turn, step,
+    message: { ...message, id: assistantIdentity(record.apiId, record.content) }, stream: [] }, { surfaceOp: 'append' })
   history.assistants.push(event)
   return 1
 }

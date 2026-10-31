@@ -3,6 +3,20 @@ import assert from 'node:assert/strict';
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES);
 
+test('实际 rc5 服务：清除连接仅限 owner 并刷新模型注册', { skip: !available }, async () => {
+  const { ClaudeBridgeService } = await import('../plugin/index.mjs');
+  let cleared = 0, replaced = 0;
+  const denied = new Error('owner required');
+  const service = { assertOwner() { throw denied; },
+    backend: { async clearConnection() { cleared++; return { configured: false, status: 'missing' }; } },
+    catalogRegistration: { replace(ids) { assert.deepEqual(ids, ['claude-sdk-remote']); replaced++; } } };
+  await assert.rejects(ClaudeBridgeService.prototype.clearConnection.call(service), error => error === denied);
+  assert.equal(cleared, 0);
+  service.assertOwner = () => {};
+  assert.deepEqual(await ClaudeBridgeService.prototype.clearConnection.call(service), { configured: false, status: 'missing' });
+  assert.equal(cleared, 1); assert.equal(replaced, 1);
+});
+
 test('实际 rc5 服务：同步 RPC 解包 resolveAgent 结果并保留解析错误', { skip: !available }, async () => {
   const { ClaudeBridgeService } = await import('../plugin/index.mjs');
   const agent = { id: 's', session: { header: { agentPreset: 'claude-sdk-remote' } } };

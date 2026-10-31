@@ -1,16 +1,21 @@
 import { randomUUID } from 'node:crypto'
 import { assistantIdentity } from './history-sync.mjs'
+import { isNoResponsePlaceholder } from './sdk-message.mjs'
+
+// DSH followers require dense revisions across the attached Agent lifecycle,
+// including a stopped query followed by a fresh projection for the next turn.
+const revisions = new WeakMap()
 
 /** Project SDK text/thinking into DSH's existing live and durable renderers. */
 export class SdkProjection {
-  constructor({ agent, helpers, turn, step, model, onStarted, onUsage, onModelStart }) {
-    Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onModelStart })
+  constructor({ agent, helpers, turn, step, model, onStarted, onUsage, onModelStart, onFirstToken, onFirstText }) {
+    Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onModelStart, onFirstToken, onFirstText })
     this.active = undefined
-    this.revision = 0
     this.blocks = new Map()
     this.committedToolIds = new Set()
     this.committedToolCalls = new Map()
     this.committedText = new Set()
+    this.committedContent = new Map()
     this.messageId = undefined
     this.startedModelIds = new Set()
     this.modelResponses = 0
@@ -18,7 +23,11 @@ export class SdkProjection {
     this.streamUsageFinal = false
   }
 
-  emit(frame) { this.agent.dispatch.emit('agent/assistant-stream', { frame }) }
+  emit(frame) {
+    const revision = (revisions.get(this.agent) ?? 0) + 1
+    revisions.set(this.agent, revision)
+    this.agent.dispatch.emit('agent/assistant-stream', { frame: { ...frame, revision } })
+  }
 
   start() {
     if (this.active) return
@@ -27,15 +36,21 @@ export class SdkProjection {
       accumulator: new this.helpers.AssistantStreamAccumulator(),
       assembler: new this.helpers.BlockAssembler(), index: 0,
     }
-    this.emit({ type: 'start', attemptId: this.active.id, revision: ++this.revision, turn: this.turn, step: this.step })
+    this.emit({ type: 'start', attemptId: this.active.id, turn: this.turn, step: this.step })
   }
 
   push(chunk) {
+    const token = ['text-delta', 'reasoning-delta'].includes(chunk.type) ? chunk.text
+      : chunk.type === 'tool-call-delta' ? chunk.argumentsDelta : undefined
+    if (typeof token === 'string' && token.length) {
+      if (!this.firstToken) { this.firstToken = true; this.onFirstToken?.(chunk.type) }
+      if (chunk.type === 'text-delta' && !this.firstText) { this.firstText = true; this.onFirstText?.() }
+    }
     this.start()
     const active = this.active
     const timed = active.accumulator.push({ time: Date.now(), chunk })
     active.assembler.push(timed.chunk)
-    this.emit({ type: 'chunk', attemptId: active.id, revision: ++this.revision,
+    this.emit({ type: 'chunk', attemptId: active.id,
       index: active.index++, time: timed.time, chunk: timed.chunk })
   }
 
@@ -88,9 +103,14 @@ export class SdkProjection {
           this.push({ type: 'block-end', index: block.index, block: this.finalBlock(block) })
           block.ended = true
         }
+      } else if (event?.type === 'message_stop' && this.active && this.streamUsageFinal) {
+        // The complete response is durable before query-level bookkeeping or a
+        // later synthetic message can arrive. Result usage is still recorded.
+        this.finish({ usage: dshUsage({ usage: this.streamUsage }) })
       }
     }
     if (message.type === 'assistant') {
+      if (isNoResponsePlaceholder(message.message)) return
       const content = message.message?.content
       if (!Array.isArray(content)) return
       this.messageId = message.message?.id
@@ -209,15 +229,23 @@ export class SdkProjection {
   }
 
   finish({ interrupted = false, usage } = {}) {
-    if (!this.active && !usage) return
-    this.start()
+    // Usage-only results must never settle a second empty assistant message.
+    if (!this.active) return
     for (const block of this.blocks.values()) {
       if (!block.ended) this.push({ type: 'block-end', index: block.index, block: this.finalBlock(block) })
     }
     if (usage) this.push({ type: 'usage', usage })
     this.push({ type: 'finish', reason: { kind: 'stop' } })
     const active = this.active
-    const content = this.finalOrder ? this.finalOrder.map(block => this.finalBlock(block)) : active.assembler.blocks()
+    const fresh = this.finalOrder ? this.finalOrder.map(block => this.finalBlock(block)) : active.assembler.blocks()
+    const content = [...(this.committedContent.get(this.messageId) ?? [])]
+    for (const block of fresh) {
+      const previous = content.findIndex(old => old.type === block.type && (block.type === 'tool-call'
+        ? old.id === block.id : block.text.startsWith(old.text)))
+      if (previous < 0) content.push(block)
+      else content[previous] = block
+    }
+    if (this.messageId) this.committedContent.set(this.messageId, content)
     for (const block of content) {
       if (block.type === 'tool-call') {
         this.committedToolIds.add(block.id)
@@ -235,7 +263,7 @@ export class SdkProjection {
       ...(usage ? { usage } : {}),
     }
     const committed = this.agent.session.append('assistant/message', data, { surfaceOp: 'append' })
-    this.emit({ type: 'end', attemptId: active.id, revision: ++this.revision, index: active.index,
+    this.emit({ type: 'end', attemptId: active.id, index: active.index,
       outcome: { kind: 'committed', eventType: 'assistant/message', seq: committed.seq } })
     this.active = undefined
     this.blocks.clear()

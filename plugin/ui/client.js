@@ -94,6 +94,7 @@ exports.apply = async function apply(ctx) {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#Connection',
       create: () => z.object({ url: z.string(), token: z.string().optional() }),
     } }]),
+    descriptor('clearConnection'),
     descriptor('refreshCatalog'),
     descriptor('modelPreferences'),
     descriptor('visibleModels'),
@@ -141,6 +142,7 @@ exports.apply = async function apply(ctx) {
   const updateSettings = patch => settingsStore.set({ ...settingsStore.getSnapshot(), ...patch });
 
   function readPlanUsage(reason = 'poll') {
+    if (settingsStore.getSnapshot().busy) return Promise.resolve();
     const now = Date.now();
     const previous = quotaStore.getSnapshot();
     const manual = reason === 'manual';
@@ -206,7 +208,8 @@ exports.apply = async function apply(ctx) {
   let statusRequest;
   let statusGeneration = 0;
   let urlEdited = false;
-  function readStatus() {
+  function readStatus(force = false) {
+    if (!force && settingsStore.getSnapshot().busy) return Promise.resolve();
     if (statusRequest) return statusRequest;
     const generation = statusGeneration;
     const request = (async () => {
@@ -230,40 +233,53 @@ exports.apply = async function apply(ctx) {
   }
 
   async function saveConnection(value) {
+    return changeConnection(() => ctx.remote.claudeBridge.saveConnection(value), false);
+  }
+
+  async function clearConnection() {
+    return changeConnection(() => ctx.remote.claudeBridge.clearConnection(), true);
+  }
+
+  async function changeConnection(request, clearing) {
+    if (settingsStore.getSnapshot().busy) return;
     statusGeneration++;
     quotaGeneration++;
+    statusRequest = undefined; modelRequest = undefined; quotaRequest = undefined;
     quotaLastAttemptAt = 0; quotaFailures = 0; quotaRetryAt = 0;
     quotaStore.set(UNKNOWN_QUOTA);
-    updateSettings({ busy: true, error: '', message: '' });
+    close();
+    updateSettings({ busy: true, modelsLoading: false, error: '', message: '' });
     try {
-      if (modelRequest) await modelRequest;
-      if (quotaRequest) await quotaRequest;
-      const response = await ctx.remote.claudeBridge.saveConnection(value);
+      const response = await request();
       if (!response.ok) throw new Error(response.error.message);
       urlEdited = false;
-      if (statusRequest) await statusRequest;
-      await readStatus();
-      if (settingsStore.getSnapshot().modelsLoaded) await loadModelPreferences();
-      updateSettings({ message: '连接设置已保存。' });
+      if (clearing) updateSettings({ url: '', configured: false, connected: false, authentication: 'unknown',
+        models: [], selectedModelIds: [], modelsLoaded: false, modelError: '', usingModelDefaults: true });
+      await readStatus(true);
+      if (!clearing && settingsStore.getSnapshot().modelsLoaded) await loadModelPreferences(true);
+      updateSettings({ message: clearing ? '已清除本机服务器地址和连接凭据。' : '连接设置已保存。' });
     } catch (error) { updateSettings({ error: textError(error) }); }
     finally { updateSettings({ busy: false }); }
   }
 
   async function refreshCatalog() {
+    if (settingsStore.getSnapshot().busy) return;
     updateSettings({ busy: true, error: '', message: '' });
     try {
       if (modelRequest) await modelRequest;
       const response = await ctx.remote.claudeBridge.refreshCatalog();
       if (!response.ok) throw new Error(response.error.message);
-      await readStatus();
-      await loadModelPreferences();
+      await readStatus(true);
+      await loadModelPreferences(true);
       updateSettings({ message: `连接成功，已读取 ${response.value.models?.length ?? 0} 个账号模型。` });
     } catch (error) { updateSettings({ error: textError(error) }); }
     finally { updateSettings({ busy: false }); }
   }
 
-  function loadModelPreferences() {
+  function loadModelPreferences(force = false) {
+    if (!force && settingsStore.getSnapshot().busy) return Promise.resolve();
     if (modelRequest) return modelRequest;
+    const revision = statusGeneration;
     updateSettings({ modelsLoading: true, modelError: '' });
     const request = (async () => {
       try {
@@ -273,12 +289,12 @@ exports.apply = async function apply(ctx) {
         if (!Array.isArray(value?.models) || !Array.isArray(value?.enabledIds)) {
           throw new Error('远程模型列表格式无效。');
         }
-        if (!disposed) updateSettings({ models: value.models, selectedModelIds: value.enabledIds,
+        if (!disposed && revision === statusGeneration) updateSettings({ models: value.models, selectedModelIds: value.enabledIds,
           usingModelDefaults: value.usingDefaults === true, modelsLoaded: true });
       } catch (error) {
-        if (!disposed) updateSettings({ modelError: textError(error) });
+        if (!disposed && revision === statusGeneration) updateSettings({ modelError: textError(error) });
       } finally {
-        if (!disposed) updateSettings({ modelsLoading: false });
+        if (!disposed && revision === statusGeneration) updateSettings({ modelsLoading: false });
       }
     })();
     modelRequest = request;
@@ -299,7 +315,7 @@ exports.apply = async function apply(ctx) {
     try {
       const response = await ctx.remote.claudeBridge.saveModelPreferences({ enabledIds: state.selectedModelIds });
       if (!response.ok) throw new Error(response.error.message);
-      await loadModelPreferences();
+      await loadModelPreferences(true);
       updateSettings({ message: '模型显示设置已保存。' });
     } catch (error) { updateSettings({ modelError: textError(error) }); }
     finally { updateSettings({ busy: false }); }
@@ -380,15 +396,18 @@ exports.apply = async function apply(ctx) {
     const state = useBridgeStatus(value => value);
     React.useEffect(() => {
       if (state == null || !syncSession || ['running', 'compacting', 'stopping'].includes(state.phase)) return;
-      let cancelled = false, timer, failures = 0;
-      const deadline = Date.now() + 120_000;
+      let cancelled = false, timer, failures = 0, inFlight = false;
       const sync = async () => {
-        if (cancelled || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
         clearTimeout(timer);
+        if (cancelled || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+        inFlight = true;
         let result;
         try { result = await syncSession(); } catch { result = { status: 'unavailable' }; }
-        if (!cancelled && Date.now() < deadline && ['waiting', 'unavailable', 'active'].includes(result.status)) {
-          timer = setTimeout(sync, Math.min(15_000, 2000 * 2 ** failures++));
+        finally { inFlight = false; }
+        if (!cancelled) {
+          const retry = ['waiting', 'unavailable', 'active'].includes(result?.status);
+          if (!retry) failures = 0;
+          timer = setTimeout(sync, retry ? Math.min(30_000, 2000 * 2 ** Math.min(failures++, 4)) : 30_000);
         }
       };
       void sync();
@@ -620,7 +639,7 @@ exports.apply = async function apply(ctx) {
         onClick: () => { void submit(); } }, state.busy ? '正在创建…' : '创建'))));
   }
 
-  function Settings({ useSettings, editUrl, save, refresh, refreshStatus, loadModels, toggleVisibleModel, saveModels }) {
+  function Settings({ useSettings, editUrl, save, clear, refresh, refreshStatus, loadModels, toggleVisibleModel, saveModels }) {
     const state = useSettings(value => value);
     const [token, setToken] = React.useState('');
     React.useEffect(() => { if (state.configured) void loadModels(); }, [state.configured, loadModels]);
@@ -665,12 +684,15 @@ exports.apply = async function apply(ctx) {
         placeholder: state.configured ? '已保存；留空则保留原凭据' : '输入服务器连接凭据',
         onChange: event => setToken(event.target.value), style: field,
       })),
-      React.createElement('div', { style: { display: 'flex', gap: 8, marginBottom: 14 } },
+      React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 } },
         React.createElement('button', { type: 'button', disabled: state.busy, onClick: submit }, '保存'),
         React.createElement('button', { type: 'button', disabled: state.busy,
           onClick: () => { void refreshStatus(); } }, '刷新状态'),
         React.createElement('button', { type: 'button', disabled: state.busy || !state.configured,
-          onClick: () => { void refresh(); } }, '测试连接并刷新模型')),
+          onClick: () => { void refresh(); } }, '测试连接并刷新模型'),
+        React.createElement('button', { type: 'button', disabled: state.busy || state.activeRuns > 0,
+          onClick: () => { setToken(''); void clear(); } }, '清除已保存连接')),
+      React.createElement('p', { style: { fontSize: 12, opacity: 0.7 } }, '清除连接仅移除本机地址和桥接口令；会话记录与服务器 Claude 登录保留。'),
       React.createElement('p', null, `配置：${state.configured ? '已配置' : '未配置'}；连接：${state.connected ? '已连接' : '未连接'}；官方登录（最近验证）：${authentication}`),
       state.message && React.createElement('p', { role: 'status' }, state.message),
       (state.error || state.statusError) && React.createElement('p', { role: 'alert', style: { color: '#c43c3c' } }, state.error || state.statusError),
@@ -746,7 +768,7 @@ exports.apply = async function apply(ctx) {
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'dsh-claude-bridge', order: 15, label: '远程 Claude',
     inject: () => ({ hooks: { settings: settingsStore }, editUrl: url => { urlEdited = true; updateSettings({ url }); },
-      save: saveConnection, refresh: refreshCatalog, refreshStatus: readStatus,
+      save: saveConnection, clear: clearConnection, refresh: refreshCatalog, refreshStatus: readStatus,
       loadModels: loadModelPreferences, toggleVisibleModel: toggleModel, saveModels: saveModelPreferences }),
   }, Settings));
   void readStatus();

@@ -181,5 +181,16 @@ export function createConnectionSettings({ configPath, credentials, credentialKe
     await credentials.deleteRecord(credentialKey)
   }
 
-  return { read, save, resolve, clearToken }
+  async function clear() {
+    // Only remove our settings document and credential record. Device identity
+    // and session history live in BridgeState and are deliberately retained.
+    await readConfig(configPath)
+    await clearToken()
+    try { await unlink(configPath) } catch (error) {
+      if (error?.code !== 'ENOENT') throw new ConnectionSettingsError('SETTINGS_CLEAR_FAILED', '凭据已清除，但服务器地址无法移除')
+    }
+    return { url: undefined, configured: false, status: 'missing' }
+  }
+
+  return { read, save, resolve, clearToken, clear }
 }

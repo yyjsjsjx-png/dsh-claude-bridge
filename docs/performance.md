@@ -1,0 +1,68 @@
+# 性能诊断与脱敏报告
+
+v0.1.2 默认记录诊断元数据，不记录提示词、回复正文、思考正文、工具参数、原始错误或认证材料。日志属于设备私有数据，不随插件上传。
+
+| 日志 | 位置 | 范围 |
+| --- | --- | --- |
+| 本地 | 设置 → 远程 Claude → 诊断显示的目录，通常为 `<DSH_HOME>/claude-bridge/diagnostics` | 本地准备、历史核对、发送、首模型事件、首 token、首段正文、整轮及收到的云端诊断 |
+| 云端 | `<ROOT>/sessions/_diagnostics/<device-id>` | CLI/hooks 和工具集初始化、首模型事件、首 token、首段正文、SDK 原始耗时与结果 |
+
+两端均保留 `bridge.jsonl` 与 `bridge.previous.jsonl`，每份上限 2 MiB。云端日志写入与诊断转发分别执行，短断不会使云端日志丢失。新增记录从升级并重启后开始，旧日志无法补出从未记录过的首 token 时间。
+
+## 收集与分析
+
+用已有 Node.js 或 DSH 自带 Electron 的 Node 模式运行，不需要安装依赖：
+
+```sh
+node scripts/collect-performance.mjs --logs /path/to/diagnostics --out /path/to/new-report
+```
+
+服务器使用已有 runtime，例如：
+
+```sh
+/srv/dsh-claude-bridge/runtime/bin/node /srv/dsh-claude-bridge/scripts/collect-performance.mjs \
+  --logs /srv/dsh-claude-bridge/sessions/_diagnostics \
+  --out /srv/dsh-claude-bridge/sessions/performance-report-unique
+```
+
+`--out` 必须是尚不存在的目录。脚本只读取两份桥接诊断及已导出的 `diagnostics.sanitized.jsonl`，输出：
+
+- `performance-report.md`：P50、P95、最大耗时和每轮表格。
+- `performance-report.json`：相同指标及每轮原始数值点，缺失值保留为空缺。
+- `diagnostics.sanitized.jsonl`：重新筛选的白名单数据，轮次 ID 稳定匿名，移除会话、设备、路径和任意文本。
+- `collection-manifest.json`：输出清单和 SHA-256，不包含源日志路径。
+
+合并本地与云端的收集目录时可重复传入 `--logs`。相同匿名轮次会对应合并，云端诊断在本地已有一份时会去重。不要直接打包整个 DSH 数据目录、Host stdout/stderr 或服务器会话目录。
+
+## 如何判断等待发生在哪里
+
+| 指标 | 含义 |
+| --- | --- |
+| 本地准备至发送 | 连接、发送前历史核对、工具和提示词准备、持久保存 |
+| 云端工具集初始化 | 服务器接到 query 至 CLI/hooks 与工具集验证完成 |
+| 云端首 token | 服务器接到 query 至首次思考、文字或工具参数输出 |
+| 云端首 token 至首段正文 | 可能在生成思考或工具调用；受 effort 和任务内容影响 |
+| 两端传输与调度余量 | 本地发送后首 token 等待减去云端首 token 等待；只是估算，包含调度和传输，不能直接叫网络 RTT |
+| SDK 原始字段 | `ttft_stream_ms`、`first_content_frame_ms` 等保留 SDK 标签；`duration_api_ms` 可能累计，不能当作本轮上游耗时 |
+
+两端使用各自单调时钟计算耗时，不直接相减两台机器的墙钟时间。报告可以定位等待所在的阶段；没有上游请求边界证据时，不进一步断言是服务排队、网络或模型推理。
+
+“首 token”表示桥接首次收到可用思考、文字或工具参数的观测点。SDK 未提供流式增量时，以首个完整消息到达为准；不把它当作未观测到的真实生成起点。
+
+## 给虚拟机 agent 的采集提示词
+
+复制下面整段给虚拟机中的 agent。可以在复现完一次“停轮后第一次续聊”和一次慢首响应后执行，无需重复消耗额度：
+
+```text
+请在这台虚拟机中，为 dsh-claude-bridge 收集一份可发回开发者的本地性能诊断包。
+
+只使用现有环境，不安装工具或依赖，不发起模型请求，不重启或改动 DSH、插件及连接配置。不要读取或输出桥接口令、认证文件、Cookie、token、授权 URL、聊天正文、工具参数、浏览器存储或原始 Host stdout/stderr。
+
+1. 从 DSH“设置 → 远程 Claude → 诊断”确认本地桥接诊断目录，并找到已安装插件中的 scripts/collect-performance.mjs。界面不便读取时，只检查当前用户已知的 DSH_HOME，或当前用户 .dsh/claude-bridge/diagnostics；不要全盘扫描。插件须为 v0.1.2 或更新版。旧版没有分段点时如实说明，不编造数据，也不要擅自升级。
+2. 使用已有 Node.js 执行收集器，传入 --logs <该诊断目录> 和 --out <桌面新建且唯一的输出目录>。没有独立 Node.js 时，用本机已安装的 DeepSeek Harness.exe 并临时设置 ELECTRON_RUN_AS_NODE=1；结束后恢复该环境变量。禁止安装 Node.js 或另一份 DSH。
+3. 检查只生成 performance-report.md、performance-report.json、diagnostics.sanitized.jsonl、collection-manifest.json。确认无真实口令、认证材料、聊天正文、个人路径或 IP；不要附加原始日志和 state.json/connection.json。若发现疑似敏感内容，先移除该敏感记录并重新生成报告与摘要，不把它复制进回复。
+4. 可另写一份简短的 test-notes.txt，仅含 DSH/插件版本、测试的大致本地时间与时区、网络是否通过代理、停轮后第一次续聊是否消失、慢响应的大约等待秒数。只使用已知信息，未知项注明未知；不包含用户名、服务器地址、会话标题或对话正文。
+5. 使用系统自带压缩功能，仅将上述新建输出目录里的文件打成 ZIP 放到桌面，保留目录便于复查。最终告诉我 ZIP 的位置、SHA-256、采集了多少轮、有多少轮具备首 token 分段和两端对比。不要上传网络或把原始文件内容贴进聊天。
+
+如果目录或运行环境无法确定，完成能安全完成的部分并简短说明缺少什么，不猜测路径、不索取或读取登录凭据。
+```

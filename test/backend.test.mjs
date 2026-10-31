@@ -11,6 +11,83 @@ import { createHash } from 'node:crypto'
 
 const provider = 'claude-sdk-remote'
 
+test('清除连接关闭传输并保留设备和会话；活动任务、准备阶段和历史同步均拒绝清除', async t => {
+  let closed = 0, cleared = 0, release
+  const f = await fixture(t, async () => ({ peer: { async request() { return { protocolVersion: 1, authenticated: true } } },
+    async close() { closed++ } }))
+  f.backend.connectionSettings = { async clear() { cleared++; return { configured: false, status: 'missing' } } }
+  await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+  const before = structuredClone(f.backend.state.value)
+  await f.backend.connect()
+  f.backend.catalogCache = { time: Date.now(), reply: { models: [] } }
+  f.backend.planUsageCache = { value: {}, until: Date.now() + 1000 }
+  const preparing = f.backend.useConnection(() => new Promise(resolve => { release = resolve }))
+  await assert.rejects(f.backend.clearConnection(), { code: 'BRIDGE_BUSY' })
+  release(); await preparing
+  f.backend.runs.set('active', {})
+  await assert.rejects(f.backend.clearConnection(), { code: 'BRIDGE_BUSY' })
+  f.backend.runs.clear()
+  f.backend.syncing.set('active', Promise.resolve())
+  await assert.rejects(f.backend.clearConnection(), { code: 'BRIDGE_BUSY' })
+  f.backend.syncing.clear()
+  assert.equal(cleared, 0)
+  assert.equal((await f.backend.clearConnection()).configured, false)
+  assert.equal(cleared, 1); assert.equal(closed, 1)
+  assert.equal(f.backend.connection, undefined)
+  assert.equal(f.backend.initialized, undefined)
+  assert.equal(f.backend.authentication, 'unknown')
+  assert.equal(f.backend.catalogCache, undefined); assert.equal(f.backend.planUsageCache, undefined)
+  assert.deepEqual(f.backend.state.value, before)
+})
+
+test('清除连接中止迟到的初始化，旧关闭事件不能清掉重新建立的连接', async t => {
+  let release, started, oldOptions, closed = 0, attempts = 0
+  const ready = new Promise(resolve => { started = resolve })
+  const f = await fixture(t, async options => {
+    const first = attempts++ === 0
+    if (first) oldOptions = options
+    return { peer: { async request() {
+      if (first) { started(); await new Promise(resolve => { release = resolve }) }
+      return { protocolVersion: 1, authenticated: true }
+    } }, async close() { closed++ } }
+  })
+  f.backend.connectionSettings = { async clear() { return { configured: false, status: 'missing' } } }
+  const connecting = f.backend.connect()
+  await ready
+  const rejected = assert.rejects(connecting, { code: 'CONNECTION_CHANGED' })
+  const clearing = f.backend.clearConnection()
+  assert.equal(oldOptions.signal.aborted, true)
+  release(); await rejected; await clearing
+  assert.equal(closed, 1); assert.equal(f.backend.connection, undefined)
+  assert.equal(f.backend.authentication, 'unknown')
+  const current = await f.backend.connect()
+  oldOptions.onClose()
+  assert.equal(f.backend.connection, current)
+})
+
+test('清除以后旧目录、额度和登录响应不会恢复缓存或登录状态', async t => {
+  const replies = new Map()
+  const f = await fixture(t, async () => ({ peer: { async request(method) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { planUsage: true } }
+    return new Promise(resolve => replies.set(method, resolve))
+  } }, async close() {} }))
+  f.backend.connectionSettings = { async clear() { return { configured: false, status: 'missing' } } }
+  await f.backend.connect()
+  const catalog = f.backend.catalog(), usage = f.backend.planUsage(), auth = f.backend.refreshAuthentication()
+  await new Promise(resolve => setImmediate(resolve))
+  const rejectedCatalog = assert.rejects(catalog, { code: 'CONNECTION_CHANGED' })
+  const rejectedAuth = assert.rejects(auth, { code: 'CONNECTION_CHANGED' })
+  await f.backend.clearConnection()
+  replies.get('catalog')({ status: 'ok', models: [] })
+  replies.get('planUsage')(planUsageSnapshot({ rate_limits_available: true,
+    rate_limits: { five_hour: { utilization: 88, resets_at: null } } }))
+  replies.get('authStatus')({ loggedIn: true })
+  await rejectedCatalog; await rejectedAuth
+  assert.equal((await usage).code, 'CONNECTION_CHANGED')
+  assert.equal(f.backend.catalogCache, undefined); assert.equal(f.backend.planUsageCache, undefined)
+  assert.equal(f.backend.authentication, 'unknown')
+})
+
 test('WebSocket 关闭超时仍保存本机台账和诊断，重复卸载不再执行清理', async () => {
   const saved = []
   const backend = Object.assign(Object.create(BridgeBackend.prototype), { lifetime: new AbortController(), runs: new Map(),
@@ -650,4 +727,39 @@ test('云端原运行仍在收尾时保留新输入等待，用户停止能中�
   f.agent.phase = { kind: 'running', turn: 2, step: 1, abort: f.phaseAbort }
   await assert.rejects(f.backend.runStep(f.agent, f.decision), { name: 'AbortError' })
   assert.equal(queried, 0); assert.ok(binding.sdkSessionId)
+})
+
+test('历史核对按原生响应分配步骤，旧版游标先完整修复且不覆盖新一轮', async t => {
+  let binding
+  const offsets = []
+  const toolContent = [{ type: 'text', text: '工具前说明' }]
+  const answer = [{ type: 'text', text: '工具后的完整最终答复' }]
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, capabilities: { historySync: true } }
+    assert.equal(method, 'history')
+    offsets.push(params.offset)
+    return { status: 'ok', sessionId: binding.sdkSessionId, records: params.offset ? [] : [
+      { type: 'prompt', uuid: 'mapped-run' },
+      { type: 'assistant', uuid: 'tool-answer', apiId: 'tool-api', content: toolContent },
+      { type: 'assistant', uuid: 'final-answer', apiId: 'final-api', content: answer },
+    ], runs: {}, nextOffset: 3, lastUuid: 'final-answer', done: true }
+  } }, async close() {} }))
+  recoveryEvents(f)
+  binding = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+  await f.backend.state.markStarted(f.agent.id)
+  await f.backend.state.beginRun(f.agent.id, 'mapped-run', 'query', { turn: 2, step: 1 })
+  await f.backend.state.finishRun(f.agent.id, 'mapped-run', 'completed')
+  await f.backend.state.reconcileRecovery(f.agent.id, [], { offset: 3, lastUuid: 'final-answer' })
+  f.agent.session.append('assistant/message', { turn: 2, step: 1,
+    message: { id: assistantIdentity('tool-api', toolContent), content: toolContent } })
+  f.agent.session.append('step/start', { turn: 3, step: 1 })
+  f.agent.phase = { kind: 'running', turn: 3, step: 1, abort: new AbortController() }
+  assert.equal((await f.backend.syncSession(f.agent, { withinRun: true })).added, 1)
+  const restored = f.records.filter(event => event.type === 'assistant/message').at(-1)
+  assert.equal(restored.data.turn, 2)
+  assert.equal(restored.data.step, 2)
+  assert.deepEqual(restored.data.message.content, answer)
+  f.agent.phase = { kind: 'idle' }
+  assert.equal((await f.backend.syncSession(f.agent)).added, 0)
+  assert.deepEqual(offsets, [0, 3])
 })

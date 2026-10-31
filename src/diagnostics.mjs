@@ -1,7 +1,7 @@
 import { mkdir, appendFile, rename, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const STRING_FIELDS = new Set(['stage', 'code', 'method', 'requestId', 'sessionId', 'deviceId', 'runId', 'callId', 'toolName', 'status', 'signal', 'errorName'])
+const STRING_FIELDS = new Set(['stage', 'code', 'method', 'requestId', 'sessionId', 'deviceId', 'runId', 'callId', 'toolName', 'status', 'signal', 'errorName', 'model', 'effort'])
 const NUMBER_FIELDS = new Set(['durationMs', 'bytes', 'inputBytes', 'outputBytes', 'exitCode', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'])
 
 function safeLabel(value) {
@@ -31,7 +31,7 @@ export function createDiagnostics({ directory, maxBytes = 2 * 1024 * 1024, onRec
   let failure
   let size
   async function write(record) {
-    await mkdir(directory, { recursive: true })
+    await mkdir(directory, { recursive: true, mode: 0o700 })
     if (size === undefined) {
       try { size = (await stat(path)).size } catch (error) {
         if (error.code !== 'ENOENT') throw error

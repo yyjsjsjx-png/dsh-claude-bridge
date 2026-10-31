@@ -57,6 +57,19 @@ test('历史游标失配要求重读，活动会话等待，缺少原生证据�
   assert.equal((await f.history(f.params)).status, 'busy')
 })
 
+test('合成停轮占位不进入历史展示，过滤后原生分页游标仍完整推进', async t => {
+  const f = await fixture(t)
+  const item = (uuid, model, text) => ({ type: 'assistant', uuid, session_id: sessionId,
+    message: { id: uuid, model, content: [{ type: 'text', text }] } })
+  f.setItems([item('placeholder', '<synthetic>', 'No response requested.'),
+    item('normal', 'fixture', 'No response requested.'), item('error', '<synthetic>', 'Other error')])
+  const reply = await f.history(f.params)
+  assert.deepEqual(reply.records.map(record => record.apiId), ['normal', 'error'])
+  assert.equal(reply.nextOffset, 3)
+  assert.equal(reply.lastUuid, 'error')
+  assert.equal((await f.history({ ...f.params, offset: 3, afterUuid: 'error' })).status, 'ok')
+})
+
 test('运行回执持久保存名称及参数哈希，终态和读取释放失败均可辨认', async t => {
   const f = await fixture(t), store = createRunStore()
   await store.begin(f.cwd, 'run-1', 'query')
