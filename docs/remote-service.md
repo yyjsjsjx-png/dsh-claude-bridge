@@ -8,7 +8,7 @@
 
 | 组件 | 本项目要求或实测基线 |
 | --- | --- |
-| 客户端插件 | `v0.1.5` |
+| 客户端插件 | `v0.1.7` |
 | DSH Desktop | 实测 `0.2.1-rc.5`，其他版本按接口能力检查，仍需实际确认 |
 | 服务器 Node.js | `>=24.9`，须准备可独立执行的 Node 和 npm |
 | Claude Agent SDK | 锁定 `0.3.314` |
@@ -20,10 +20,10 @@
 
 由服务器管理员先准备独立非 root 用户，例如 `bridge`，以及供账号所有者完成官方交互登录的服务器桌面环境。不要复用其他 Claude、网关或日常服务的账号目录。以下下载、依赖安装、生成口令和登录操作均以该服务用户执行；systemd 安装命令才使用管理员权限。
 
-从 [v0.1.5 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.1.5) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
+从 [v0.1.7 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.1.7) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
 
 ```sh
-git clone --branch v0.1.5 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
+git clone --branch v0.1.7 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
 cd /home/bridge/dsh-claude-bridge
 chmod 700 /home/bridge/dsh-claude-bridge
 ```

@@ -77,3 +77,31 @@ test('同内容的块分段和工具参数键序不同，不追加旧响应；�
     localHistory(f.session), f.helpers), { code: 'HISTORY_FRAGMENT_INCOMPLETE' })
   assert.equal(f.events.length, 1)
 })
+
+test('原生记录证明未开始的工具可补齐最终参数，保留原件且重复同步不再冲突', () => {
+  const f = fixture()
+  const old = { type: 'tool-call', id: 'call-unicode', name: 'local_command', arguments: JSON.stringify({ command: String.raw`'\ufeff'` }) }
+  f.session.append('assistant/message', { turn: 2, step: 3, message: { id: assistantIdentity('api-unicode', [old]), content: [old] } })
+  f.session.append('tool/result', { turn: 2, step: 3, message: { toolCallId: old.id, content: [], isError: true }, error: { code: 'TOOL_NOT_STARTED' } })
+  const canonical = { ...old, arguments: JSON.stringify({ command: "'\ufeff'" }) }
+  const record = { apiId: 'api-unicode', model: 'fixture', content: [canonical] }
+  assert.equal(restoreAssistant(f.session, record, localHistory(f.session), f.helpers), 1)
+  assert.deepEqual(f.events[0].data.message.content, [old])
+  assert.equal(f.events.at(-1).type, 'plugin:claude-bridge/history-assistant')
+  assert.deepEqual(f.events.at(-1).data.message.content, [canonical])
+  assert.equal(restoreAssistant(f.session, record, localHistory(f.session), f.helpers), 0)
+  assert.equal(localHistory(f.session).calls.size, 0)
+})
+
+test('已登记执行、未知结果或工具名不同的参数冲突仍拒绝修复', () => {
+  for (const kind of ['started', 'unknown', 'different-name']) {
+    const f = fixture()
+    const old = { type: 'tool-call', id: 'call-conflict', name: 'local_command', arguments: '{"command":"old"}' }
+    f.session.append('assistant/message', { turn: 1, step: 1, message: { id: assistantIdentity('api-conflict', [old]), content: [old] } })
+    if (kind === 'started') f.session.append('tool/call', { callId: old.id, name: old.name, arguments: old.arguments })
+    f.session.append('tool/result', { message: { toolCallId: old.id, content: [] }, error: { code: kind === 'unknown' ? 'TOOL_OUTCOME_UNKNOWN' : 'TOOL_NOT_STARTED' } })
+    const canonical = { ...old, name: kind === 'different-name' ? 'different_tool' : old.name, arguments: '{"command":"new"}' }
+    assert.throws(() => restoreAssistant(f.session, { apiId: 'api-conflict', content: [canonical] }, localHistory(f.session), f.helpers), { code: 'HISTORY_DIVERGED' })
+    assert.equal(f.events.filter(e => e.type.startsWith('plugin:')).length, 0)
+  }
+})

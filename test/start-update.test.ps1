@@ -12,6 +12,8 @@ foreach ($directory in @($scripts, (Split-Path $fakeExecutable), $fakeHome)) { [
 $encoding = New-Object Text.UTF8Encoding($true)
 $launcher = Join-Path $scripts 'start-update.ps1'
 [IO.File]::WriteAllText($launcher, [IO.File]::ReadAllText((Join-Path $project 'scripts\start-update.ps1')), $encoding)
+# Target discovery has separate fixture checks; keep this launcher test isolated.
+[IO.File]::WriteAllText((Join-Path $scripts 'resolve-dsh-executable.ps1'), 'function Resolve-BridgeDshExecutable { param([string]$ExplicitPath) if ($ExplicitPath) { return $ExplicitPath }; return (Join-Path $env:LOCALAPPDATA ''Programs\DeepSeek Harness\DeepSeek Harness.exe'') }', $encoding)
 $stub = @'
 [CmdletBinding()]
 param([string]$DshExecutable, [string]$DshHome, [string]$Profile, [string]$PackageDirectory)

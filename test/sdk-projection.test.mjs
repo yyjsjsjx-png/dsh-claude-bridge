@@ -11,6 +11,28 @@ import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 // The ordinary Node test suite skips these cases if its ASAR reader is absent.
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
 
+test('实际 rc5 helper：工具使用最终 SDK 参数登记，Unicode 流式差异不进入执行历史', { skip: !available }, async () => {
+  const { records, projection } = await fixture()
+  const streamed = { command: String.raw`'\ufeff'` }
+  const canonical = { command: "'\ufeff'" }
+  await projection.accept({ type: 'stream_event', event: { type: 'message_start', message: { id: 'canonical-tool' } } })
+  await projection.accept({ type: 'stream_event', event: { type: 'content_block_start', index: 0,
+    content_block: { type: 'tool_use', id: 'toolu_unicode', name: 'mcp__dsh__local_command', input: {} } } })
+  await projection.accept({ type: 'stream_event', event: { type: 'content_block_delta', index: 0,
+    delta: { type: 'input_json_delta', partial_json: JSON.stringify(streamed) } } })
+  await projection.accept({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
+  await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 12 } } })
+  await projection.accept({ type: 'stream_event', event: { type: 'message_stop' } })
+  assert.equal(projection.committedToolCalls.has('toolu_unicode'), false)
+  assert.equal(records.length, 0)
+  await projection.accept({ type: 'assistant', message: { id: 'canonical-tool', content: [
+    { type: 'tool_use', id: 'toolu_unicode', name: 'mcp__dsh__local_command', input: canonical },
+  ] } })
+  assert.deepEqual(JSON.parse(projection.committedToolCalls.get('toolu_unicode').arguments), canonical)
+  assert.deepEqual(JSON.parse(records[0].data.message.content[0].arguments), canonical)
+  assert.deepEqual(records[0].data.stream, [])
+})
+
 async function fixture() {
   const helpers = { ...await import('../plugin/compat/runtime.mjs'),
     appendPluginRecord(session, type, data) { return session.append(type, data, { ignorable: true }).seq } }

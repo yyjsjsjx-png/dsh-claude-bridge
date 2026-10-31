@@ -108,7 +108,8 @@ export class SdkProjection {
           this.push({ type: 'block-end', index: block.index, block: this.finalBlock(block) })
           block.ended = true
         }
-      } else if (event?.type === 'message_stop' && this.active && this.streamUsageFinal) {
+      } else if (event?.type === 'message_stop' && this.active && this.streamUsageFinal
+        && ![...this.blocks.values()].some(block => block.type === 'tool-call')) {
         // The complete response is durable before query-level bookkeeping or a
         // later synthetic message can arrive. Result usage is still recorded.
         this.finish({ usage: dshUsage({ usage: this.streamUsage }) })
@@ -122,6 +123,22 @@ export class SdkProjection {
       await this.modelStart(this.messageId)
       if (this.interrupted) return
       if (typeof message.message.model === 'string') this.model = message.message.model
+      // Partial JSON is for display. The final SDK input is the authority for
+      // execution, including escaped Unicode and other normalization details.
+      // Never advertise a streamed tool before this final input is available.
+      for (const item of content) {
+        if (item.type !== 'tool_use' || this.committedToolIds.has(item.id)) continue
+        const block = [...this.blocks.values()].find(block => block.type === 'tool-call' && block.id === item.id)
+        if (!block) continue
+        const name = item.name.replace(/^mcp__dsh__/, '')
+        const args = JSON.stringify(item.input ?? {})
+        if (block.name !== name || block.arguments !== args) {
+          block.name = name
+          block.arguments = args
+          this.active.canonicalToolInput = true
+          this.finalOrder ??= [...this.blocks.values()]
+        }
+      }
       if (!this.active) {
         for (const item of content) {
           if (!['text', 'thinking', 'tool_use'].includes(item.type)) continue
@@ -267,7 +284,7 @@ export class SdkProjection {
       message: { ...this.helpers.createAssistantMessage({ content,
         source: { provider: 'claude-sdk-remote', model: this.model } }),
         ...(this.messageId ? { id: assistantIdentity(this.messageId, content) } : {}) },
-      stream: [...active.accumulator.snapshot()],
+      stream: active.canonicalToolInput ? [] : [...active.accumulator.snapshot()],
       ...(interrupted ? { interrupted: true } : {}),
       ...(usage ? { usage } : {}),
     }

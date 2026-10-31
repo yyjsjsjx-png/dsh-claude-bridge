@@ -105,9 +105,17 @@ export function restoreAssistant(session, record, history, helpers, fallbackMode
   }
   for (const block of record.content) {
     if (block.type === 'tool-call') {
-      const old = history.assistants.flatMap(event => event.data.message.content).find(item => item.type === 'tool-call' && item.id === block.id)
+      const old = history.assistants.flatMap(event => event.data.message.content).findLast(item => item.type === 'tool-call' && item.id === block.id)
       if (old) {
-        if (!sameTool(old, block)) throw diverged()
+        if (!sameTool(old, block)) {
+          // DSH's own durable recovery result proves this advertised call was
+          // never started. Preserve the original event and append only a view
+          // correction; executed or uncertain calls remain strict conflicts.
+          const result = historyEvent(history.results.get(block.id))
+          if (old.name !== block.name || history.calls.has(block.id)
+            || result?.data.error?.code !== 'TOOL_NOT_STARTED') throw diverged()
+          missing = true
+        }
         continue
       }
       missing = true

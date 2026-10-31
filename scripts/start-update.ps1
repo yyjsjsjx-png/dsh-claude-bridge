@@ -16,7 +16,8 @@ try {
     if ($Profile -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$') { throw '配置名称无效。' }
     # Resolve every target before UAC. A different administrator account must
     # never replace the original user's Home or installation with its defaults.
-    if (-not $DshExecutable) { $DshExecutable = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe' }
+    . (Join-Path $PSScriptRoot 'resolve-dsh-executable.ps1')
+    $DshExecutable = Resolve-BridgeDshExecutable $DshExecutable
     if (-not $PackageDirectory) { $PackageDirectory = Split-Path -Parent $PSScriptRoot }
     if (-not $DshHome) {
         $DshHome = $env:DSH_HOME

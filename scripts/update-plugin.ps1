@@ -9,9 +9,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not $PackageDirectory) { $PackageDirectory = Split-Path -Parent $PSScriptRoot }
-if (-not $DshExecutable) {
-    $DshExecutable = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'
-}
+. (Join-Path $PSScriptRoot 'resolve-dsh-executable.ps1')
+$DshExecutable = Resolve-BridgeDshExecutable $DshExecutable
 $BridgeExecutable = (Resolve-Path -LiteralPath $DshExecutable).Path
 $BridgeResources = Join-Path (Split-Path -Parent $BridgeExecutable) 'resources'
 $BridgePackage = (Resolve-Path -LiteralPath $PackageDirectory).Path
