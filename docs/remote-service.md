@@ -1,6 +1,6 @@
 # 远程服务部署
 
-客户端运行 DSH 和插件；Linux 服务器的独立非 root 用户运行固定版本的 Claude Code 与 Agent SDK。桥接服务只绑定回环地址，由 SSH 转发提供加密访问。
+客户端运行 DSH 和插件；Linux 服务器的独立非 root 用户运行固定版本的 Claude Code 与 Agent SDK。桥接服务只绑定回环地址，可由受信任 TLS 反向代理提供公网 WSS，或使用 SSH 加密转发。
 
 ## 目录与依赖
 
@@ -70,6 +70,20 @@ ss -lnt 'sport = :18944'
 
 ## 客户端连接
 
+有公网 WSS 时，客户端只需在 DSH“远程 Claude”页填写地址和独立桥接口令，保存后测试连接；不需要在客户端运行 SSH。
+
+例如域名已经指向服务器、Caddy 管理可信证书时，独立站点可转发到回环桥接：
+
+```caddyfile
+bridge.example.com {
+    reverse_proxy 127.0.0.1:18944
+}
+```
+
+客户端填写 `wss://bridge.example.com/`。将新站点加入现有代理前应备份并校验配置，再平滑重载；临时测试入口使用独立后端、独立口令和明确的到期停用机制。桥接后端本身仍保持回环监听。
+
+没有公网 WSS 时，可选 SSH 转发：
+
 ```sh
 ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
   -L 127.0.0.1:18944:127.0.0.1:18944 your-user@your-server
@@ -102,4 +116,4 @@ DSH 会话和受保护的本机连接设置、服务器 `claude-config`、`sessi
 
 桥接口令是共享服务访问凭据，device ID 只是会话命名空间。本版本面向账号所有者自己的设备，不把它当作多人租户隔离服务。临时测试凭据应独立生成、限制用途和有效期；撤销时移除对应 SSH 公钥并停用该测试入口。
 
-公网 WSS 未在本次部署中配置；测试入口通过既有 SSH 端口访问，没有新增公网桥接监听。
+公网 WSS 由反向代理终止 TLS，认证仍由桥接服务在 WebSocket 内完成。地址中不包含口令，公开源码不保存实际测试入口或凭据。
