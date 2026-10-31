@@ -1,0 +1,43 @@
+# 保留数据原地更新
+
+更新插件不需要还原虚拟机快照，也不需要卸载 DSH。还原纯净快照会同时丢失旧会话及本机设备身份，无法用于检查连续升级。
+
+## Windows Desktop
+
+1. 等待任务结束，完全退出 DSH，包括托盘中的程序。
+2. 下载 [v0.1.3 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.3/dsh-claude-bridge-0.1.3.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
+3. 在解压后的 `dsh-claude-bridge` 目录打开 PowerShell，运行：
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-plugin.ps1
+   ```
+
+4. 看到 `0.1.2 -> 0.1.3` 等版本结果后，重新启动 DSH。在插件页核对版本，再打开原会话继续使用。
+
+脚本使用现有 DSH 自带的 Electron、pnpm 和官方插件管理接口，以离线本地包替换同名插件；不安装新的工具链，不执行包生命周期脚本，不自动启动或终止 DSH。**请保留解压目录，更新后不要移动或删除它**，包管理器可能保留对本地目录的引用。运行中的配置会被拒绝更新。
+
+自定义安装位置或独立数据目录时，显式传入：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-plugin.ps1 `
+  -DshExecutable 'D:\Apps\DeepSeek Harness\DeepSeek Harness.exe' `
+  -DshHome 'D:\DSH-Test-Data' -Profile desktop
+```
+
+省略 `DshHome` 时遵循当前 `DSH_HOME`，未设置时使用用户目录的 `.dsh`。插件依赖只更新指定 profile；会话存储由同一 Home 共享，迁移会检查该 Home 的远程 Claude 历史，因此其他 profile 也必须退出。请在安装包目录运行脚本，不要从已安装插件的 `node_modules` 目录原地覆盖自身。
+
+## 保留与失败处理
+
+更新保留原 DSH 数据目录、会话历史、桥接设备身份、SDK 会话绑定及保存的连接。它不会清除连接、撤销凭据或重新登录 Claude。再次打开原远程会话时，由插件核对 SDK 原生历史；旧版展示记录的修复可能在首次空闲同步后出现。
+
+插件安装前，脚本在目标 profile 的 `.plugin-manager/backups/claude-bridge-…` 保存 `package.json` 和已有的 `pnpm-lock.yaml`。还会检查旧版远程 Claude 的 V4 日志：旧同步向已闭合轮次追加消息、重复广告工具时，可能导致重启后拒绝读取。脚本仅迁移能确定属于桥接的记录，保留既有事件序号和完整消息，将展示补齐写成可忽略的插件记录。写回前执行 DSH 原生严格格式校验，临时文件落盘后原子替换。
+
+受影响日志的原始压缩文件保存在同一备份目录的 `histories/`，属于**私人历史备份，不要上传**；未改动日志不另复制。脚本不读取认证或连接文件，不输出聊天正文。它不会删除整个会话或重新创建 SDK 绑定。该备份只包含安装元数据和本次变动的日志，不能当作完整 DSH 备份。
+
+若更新失败，脚本会报告日志位置和元数据备份位置，不宣称更新成功。历史迁移拒绝时请先保留原日志与备份，暂勿启动 DSH，将简短错误提供给开发者；不要上传完整历史。原生包管理器对兼容性拒绝会恢复安装元数据并尝试恢复依赖；其他失败可能仍需重新运行更新。若已经迁移历史但插件安装失败，应先重跑更新到新版本再启动；不要只退回旧插件。离线缓存不足时会明确失败，不会自行下载工具链。
+
+## 从 v0.1.2 升级的提示
+
+远程模型和思考强度现在独立记忆。以后“新建远程 Claude”沿用上次成功选择；型号被隐藏或不再可用时要求重新选择，不自动改用其他型号。
+
+旧版可能已将远程模型保存成 DSH 全局默认。普通“新会话”遇到这一遗留设置时，会在创建前提示使用“新建远程 Claude”，避免标准预设配上远程模型。远程会话仍从专用入口创建；普通 DSH 会话使用普通模型。不会擅自替用户选一个新的普通默认模型。

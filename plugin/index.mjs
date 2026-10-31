@@ -182,7 +182,7 @@ let ClaudeBridgeService = (() => {
             if (_metadata) Object.defineProperty(this, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });
         }
         static inject = ['tools', 'systemPrompt', 'sessions', 'llm', 'approval', 'fs',
-            'attachments', 'sessionProjections', 'credentials', 'agents', 'subagents'];
+            'attachments', 'sessionProjections', 'credentials', 'agents', 'subagents', 'agentDefaultModel'];
         static Config = schema.object({
             stateDirectory: schema.string(),
             transport: schema.union(['wss', 'ssh']).default('wss'),
@@ -310,7 +310,7 @@ let ClaudeBridgeService = (() => {
         }
         async visibleModels() {
             this.assertOwner();
-            return { models: await this.catalogAdapter.models(true) };
+            return { models: await this.catalogAdapter.models(true), selection: await this.backend.creationSelection() };
         }
         async saveModelPreferences(value) {
             this.assertOwner();

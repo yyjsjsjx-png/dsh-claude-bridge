@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeGuardedSessionController, makeLockedPresetRegistry } from '../plugin/controller-guards.mjs';
+import { makeGuardedSessionController, makeLockedPresetRegistry, installControllerGuards } from '../plugin/controller-guards.mjs';
 import { encodeRemoteCreationSelection } from '../plugin/policy.mjs';
 
 class FakeRemoteError extends Error {
@@ -79,6 +79,67 @@ test('会话锁定引擎并在写入模型选择前拒绝跨引擎', async () =>
   await controller.create({});
   await assert.rejects(controller.selectModel({ sessionId: 's', provider: 'claude-sdk-remote', model: 'account-default' }), /不能切换执行引擎/);
   assert.equal(getWrites(), 0);
+});
+
+test('旧版遗留远程全局默认在普通会话创建前给出专用入口提示', async () => {
+  const { ctx, controller, getCreated } = harness();
+  ctx.agentDefaultModel.currentSelection = () => ({ provider: 'claude-sdk-remote', model: 'account-default' });
+  await assert.rejects(controller.create({}), error => {
+    assert.equal(error.code, 'session/model-unavailable');
+    assert.match(error.message, /新建远程 Claude/);
+    return true;
+  });
+  assert.equal(getCreated(), undefined);
+  await controller.create({ agentPreset: encodeRemoteCreationSelection({
+    provider: 'claude-sdk-remote', model: 'account-default',
+  }) });
+  assert.equal(getCreated().agentPreset, 'claude-sdk-remote');
+});
+
+test('只有模型选择成功后记住归一化选型，失败保留上次选择', async () => {
+  const { ctx, controller } = harness();
+  const remembered = [];
+  ctx.get = () => ({ backend: { rememberCreationSelection: async selected => remembered.push(selected) } });
+  await controller.create({ agentPreset: encodeRemoteCreationSelection({
+    provider: 'claude-sdk-remote', model: 'account-default', reasoningEffort: 'low',
+  }) });
+  assert.equal(remembered.length, 1);
+  assert.equal(remembered[0].reasoningEffort, 'low');
+  await assert.rejects(controller.selectModel({ sessionId: 's', provider: 'deepseek', model: 'v1' }));
+  assert.equal(remembered.length, 1);
+});
+
+test('实例守卫保留原生身份，隔离全局默认，并在卸载或失败时完整恢复', async () => {
+  const { ctx, controller } = harness();
+  const basePrototype = Object.getPrototypeOf(Object.getPrototypeOf(controller));
+  Object.setPrototypeOf(controller, basePrototype);
+  delete controller.bridgeContext;
+  ctx.sessionController = controller;
+  const selected = [];
+  class Defaults {
+    currentSelection() { return { provider: 'deepseek', model: 'v1' }; }
+    async saveSelection(value) { selected.push(value); }
+  }
+  class Presets { defaultId = 'standard'; async select() {} }
+  ctx.agentPresets = new Presets();
+  ctx.agentDefaultModel = new Defaults();
+  const originalCreate = controller.create, originalSave = ctx.agentDefaultModel.saveSelection;
+  const dispose = installControllerGuards(ctx, FakeRemoteError);
+  assert.equal(Object.getPrototypeOf(controller), basePrototype);
+  await controller.create({});
+  await ctx.agentDefaultModel.saveSelection({ provider: 'claude-sdk-remote', model: 'account-default' });
+  await ctx.agentDefaultModel.saveSelection({ provider: 'deepseek', model: 'v2' });
+  assert.deepEqual(selected, [{ provider: 'deepseek', model: 'v2' }]);
+  await assert.rejects(controller.selectModel({ sessionId: 's', provider: 'claude-sdk-remote', model: 'account-default' }));
+  dispose(); dispose();
+  assert.equal(controller.create, originalCreate);
+  assert.equal(ctx.agentDefaultModel.saveSelection, originalSave);
+  assert.equal(Object.hasOwn(controller, 'create'), false);
+  assert.equal(Object.hasOwn(controller, 'bridgeContext'), false);
+  Object.defineProperty(ctx.agentPresets, 'select', { value: 1, configurable: true });
+  assert.throws(() => installControllerGuards(ctx, FakeRemoteError), /接口不兼容/);
+  assert.equal(ctx.agentDefaultModel.saveSelection, originalSave);
+  assert.equal(controller.create, originalCreate);
 });
 
 test('远程消息分支在创建分叉前拒绝，不写入新会话', async () => {

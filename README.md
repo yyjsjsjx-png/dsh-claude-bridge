@@ -22,12 +22,14 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.2
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.3
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
 3. 在 **设置 → 远程 Claude** 保存服务提供方给出的 **`wss://…` 服务器地址**和**独立桥接口令**，点击“测试连接并刷新模型”。公网 WSS 直接连接，不需要 SSH、密钥文件或额外启动脚本。
-4. 在会话首页点击“新建远程 Claude”，选择账号实际返回的模型与推理强度，再开始对话。
+4. 在会话首页点击“新建远程 Claude”，选择账号实际返回的模型与推理强度，再开始对话。之后默认沿用上次成功选择；型号或强度不可用时回退为重新选择或模型默认强度。
+
+已有安装可保留数据原地升级，无须还原快照。下载 [v0.1.3 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.3/dsh-claude-bridge-0.1.3.zip)，解压并完全退出 DSH，在包目录运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-plugin.ps1`。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
 
 设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销其他设备持有的同一口令。
 
@@ -45,7 +47,7 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.2
+dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.3
 ```
 
 ## 已实现
@@ -60,6 +62,9 @@ dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-c
 - 设置页打开时刷新本设备用量，前台每 5 秒更新，隐藏或离线暂停；兼容性和诊断明细默认收起。
 - 停轮后的续聊沿用连续流式序号；原生回复以完整快照结算，精确过滤 CLI 的合成 `No response requested.` 占位。普通同文回复和其他错误保留。
 - 当前会话轮末、恢复连接及重新可见时核对原生历史，前台空闲每 30 秒增量核对；升级后首次完整核对可修复旧版只保存尾部的展示。
+- 历史补齐使用独立插件记录，保持原步骤位置和思考、正文顺序，不向已结束的原生轮次写消息；同一响应的工具只广告一次，累计展示不污染工具生命周期。跨页片段从响应起点重读。
+- 启用时保留 DSH 原生会话控制器、预设注册器与客户端模块身份，策略在卸载时清理，避免热启用替换核心模块导致白屏。
+- 远程模型和强度单独记忆，不再写入 DSH 普通新会话的全局默认。旧版遗留的远程默认会提示改走专用创建入口。
 - 两端分段耗时、SDK 原始耗时字段、脱敏收集及性能报告。报告区分首 token 和首段正文，使用方式及虚拟机 agent 采集提示词见 [性能诊断](docs/performance.md)。
 
 ## 恢复边界

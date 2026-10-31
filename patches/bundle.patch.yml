@@ -1,10 +1,6 @@
 # DSH bundle with runtime capability checks. Enable in a dedicated profile.
 - id: agent-loop
   disabled: true
-- id: session-controller
-  disabled: true
-- id: agent-preset-registry
-  disabled: true
 - insert:
     - id: claude-agent-loop
       name: '../plugin/compat/agent-loop.mjs'
@@ -16,12 +12,6 @@
         transport: wss
     - id: claude-session-controller
       name: '../plugin/session-controller.mjs'
-    - id: claude-session-client
-      name: '../plugin/session-client/index.mjs'
-    - id: claude-preset-registry
-      name: '../plugin/preset-registry.mjs'
-      config:
-        default: standard
     - id: preset-claude-sdk-remote
       name: '../plugin/preset-service.mjs'
     - id: claude-bridge-ui

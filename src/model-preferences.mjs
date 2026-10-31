@@ -22,3 +22,14 @@ export function validateVisibleIds(value) {
   }
   return [...value.enabledIds]
 }
+
+export function validateCreationSelection(value) {
+  const identifier = text => typeof text === 'string' && text.trim().length > 0 && text === text.trim() && text.length <= 256
+    && !/[\x00-\x1f\x7f]/.test(text)
+  if (!value || value.provider !== 'claude-sdk-remote' || !identifier(value.model)
+    || (value.reasoningEffort !== undefined && !identifier(value.reasoningEffort))) {
+    throw Object.assign(new TypeError('上次模型选择无效，请重新选择。'), { code: 'MODEL_PREFERENCES_INVALID' })
+  }
+  return { provider: value.provider, model: value.model,
+    ...(value.reasoningEffort === undefined ? {} : { reasoningEffort: value.reasoningEffort }) }
+}

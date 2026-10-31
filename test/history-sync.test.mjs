@@ -6,7 +6,8 @@ function fixture() {
   const events = []
   const session = { get seq() { return events.length }, eventAt: seq => events[seq],
     append(type, data, intent) { const event = { seq: events.length, type, data, ...intent }; events.push(event); return event } }
-  const helpers = { createAssistantMessage({ content, source }) { return { id: 'generated', role: 'assistant', source: { kind: 'model', ...source }, content } } }
+  const helpers = { appendPluginRecord(session, type, data) { return session.append(type, data, { ignorable: true }).seq },
+    createAssistantMessage({ content, source }) { return { id: 'generated', role: 'assistant', source: { kind: 'model', ...source }, content } } }
   return { session, helpers, events }
 }
 
@@ -60,4 +61,19 @@ test('未知占位结果不能冒充真实结果，实际已保存的失败结�
   assert.equal(knownToolResult(event(UNKNOWN_TOOL_TEXT)), false)
   assert.equal(knownToolResult({ ...event('未开始'), data: { ...event('未开始').data, error: { code: 'TOOL_NOT_STARTED' } } }), false)
   assert.equal(knownToolResult(event('进程返回非零退出码')), true)
+})
+
+test('同内容的块分段和工具参数键序不同，不追加旧响应；部分片段不覆盖完整快照', () => {
+  const f = fixture()
+  const content = [{ type: 'reasoning', text: '合成分析' }, { type: 'text', text: '工具前说明' },
+    { type: 'tool-call', id: 'call-order', name: 'local_wait', arguments: '{"first":1,"second":2}' }]
+  f.session.append('assistant/message', { turn: 1, step: 1, message: { id: assistantIdentity('api-order', content), content } })
+  const record = { apiId: 'api-order', content: [content[0], { type: 'text', text: '工具前' }, { type: 'text', text: '说明' },
+    { ...content[2], arguments: '{"second":2,"first":1}' }] }
+  assert.equal(restoreAssistant(f.session, record, localHistory(f.session), f.helpers), 0)
+  assert.equal(restoreAssistant(f.session, { ...record, content: [content[0]] }, localHistory(f.session), f.helpers), 0)
+  assert.equal(f.events.length, 1)
+  assert.throws(() => restoreAssistant(f.session, { ...record, content: [{ type: 'reasoning', text: '合成分析补齐' }] },
+    localHistory(f.session), f.helpers), { code: 'HISTORY_FRAGMENT_INCOMPLETE' })
+  assert.equal(f.events.length, 1)
 })

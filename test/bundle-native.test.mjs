@@ -24,12 +24,14 @@ test('实际 rc5：标准 bundle 接受不同版本号并检查实际 Host 能�
   const files = boot.bundlePatchPaths(root, manifest.dsh.bundle)
   const patches = files.flatMap(path => boot.loadOverlayPatches('dsh', path))
   const rows = boot.composeEntries([patches.filter(patch => patch.insert)])
-  assert.equal(rows.length, 7)
+  assert.equal(rows.length, 5)
   for (const row of rows) {
     assert.ok(row.name.startsWith(pathToFileURL(resolve(root)).href + '/'))
     await access(fileURLToPath(row.name))
   }
-  for (const id of ['claude-bridge-ui', 'claude-session-client']) {
+  assert.equal(patches.some(row => ['session-controller', 'agent-preset-registry'].includes(row.id) && row.disabled), false)
+  assert.equal(rows.some(row => row.id === 'claude-session-client'), false)
+  for (const id of ['claude-bridge-ui']) {
     const row = rows.find(item => item.id === id)
     const meta = JSON.parse(await readFile(join(dirname(fileURLToPath(row.name)), 'package.json'), 'utf8'))
     assert.equal(meta.dsh.client.platform, 'web')

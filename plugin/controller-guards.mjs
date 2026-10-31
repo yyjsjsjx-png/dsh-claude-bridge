@@ -1,6 +1,6 @@
 /** rc.5 controller wrappers. They act before the upstream mutating methods. */
 import {
-  CLAUDE_PRESET, EnginePolicyError, planSessionCreation, decodeRemoteCreationSelection,
+  CLAUDE_PRESET, CLAUDE_PROVIDER, EnginePolicyError, planSessionCreation, decodeRemoteCreationSelection,
   assertModelForPreset, assertPresetUnchanged,
 } from './policy.mjs';
 
@@ -131,6 +131,11 @@ export function makeGuardedSessionController(Base, RemoteError) {
         await ctx.llm.resolveCallConfig(plan.initialModel);
       } else if (target === CLAUDE_PRESET) {
         return restoreRemoteBlank(this, ctx, RemoteError, input);
+      } else if (ctx.agentDefaultModel.currentSelection().provider === CLAUDE_PROVIDER) {
+        // Older bridge versions saved remote selections as DSH's global default.
+        // Refuse before minting a standard Session with a remote model.
+        throw remoteFailure(RemoteError, 'session/model-unavailable',
+          '当前默认模型为远程 Claude，请通过“新建远程 Claude”创建会话；普通 DSH 会话请选择普通模型。');
       }
 
       // The rc.5 upstream can recompose an existing *cold* blank session in
@@ -162,7 +167,12 @@ export function makeGuardedSessionController(Base, RemoteError) {
       const preset = presetForAgent(this.bridgeContext, RemoteError, agent);
       try { assertModelForPreset(preset, request); }
       catch (error) { policyFailure(RemoteError, error, request.sessionId); }
-      return super.selectModel(request);
+      const selected = await super.selectModel(request);
+      if (preset === CLAUDE_PRESET) {
+        try { await this.bridgeContext.get?.('claudeBridge')?.backend?.rememberCreationSelection(selected.selected); }
+        catch { this.bridgeContext.logger?.warn('上次模型选择保存失败，下次新建时请重新选择。'); }
+      }
+      return selected;
     }
 
     async prompt(request, signal) {
@@ -209,4 +219,44 @@ export function makeLockedPresetRegistry(Base, RemoteError) {
       return current;
     }
   };
+}
+
+/** Attach policies without replacing the native Services or their browser graph. */
+export function installControllerGuards(ctx, RemoteError) {
+  const restorers = [];
+  const install = (target, makeGuarded, names) => {
+    class Delegate {}
+    for (const name of names) {
+      let owner = target, descriptor;
+      while (owner && !(descriptor = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+      if (typeof descriptor?.value !== 'function') {
+        throw new Error(`远程 Claude 插件无法加载：DSH ${name}() 接口不兼容。`);
+      }
+      Object.defineProperty(Delegate.prototype, name, { value: descriptor.value });
+    }
+    const guarded = makeGuarded(Delegate, RemoteError).prototype;
+    for (const [name, value] of [['bridgeContext', ctx], ...names.map(name => [name, guarded[name]])]) {
+      const previous = Object.getOwnPropertyDescriptor(target, name);
+      Object.defineProperty(target, name, { value, configurable: true, writable: true });
+      restorers.push(() => {
+        if (Object.getOwnPropertyDescriptor(target, name)?.value !== value) return;
+        if (previous) Object.defineProperty(target, name, previous);
+        else delete target[name];
+      });
+    }
+  };
+  const dispose = () => { for (const restore of restorers.splice(0).reverse()) restore(); };
+  try {
+    // The native selector writes the global default asynchronously. Keep that
+    // native path for ordinary models; remote choices have separate storage.
+    install(ctx.agentDefaultModel, Base => class extends Base {
+      async saveSelection(selection) {
+        if (selection.provider === CLAUDE_PROVIDER) return;
+        return super.saveSelection(selection);
+      }
+    }, ['saveSelection']);
+    install(ctx.sessionController, makeGuardedSessionController, ['create', 'selectModel', 'prompt', 'fork']);
+    install(ctx.agentPresets, makeLockedPresetRegistry, ['select']);
+    return dispose;
+  } catch (error) { dispose(); throw error; }
 }

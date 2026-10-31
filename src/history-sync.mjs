@@ -1,12 +1,26 @@
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
+import { historyEvent, appendHistoryRecord, HISTORY_ASSISTANT } from './history-records.mjs'
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 export const assistantPrefix = apiId => `claude-sdk:${apiId}:`
 export const assistantIdentity = (apiId, content) => assistantPrefix(apiId) + hash(content)
 export const UNKNOWN_TOOL_TEXT = '本机工具已开始派发，但未取得执行结果；可能已产生副作用，请核实后再决定是否重试。'
 const diverged = () => Object.assign(new Error('云端记录与本机已保存内容不一致，未覆盖历史。'), { code: 'HISTORY_DIVERGED' })
+const fragment = () => Object.assign(new Error('云端返回了同一响应的部分内容，需要重新核对完整记录。'), { code: 'HISTORY_FRAGMENT_INCOMPLETE' })
+const textOf = (content, type) => content.filter(block => block.type === type).map(block => block.text).join('')
+const sameTool = (old, block) => {
+  try { return old.name === block.name && isDeepStrictEqual(JSON.parse(old.arguments), JSON.parse(block.arguments)) } catch { return false }
+}
+
+// Block segmentation and JSON key order are serialization details. A matching
+// visible snapshot must not be re-appended just because those details differ.
+function covers(content, incoming) {
+  return ['text', 'reasoning'].every(type => textOf(content, type) === textOf(incoming, type))
+    && incoming.filter(block => block.type === 'tool-call').every(block =>
+      content.some(old => old.type === 'tool-call' && old.id === block.id && sameTool(old, block)))
+}
 
 /** Native transcripts can store each block of one API message on a separate
  * line. Join those blocks before comparing with the locally streamed message. */
@@ -38,7 +52,7 @@ export function localHistory(session) {
   const assistants = [], calls = new Map(), results = new Map()
   let turn = 0, step = 1
   for (let seq = 0; seq < session.seq; seq++) {
-    const event = session.eventAt(seq)
+    const event = historyEvent(session.eventAt(seq))
     if (!event || event.seq !== seq) throw Object.assign(new Error('本机会话存在记录缺口。'), { code: 'LOCAL_HISTORY_GAP' })
     if (Number.isSafeInteger(event.data?.turn)) turn = Math.max(turn, event.data.turn)
     if (Number.isSafeInteger(event.data?.step)) step = event.data.step
@@ -63,10 +77,10 @@ export function restoreAssistant(session, record, history, helpers, fallbackMode
   if (!existing.length) {
     const exact = history.assistants.find(event => !event.data.message.id.startsWith('claude-sdk:')
       && !history.matchedLegacy.has(event.seq) && hash(event.data.message.content) === hash(record.content))
-    if (exact) { history.matchedLegacy.add(exact.seq); return 0 }
+    if (exact) { history.matchedLegacy.add(exact.seq); existing = [exact] }
     // Upgrade an interrupted pre-feature record only when the actual text is
     // a substantial prefix, or a stable tool-use id proves the association.
-    const candidate = history.assistants.find(event => !event.data.message.id.startsWith('claude-sdk:')
+    const candidate = !existing.length && history.assistants.find(event => !event.data.message.id.startsWith('claude-sdk:')
       && !history.matchedLegacy.has(event.seq) && event.data.interrupted === true
       && event.data.message.content.some(block => block.type === 'tool-call'
         ? record.content.some(next => next.type === 'tool-call' && next.id === block.id)
@@ -74,7 +88,7 @@ export function restoreAssistant(session, record, history, helpers, fallbackMode
           && record.content.some(next => next.type === block.type && next.text.startsWith(block.text))))
     if (candidate) { existing = [candidate]; history.matchedLegacy.add(candidate.seq) }
   }
-  let missing = !existing.length
+  let missing = !existing.length, incomplete = false
   for (const type of ['text', 'reasoning']) {
     const complete = record.content.filter(item => item.type === type).map(item => item.text).join('')
     let known = ''
@@ -86,34 +100,39 @@ export function restoreAssistant(session, record, history, helpers, fallbackMode
     if (!known.startsWith(complete) && !complete.startsWith(known)) throw diverged()
     // A cursor can point into a split SDK message. Never replace a longer
     // locally saved answer with that incomplete cloud fragment.
-    if (known.length > complete.length) return 0
+    if (known.length > complete.length) incomplete = true
     if (complete.length > known.length) missing = true
   }
   for (const block of record.content) {
     if (block.type === 'tool-call') {
       const old = history.assistants.flatMap(event => event.data.message.content).find(item => item.type === 'tool-call' && item.id === block.id)
       if (old) {
-        let same = false
-        try { same = old.name === block.name && isDeepStrictEqual(JSON.parse(old.arguments), JSON.parse(block.arguments)) } catch {}
-        if (!same) throw diverged()
+        if (!sameTool(old, block)) throw diverged()
         continue
       }
       missing = true
     }
   }
-  const anchor = existing.at(-1)?.data
+  if (existing.some(event => event.data.message.content.some(block => block.type === 'tool-call'
+    && !record.content.some(next => next.type === 'tool-call' && next.id === block.id)))) incomplete = true
+  if (incomplete) {
+    if (missing) throw fragment()
+    return 0
+  }
+  const anchor = existing[0]?.data
   const turn = anchor?.turn ?? history.turn, step = anchor?.step ?? history.step
   const visible = history.assistants.findLast(event => event.data.turn === turn && event.data.step === step)
-  if (!missing && visible && hash(visible.data.message.content) === hash(record.content)) return 0
+  if (!missing && visible && covers(visible.data.message.content, record.content)) return 0
   const message = helpers.createAssistantMessage({ content: record.content,
     source: { provider: 'claude-sdk-remote', model: record.model ?? fallbackModel } })
-  const event = session.append('assistant/message', { turn, step,
-    message: { ...message, id: assistantIdentity(record.apiId, record.content) }, stream: [] }, { surfaceOp: 'append' })
+  const event = appendHistoryRecord(session, HISTORY_ASSISTANT, { turn, step,
+    message: { ...message, id: assistantIdentity(record.apiId, record.content) }, stream: [] }, helpers)
   history.assistants.push(event)
   return 1
 }
 
 export function knownToolResult(event) {
+  event = historyEvent(event)
   return event?.type === 'tool/result' && Array.isArray(event.data?.message?.content) && event.data.meta?.claudeBridgeOutcome !== 'unknown'
     && !['TOOL_OUTCOME_UNKNOWN', 'TOOL_NOT_STARTED'].includes(event.data.error?.code)
     && !event.data.message.content.some(block => block.type === 'text' && block.text === UNKNOWN_TOOL_TEXT)

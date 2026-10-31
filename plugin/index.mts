@@ -118,7 +118,7 @@ export class ClaudeCatalogAdapter extends LlmAdapter {
 /** This plugin deliberately registers no credentials or network endpoint. */
 export class ClaudeBridgeService extends TypertRemoteService {
   static inject = ['tools', 'systemPrompt', 'sessions', 'llm', 'approval', 'fs',
-    'attachments', 'sessionProjections', 'credentials', 'agents', 'subagents'];
+    'attachments', 'sessionProjections', 'credentials', 'agents', 'subagents', 'agentDefaultModel'];
 
   static Config = schema.object({
     stateDirectory: schema.string(),
@@ -256,7 +256,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
   @Remote('visibleModels')
   async visibleModels() {
     this.assertOwner();
-    return { models: await this.catalogAdapter.models(true) };
+    return { models: await this.catalogAdapter.models(true), selection: await this.backend.creationSelection() };
   }
 
   @Remote('saveModelPreferences')

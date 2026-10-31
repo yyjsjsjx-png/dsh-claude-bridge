@@ -42,8 +42,6 @@ const replacements = {
   __AGENT_LOOP_URL__: 'plugin/compat/agent-loop.mjs',
   __BRIDGE_SERVICE_URL__: 'plugin/index.mjs',
   __SESSION_CONTROLLER_URL__: 'plugin/session-controller.mjs',
-  __SESSION_CLIENT_URL__: 'plugin/session-client/index.mjs',
-  __PRESET_REGISTRY_URL__: 'plugin/preset-registry.mjs',
   __PRESET_SERVICE_URL__: 'plugin/preset-service.mjs',
   __BRIDGE_UI_URL__: 'plugin/ui/index.mjs',
 }

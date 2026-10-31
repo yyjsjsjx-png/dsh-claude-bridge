@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { assistantIdentity } from './history-sync.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
+import { appendHistoryRecord, HISTORY_ASSISTANT } from './history-records.mjs'
 
 // DSH followers require dense revisions across the attached Agent lifecycle,
 // including a stopped query followed by a fresh projection for the next turn.
@@ -35,8 +36,12 @@ export class SdkProjection {
       id: `${this.agent.id}:bridge:${randomUUID()}`,
       accumulator: new this.helpers.AssistantStreamAccumulator(),
       assembler: new this.helpers.BlockAssembler(), index: 0,
+      // Native followers retain the first committed stream until Step end.
+      // More blocks of that same API response update its durable snapshot;
+      // opening another live attempt would force a client rebaseline.
+      silent: this.committedContent.has(this.messageId),
     }
-    this.emit({ type: 'start', attemptId: this.active.id, turn: this.turn, step: this.step })
+    if (!this.active.silent) this.emit({ type: 'start', attemptId: this.active.id, turn: this.turn, step: this.step })
   }
 
   push(chunk) {
@@ -50,7 +55,7 @@ export class SdkProjection {
     const active = this.active
     const timed = active.accumulator.push({ time: Date.now(), chunk })
     active.assembler.push(timed.chunk)
-    this.emit({ type: 'chunk', attemptId: active.id,
+    if (!active.silent) this.emit({ type: 'chunk', attemptId: active.id,
       index: active.index++, time: timed.time, chunk: timed.chunk })
   }
 
@@ -238,7 +243,11 @@ export class SdkProjection {
     this.push({ type: 'finish', reason: { kind: 'stop' } })
     const active = this.active
     const fresh = this.finalOrder ? this.finalOrder.map(block => this.finalBlock(block)) : active.assembler.blocks()
-    const content = [...(this.committedContent.get(this.messageId) ?? [])]
+    const previousContent = this.committedContent.get(this.messageId)
+    const content = [...(previousContent ?? [])]
+    const journalContent = fresh.filter(block => block.type === 'tool-call'
+      ? !this.committedToolIds.has(block.id)
+      : !this.committedText.has(JSON.stringify([this.messageId, block.type, block.text])))
     for (const block of fresh) {
       const previous = content.findIndex(old => old.type === block.type && (block.type === 'tool-call'
         ? old.id === block.id : block.text.startsWith(old.text)))
@@ -262,8 +271,16 @@ export class SdkProjection {
       ...(interrupted ? { interrupted: true } : {}),
       ...(usage ? { usage } : {}),
     }
-    const committed = this.agent.session.append('assistant/message', data, { surfaceOp: 'append' })
-    this.emit({ type: 'end', attemptId: active.id, index: active.index,
+    // Native messages advertise each tool exactly once. The cumulative view is
+    // an ignorable plugin record, so replay cannot reopen completed tool calls.
+    let committed
+    if (!previousContent || journalContent.length) {
+      committed = this.agent.session.append('assistant/message', { ...data,
+        ...(previousContent ? { message: { ...data.message, content: journalContent }, stream: [] } : {}),
+      }, { surfaceOp: 'append' })
+    }
+    if (previousContent) appendHistoryRecord(this.agent.session, HISTORY_ASSISTANT, data, this.helpers)
+    if (!active.silent) this.emit({ type: 'end', attemptId: active.id, index: active.index,
       outcome: { kind: 'committed', eventType: 'assistant/message', seq: committed.seq } })
     this.active = undefined
     this.blocks.clear()

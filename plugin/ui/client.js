@@ -74,9 +74,85 @@ function textError(error) {
   return error instanceof Error ? error.message : String(error || '操作失败');
 }
 
+// Interpret display-only repairs through the installed native renderers. They
+// retain their original Step without changing the native model/tool journal.
+exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
+  const registry = ctx.uiConversation.events;
+  if (!registry || !['entries', 'subscribe', 'refresh', 'forEvent'].every(name => typeof registry[name] === 'function')) {
+    throw new Error('远程 Claude 插件无法加载：DSH 对话排序接口不兼容。');
+  }
+  const repairs = {
+    'plugin:claude-bridge/history-assistant': 'assistant/message',
+    'plugin:claude-bridge/history-tool-result': 'tool/result',
+  };
+  const eventView = event => repairs[event.type] && event.ignorable === true
+    ? { ...event, type: repairs[event.type], surfaceOp: 'append' } : event;
+  const matchView = match => match && eventView(match.event) !== match.event
+    ? { ...match, event: eventView(match.event) } : match;
+  const contextView = context => context.matches.some(match => repairs[match.event.type])
+    ? { ...context, start: matchView(context.start), matches: context.matches.map(matchView) } : context;
+  const installed = new Map();
+  const originalForEvent = registry.forEvent;
+  const wrappedForEvent = function(type) {
+    const routes = originalForEvent.call(this, repairs[type] ?? type);
+    const kind = repairs[type] === 'assistant/message' ? 'assistant-step' : 'tool-call';
+    return repairs[type] ? new Set([...routes].filter(route => route.definition.kind === kind).map(({ definition, match }) => ({
+      definition, match: event => match(eventView(event)),
+    }))) : routes;
+  };
+  registry.forEvent = wrappedForEvent;
+  const reconcile = () => {
+    let changed = false;
+    for (const definition of registry.entries()) {
+      if (!['assistant-step', 'tool-call'].includes(definition.kind) || installed.has(definition)) continue;
+      if (typeof definition.buildViewNode !== 'function' || typeof definition.update !== 'function') {
+        throw new Error('远程 Claude 插件无法加载：DSH 消息展示接口不兼容。');
+      }
+      const methods = new Map();
+      for (const name of ['update', 'buildViewNode', 'buildLocationData', 'publication']) {
+        const original = definition[name];
+        if (typeof original !== 'function') continue;
+        const wrapped = function(context, ...args) {
+          if (name === 'publication') return original.call(this, matchView(context), ...args);
+          context = contextView(context);
+          const result = original.call(this, context, ...(name === 'update' ? args.map(matchView) : args));
+          if (name !== 'buildViewNode' || definition.kind !== 'assistant-step' || !result
+            || !context.matches.some(({ event }) => event.type === 'assistant/message'
+              && (event.data.message.source?.provider === 'claude-sdk-remote'
+                || event.data.message.id?.startsWith('claude-sdk:')))) return result;
+          const start = context.start?.event.type === 'step/start' ? context.start.event
+            : result.location?.kind === 'step' ? result.location.step.start : undefined;
+          const first = context.matches.find(({ event }) => event.type === 'assistant/message');
+          const anchor = start ? start.seq + 0.25 : first?.event.seq;
+          return Number.isFinite(anchor) && result.anchorSeq !== anchor ? { ...result, anchorSeq: anchor } : result;
+        };
+        definition[name] = wrapped;
+        methods.set(name, { original, wrapped });
+      }
+      installed.set(definition, methods);
+      changed = true;
+    }
+    if (changed) registry.refresh();
+  };
+  const unsubscribe = registry.subscribe(reconcile);
+  reconcile();
+  return () => {
+    unsubscribe();
+    for (const [definition, methods] of installed) {
+      for (const [name, { original, wrapped }] of methods) if (definition[name] === wrapped) definition[name] = original;
+    }
+    if (registry.forEvent === wrappedForEvent) registry.forEvent = originalForEvent;
+    installed.clear();
+    registry.refresh();
+  };
+};
+
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
 
 exports.apply = async function apply(ctx) {
+  ctx.inject(['uiConversation'], ctx => {
+    if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程 Claude 对话排序');
+  });
   const json = { mode: 'src-json' };
   const descriptor = (method, parameters = []) => ({
     id: `dsh-claude-bridge-ui#claudeBridge/${method}`, service: 'claudeBridge',
@@ -340,7 +416,10 @@ exports.apply = async function apply(ctx) {
       if (!response.ok) throw new Error(response.error.message);
       if (disposed || revision !== generation) return;
       if (!Array.isArray(response.value?.models)) throw new Error('远程 Claude 模型目录格式无效。');
-      update({ loading: false, models: response.value.models,
+      const saved = response.value.selection;
+      const model = response.value.models.find(item => item.id === saved?.model);
+      const effort = model?.reasoning?.efforts?.some(item => item.id === saved?.reasoningEffort) ? saved.reasoningEffort : '';
+      update({ loading: false, models: response.value.models, model: model?.id ?? '', effort,
         error: response.value.models.length ? '' : '没有勾选可显示的模型，请在远程 Claude 设置中选择。' });
     } catch (error) {
       if (!disposed && revision === generation) update({ loading: false, error: textError(error) });

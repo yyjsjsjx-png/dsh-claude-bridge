@@ -10,11 +10,12 @@ import { createConnectionSettings } from './connection-settings.mjs'
 import { toMcpToolDefinitions, toSdkPrompt, toMcpContent } from './dsh-content.mjs'
 import { SdkProjection, dshUsage } from './sdk-projection.mjs'
 import { CLAUDE_PROVIDER, CLAUDE_PRESET } from '../plugin/policy.mjs'
-import { defaultVisibleIds, validateVisibleIds } from './model-preferences.mjs'
+import { defaultVisibleIds, validateVisibleIds, validateCreationSelection } from './model-preferences.mjs'
 import { imageCapability } from './model-capabilities.mjs'
 import { contextSnapshot, initialSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
 
@@ -291,6 +292,17 @@ export class BridgeBackend {
     return { status: 'ok', models: preferences.models.filter(model => enabled.has(model.value)) }
   }
 
+  async creationSelection() {
+    await this.state.ready
+    const value = this.state.value.creationSelection ?? this.ctx.agentDefaultModel?.currentSelection()
+    return value?.provider === CLAUDE_PROVIDER ? validateCreationSelection(value) : null
+  }
+
+  async rememberCreationSelection(value) {
+    const selection = validateCreationSelection(value)
+    await this.state.update(state => { state.creationSelection = selection })
+  }
+
   async notification(method, params) {
     if (method === 'diagnostic') {
       this.diagnostics.event(params.event ?? 'remote.event', params)
@@ -337,53 +349,74 @@ export class BridgeBackend {
         if (this.initialized?.capabilities?.historySync !== true) {
           throw failure('HISTORY_UNAVAILABLE', '服务器尚未提供云端记录同步。')
         }
-        const local = localHistory(agent.session)
-        local.turn = pending.findLast(run => Number.isSafeInteger(run.turn))?.turn
-          ?? Math.max(1, local.turn - (withinRun ? 1 : 0))
+        let local
         const cloudResults = new Map()
-        // Reconcile once in full after upgrading from the old tail-only
-        // projection so an already hidden answer can be repaired as well.
-        let cursor = binding.historyCursor?.projectionVersion !== 2 || pending.some(run => !run.reconciledAt) ? { offset: 0, lastUuid: null }
-          : binding.historyCursor ?? { offset: 0, lastUuid: null }
-        let cloudRuns = {}, added = 0, bytes = 0, reset = false, done = false
-        const records = []
-        for (let page = 0; page < 3200; page++) {
-          combined.throwIfAborted()
-          const reply = await transport.peer.request('history', { deviceId: binding.deviceId,
-            dshSessionId: agent.id, sessionId: binding.sdkSessionId, projectPath: binding.projectPath,
-            offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 })
-          if (reply.status === 'busy') {
-            this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
-              interrupted: true, updatedAt: Date.now() } })
-            return { status: 'waiting' }
+        // Re-read the last response's page so a split API message is never
+        // treated as a complete new snapshot at an incremental cursor.
+        let cursor = binding.historyCursor?.projectionVersion !== 3 || pending.some(run => !run.reconciledAt)
+          ? { offset: 0, lastUuid: null } : binding.historyCursor.replay ?? { offset: 0, lastUuid: null }
+        let cloudRuns = {}, added = 0, replay
+        for (let attempt = 0; attempt < 2; attempt++) {
+          local = localHistory(agent.session)
+          local.turn = pending.findLast(run => Number.isSafeInteger(run.turn))?.turn
+            ?? Math.max(1, local.turn - (withinRun ? 1 : 0))
+          let bytes = 0, reset = false, done = false, readStart = cursor, lastApi
+          const assistantPages = new Map()
+          const records = []
+          for (let page = 0; page < 3200; page++) {
+            combined.throwIfAborted()
+            const pageCursor = cursor
+            const reply = await transport.peer.request('history', { deviceId: binding.deviceId,
+              dshSessionId: agent.id, sessionId: binding.sdkSessionId, projectPath: binding.projectPath,
+              offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 })
+            if (reply.status === 'busy') {
+              this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
+                interrupted: true, updatedAt: Date.now() } })
+              return { status: 'waiting' }
+            }
+            if (reply.status === 'cursor-reset' && !reset) {
+              cursor = readStart = { offset: 0, lastUuid: null }; records.length = 0; bytes = 0
+              assistantPages.clear(); lastApi = undefined; reset = true; continue
+            }
+            if (reply.status !== 'ok' || reply.sessionId !== binding.sdkSessionId || !Array.isArray(reply.records)
+              || !Number.isSafeInteger(reply.nextOffset) || reply.nextOffset < cursor.offset
+              || (reply.nextOffset === cursor.offset && reply.done !== true)
+              || (reply.lastUuid !== null && typeof reply.lastUuid !== 'string')) {
+              throw failure(reply.code ?? 'HISTORY_INVALID', '云端记录尚未同步，未继续执行。')
+            }
+            bytes += Buffer.byteLength(JSON.stringify(reply.records))
+            if (bytes > 64 * 1024 * 1024) throw failure('HISTORY_TOO_LARGE', '本次恢复内容过大，已保留已同步记录。')
+            cloudRuns = reply.runs ?? {}
+            for (const record of reply.records) if (record.type === 'assistant') {
+              if (!assistantPages.has(record.apiId)) assistantPages.set(record.apiId, pageCursor)
+              lastApi = record.apiId
+            }
+            records.push(...reply.records)
+            cursor = { offset: reply.nextOffset, lastUuid: reply.lastUuid }
+            if (reply.done) { done = true; break }
           }
-          if (reply.status === 'cursor-reset' && !reset) { cursor = { offset: 0, lastUuid: null }; records.length = 0; bytes = 0; reset = true; continue }
-          if (reply.status !== 'ok' || reply.sessionId !== binding.sdkSessionId || !Array.isArray(reply.records)
-            || !Number.isSafeInteger(reply.nextOffset) || reply.nextOffset < cursor.offset
-            || (reply.nextOffset === cursor.offset && reply.done !== true)
-            || (reply.lastUuid !== null && typeof reply.lastUuid !== 'string')) {
-            throw failure(reply.code ?? 'HISTORY_INVALID', '云端记录尚未同步，未继续执行。')
+          if (!done) throw failure('HISTORY_TOO_LARGE', '云端记录超过本次同步上限，未静默省略。')
+          cloudResults.clear()
+          try {
+            for (const record of coalesceHistory(records)) {
+              if (record.type === 'prompt' && binding.runs?.[record.uuid]?.turn) {
+                local.turn = binding.runs[record.uuid].turn; local.step = binding.runs[record.uuid].step
+              } else if (record.type === 'assistant') {
+                const previous = local.assistants.find(event => event.data.message.id.startsWith(assistantPrefix(record.apiId)))
+                if (previous) { local.turn = previous.data.turn; local.step = previous.data.step }
+                added += restoreAssistant(agent.session, record, local, this.helpers,
+                  agent._bridgeStatus?.model ?? selectionFor(this.ctx, agent).model)
+                // Each distinct main-agent API response owns a DSH step. Tool
+                // results and split transcript blocks must not collapse them.
+                local.step++
+              } else if (record.type === 'tool-result') cloudResults.set(record.callId, record)
+            }
+            replay = assistantPages.get(lastApi) ?? readStart
+            break
+          } catch (error) {
+            if (error.code !== 'HISTORY_FRAGMENT_INCOMPLETE' || readStart.offset === 0 || attempt > 0) throw error
+            cursor = { offset: 0, lastUuid: null }
           }
-          bytes += Buffer.byteLength(JSON.stringify(reply.records))
-          if (bytes > 64 * 1024 * 1024) throw failure('HISTORY_TOO_LARGE', '本次恢复内容过大，已保留已同步记录。')
-          cloudRuns = reply.runs ?? {}
-          records.push(...reply.records)
-          cursor = { offset: reply.nextOffset, lastUuid: reply.lastUuid }
-          if (reply.done) { done = true; break }
-        }
-        if (!done) throw failure('HISTORY_TOO_LARGE', '云端记录超过本次同步上限，未静默省略。')
-        for (const record of coalesceHistory(records)) {
-            if (record.type === 'prompt' && binding.runs?.[record.uuid]?.turn) {
-              local.turn = binding.runs[record.uuid].turn; local.step = binding.runs[record.uuid].step
-            } else if (record.type === 'assistant') {
-              const previous = local.assistants.findLast(event => event.data.message.id.startsWith(assistantPrefix(record.apiId)))
-              if (previous) { local.turn = previous.data.turn; local.step = previous.data.step }
-              added += restoreAssistant(agent.session, record, local, this.helpers,
-                agent._bridgeStatus?.model ?? selectionFor(this.ctx, agent).model)
-              // Each distinct main-agent API response owns a DSH step. Tool
-              // results and split transcript blocks must not collapse them.
-              local.step++
-            } else if (record.type === 'tool-result') cloudResults.set(record.callId, record)
         }
         const updates = []
         let unresolvedTools = 0
@@ -400,9 +433,9 @@ export class BridgeBackend {
               try { expectedHash = createHash('sha256').update(JSON.stringify(JSON.parse(call?.data.arguments))).digest('hex') } catch {}
               if (cloud?.content && call?.seq === tool.callSeq && call.data.name === tool.name
                 && receipt?.name === tool.name && receipt.argumentsSha256 === expectedHash) {
-                result = agent.session.append('tool/result', { turn: call.data.turn, step: call.data.step,
+                result = appendHistoryRecord(agent.session, HISTORY_TOOL_RESULT, { turn: call.data.turn, step: call.data.step,
                   message: this.helpers.createToolResultMessage({ callId, content: cloud.content, isError: cloud.isError }),
-                  meta: { claudeBridgeRecovered: true } }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+                  meta: { claudeBridgeRecovered: true }, callSeq: call.seq }, this.helpers)
                 local.results.set(callId, result)
               }
             }
@@ -417,7 +450,7 @@ export class BridgeBackend {
             ? observed : run.status === 'prepared' ? 'not-sent' : 'unknown', tools })
         }
         await this.checkpoint(agent.session)
-        await this.state.reconcileRecovery(agent.id, updates, { ...cursor, projectionVersion: 2 })
+        await this.state.reconcileRecovery(agent.id, updates, { ...cursor, replay, projectionVersion: 3 })
         await this.state.markStarted(agent.id)
         const previous = agent._bridgeStatus ?? this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
         const interrupted = pending.length > 0 || ['running', 'stopping', 'unknown'].includes(previous?.phase)

@@ -3,18 +3,23 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import vm from 'node:vm'
 import { SdkProjection } from '../src/sdk-projection.mjs'
+import { HISTORY_ASSISTANT } from '../src/history-records.mjs'
+import { strictSession } from './fixtures/native-persistence.mjs'
+import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
 // The ordinary Node test suite skips these cases if its ASAR reader is absent.
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
 
 async function fixture() {
-  const helpers = await import('../plugin/compat/runtime.mjs')
+  const helpers = { ...await import('../plugin/compat/runtime.mjs'),
+    appendPluginRecord(session, type, data) { return session.append(type, data, { ignorable: true }).seq } }
   const records = []
   const frames = []
   const agent = {
     id: 'projection-test',
-    session: { append(type, data, intent) { records.push({ type, data, intent }); return { seq: records.length } } },
+    session: { eventAt: seq => records[seq - 1],
+      append(type, data, intent) { records.push({ type, data, ...intent, intent }); return { seq: records.length } } },
     dispatch: { emit(type, value) { frames.push({ type, ...value }) } },
   }
   const projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'haiku', async onUsage() {} })
@@ -183,7 +188,7 @@ test('实际 rc5 helper：相同 SDK message ID 的不同工具块均保留', { 
       { type: 'tool_use', id, name: 'mcp__dsh__local_smoke', input: {} },
     ] } })
   }
-  const blocks = records.filter((record) => record.type === 'assistant/message').at(-1).data.message.content
+  const blocks = records.filter((record) => record.type === HISTORY_ASSISTANT).at(-1).data.message.content
   assert.deepEqual(blocks.filter((block) => block.type === 'tool-call').map((block) => block.id), ['toolu_one', 'toolu_two'])
 })
 
@@ -255,6 +260,33 @@ test('实际 rc5 helper：同一步多个工具片段结算为累计快照，后
   assert.deepEqual(records.at(-1).data.message.content.map(block => block.text ?? block.id), ['工具前文本', 'one', '第二段说明', 'two'])
 })
 
+test('实际原生客户端：同一响应的多个工具片段不重开流、不触发历史重建', { skip: !available }, async () => {
+  const f = await fixture()
+  const source = await readFile(new URL('../plugin/session-client/client.js', import.meta.url), 'utf8')
+  const start = source.indexOf('var ClientAssistantStream = class'), end = source.indexOf('//#endregion', start)
+  const fold = vm.runInNewContext(`${source.slice(start, end)}; new ClientAssistantStream()`)
+  fold.replace([])
+  let seq = 0
+  const check = decision => assert.notEqual(decision?.type, 'rebaseline')
+  f.agent.session.append = (type, data, intent) => {
+    const event = { seq: seq++, time: Date.now(), type, data, ...intent }
+    f.records.push(event)
+    check(fold.acceptDurable({ type: 'durable', event }))
+    return event
+  }
+  f.agent.dispatch.emit = (_name, value) => {
+    const frame = { ...value.frame, ...(value.frame.type === 'start' ? { startedAfterSeq: seq - 1 } : {}) }
+    f.frames.push(frame); check(fold.acceptFrame(frame))
+  }
+  await f.projection.accept({ type: 'stream_event', event: { type: 'message_start', message: { id: 'multi-tool' } } })
+  for (const id of ['a', 'b']) await f.projection.accept({ type: 'assistant', message: { id: 'multi-tool', content: [
+    { type: 'tool_use', id, name: 'mcp__dsh__local_wait', input: {} },
+  ] } })
+  f.agent.session.append('step/end', { turn: 1, step: 1 })
+  assert.deepEqual(f.records.filter(event => event.type === HISTORY_ASSISTANT).at(-1).data.message.content.map(block => block.id), ['a', 'b'])
+  assert.equal(f.frames.filter(frame => frame.type === 'start').length, 1)
+})
+
 test('实际 rc5 helper：首 token 和首正文分开计时，每轮只各报告一次', { skip: !available }, async () => {
   const { projection } = await fixture()
   const times = []
@@ -278,4 +310,29 @@ test('实际 rc5 helper：部分流只有文本时仍补全完整消息里的工
   const blocks = records.filter((record) => record.type === 'assistant/message').flatMap((record) => record.data.message.content)
   assert.equal(blocks.filter((block) => block.type === 'text' && block.text === '检查中').length, 1)
   assert.equal(blocks.filter((block) => block.type === 'tool-call' && block.id === 'toolu_unstreamed').length, 1)
+})
+
+test('原生持久化：同一响应多个工具片段只广告一次，累计展示可严格重载', { skip: !available }, async () => {
+  const native = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const helpers = { ...await import('../plugin/compat/runtime.mjs'), appendPluginRecord: native.appendPluginRecord }
+  const id = 'strict-multi-tool'
+  const session = native.Session.create(id, undefined, { version: native.SESSION_FORMAT_VERSION,
+    id, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+  session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
+  const projection = new SdkProjection({ agent: { id, session, dispatch: { emit() {} } },
+    helpers, turn: 1, step: 1, model: 'fixture' })
+  for (const callId of ['a', 'b']) {
+    await projection.accept({ type: 'assistant', message: { id: 'same-api', content: [
+      { type: 'text', text: `合成说明-${callId}` }, { type: 'tool_use', id: callId, name: 'mcp__dsh__local_wait', input: {} },
+    ] } })
+    session.append('tool/call', { turn: 1, step: 1, callId, name: 'local_wait', arguments: '{}' })
+    session.append('tool/result', { turn: 1, step: 1,
+      message: helpers.createToolResultMessage({ callId, content: [{ type: 'text', text: '合成结果' }], isError: false }) }, { surfaceOp: 'append' })
+  }
+  session.append('step/end', { turn: 1, step: 1 }); session.append('turn/end', { turn: 1 })
+  await strictSession(session)
+  assert.deepEqual(session.snapshotEvents().filter(event => event.type === 'assistant/message')
+    .flatMap(event => event.data.message.content.filter(block => block.type === 'tool-call').map(block => block.id)), ['a', 'b'])
+  assert.deepEqual(session.snapshotEvents().findLast(event => event.type === HISTORY_ASSISTANT)
+    .data.message.content.map(block => block.text ?? block.id), ['合成说明-a', 'a', '合成说明-b', 'b'])
 })

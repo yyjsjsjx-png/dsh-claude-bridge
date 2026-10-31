@@ -7,6 +7,7 @@ import { BridgeBackend } from '../src/backend.mjs'
 import { planUsageSnapshot } from '../src/plan-usage.mjs'
 import { BridgeState } from '../src/state.mjs'
 import { assistantIdentity, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
+import { HISTORY_ASSISTANT, HISTORY_TOOL_RESULT } from '../src/history-records.mjs'
 import { createHash } from 'node:crypto'
 
 const provider = 'claude-sdk-remote'
@@ -306,6 +307,23 @@ test('显示偏好默认三种 5.5，保存后可清空且不会删除完整目�
   assert.deepEqual((await f.backend.visibleCatalog()).models, [])
 })
 
+test('新建模型和强度跨重启保存，与显示模型偏好独立', async t => {
+  const f = await fixture(t, async () => { throw new Error('记忆选型不应连接服务器') })
+  assert.equal(await f.backend.creationSelection(), null)
+  const selection = { provider, model: 'haiku', reasoningEffort: 'high' }
+  f.ctx.agentDefaultModel = { currentSelection: () => selection }
+  assert.deepEqual(await f.backend.creationSelection(), selection)
+  await f.backend.rememberCreationSelection({ ...selection, sessionId: 'ignored' })
+  assert.deepEqual(await f.backend.creationSelection(), selection)
+  const persisted = new BridgeState(f.backend.directory)
+  await persisted.ready
+  assert.deepEqual(persisted.value.creationSelection, selection)
+  assert.equal(persisted.value.modelPreferences, undefined)
+  await assert.rejects(f.backend.rememberCreationSelection({ provider: 'other', model: 'haiku' }),
+    { code: 'MODEL_PREFERENCES_INVALID' })
+  assert.deepEqual(await f.backend.creationSelection(), selection)
+})
+
 test('目录解析并发与短期重复读取只请求一次，手动刷新另行验证登录', async (t) => {
   let catalogs = 0
   let auth = 0
@@ -437,7 +455,7 @@ async function fixture(t, makeTransport, execute) {
   }
   const helpers = {
     resolveDshHome() { return directory },
-    appendPluginRecord(session, type, data) { return session.append(type, data).seq },
+    appendPluginRecord(session, type, data) { return session.append(type, data, { ignorable: true }).seq },
     renderPrompt() { return 'DSH 测试预设' },
     createToolResultMessage({ callId, content, isError }) {
       return { id: 'synthetic-result', role: 'tool', source: { kind: 'tool-result', callId }, content, isError }
@@ -684,7 +702,7 @@ test('Host 崩溃窗口自动核实本机已落盘结果，补齐云端尾部，
   binding = await interruptedTool(f, { result: true })
   assert.equal((await f.backend.syncSession(f.agent)).added, 1)
   assert.equal((await f.backend.syncSession(f.agent)).added, 0)
-  assert.equal(f.records.filter(item => item.type === 'assistant/message').length, 2)
+  assert.equal(f.records.filter(item => item.type === HISTORY_ASSISTANT).length, 1)
   assert.equal((await f.backend.state.recoveryStatus(f.agent.id)).length, 0)
   assert.equal(f.backend.state.value.sessions[f.agent.id].runs['interrupted-run'].tools['old-call'].resultSeq, binding.resultSeq)
   assert.equal(queries, 0); assert.equal(executed, 0)
@@ -713,7 +731,7 @@ test('未知工具仅用匹配的云端回执核实，未核实说明随下一�
   assert.equal(captured.prompt.some(block => block.type === 'text' && block.text.includes('[桥接插件运行说明')), false)
   f.agent.phase = { kind: 'idle' }; verified = true
   assert.equal((await f.backend.syncSession(f.agent)).unresolvedTools, 0)
-  assert.equal(f.records.filter(item => item.type === 'tool/result' && item.data.meta?.claudeBridgeRecovered === true).length, 1)
+  assert.equal(f.records.filter(item => item.type === HISTORY_TOOL_RESULT && item.data.meta?.claudeBridgeRecovered === true).length, 1)
 })
 
 test('云端原运行仍在收尾时保留新输入等待，用户停止能中断等待且不发送 query', async t => {
@@ -755,11 +773,82 @@ test('历史核对按原生响应分配步骤，旧版游标先完整修复且�
   f.agent.session.append('step/start', { turn: 3, step: 1 })
   f.agent.phase = { kind: 'running', turn: 3, step: 1, abort: new AbortController() }
   assert.equal((await f.backend.syncSession(f.agent, { withinRun: true })).added, 1)
-  const restored = f.records.filter(event => event.type === 'assistant/message').at(-1)
+  const restored = f.records.filter(event => event.type === HISTORY_ASSISTANT).at(-1)
   assert.equal(restored.data.turn, 2)
   assert.equal(restored.data.step, 2)
   assert.deepEqual(restored.data.message.content, answer)
   f.agent.phase = { kind: 'idle' }
   assert.equal((await f.backend.syncSession(f.agent)).added, 0)
-  assert.deepEqual(offsets, [0, 3])
+  // Small histories replay their last response's page rather than resuming in
+  // the middle of a possibly split API message.
+  assert.deepEqual(offsets, [0, 0])
+  assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor?.projectionVersion, 3)
+})
+
+test('分页历史重读最后响应的起始页，补全跨页片段且保持幂等', async t => {
+  let binding, expanded = false
+  const cursors = []
+  const reasoning = { type: 'reasoning', text: '先核对已有状态。' }
+  const text = { type: 'text', text: '开始检查。' }
+  const tool = { type: 'tool-call', id: 'paged-call', name: 'local_command', arguments: '{"command":"pwd"}' }
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, capabilities: { historySync: true } }
+    assert.equal(method, 'history')
+    cursors.push({ offset: params.offset, afterUuid: params.afterUuid })
+    const page = params.offset === 0
+      ? { records: [{ type: 'prompt', uuid: 'mapped-run' },
+          { type: 'assistant', uuid: 'old-body', apiId: 'old-api', content: [{ type: 'text', text: '上个响应' }] }],
+        nextOffset: 2, lastUuid: 'old-body', done: false }
+      : params.offset === 2
+        ? { records: [{ type: 'assistant', uuid: 'a-reasoning', apiId: 'paged-api', content: [reasoning] }],
+          nextOffset: 3, lastUuid: 'a-reasoning', done: false }
+        : { records: [{ type: 'assistant', uuid: 'a-text', apiId: 'paged-api', content: [text] },
+            ...(expanded ? [{ type: 'assistant', uuid: 'a-tool', apiId: 'paged-api', content: [tool] }] : [])],
+          nextOffset: expanded ? 5 : 4, lastUuid: expanded ? 'a-tool' : 'a-text', done: true }
+    return { status: 'ok', sessionId: binding.sdkSessionId, runs: {}, ...page }
+  } }, async close() {} }))
+  recoveryEvents(f)
+  binding = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+  await f.backend.state.markStarted(f.agent.id)
+  assert.equal((await f.backend.syncSession(f.agent)).added, 2)
+  expanded = true
+  assert.equal((await f.backend.syncSession(f.agent)).added, 1)
+  assert.deepEqual(f.records.filter(event => event.type === HISTORY_ASSISTANT).at(-1).data.message.content,
+    [reasoning, text, tool])
+  assert.equal((await f.backend.syncSession(f.agent)).added, 0)
+  assert.deepEqual(cursors, [
+    { offset: 0, afterUuid: undefined }, { offset: 2, afterUuid: 'old-body' }, { offset: 3, afterUuid: 'a-reasoning' },
+    { offset: 2, afterUuid: 'old-body' }, { offset: 3, afterUuid: 'a-reasoning' },
+    { offset: 2, afterUuid: 'old-body' }, { offset: 3, afterUuid: 'a-reasoning' },
+  ])
+  assert.deepEqual(f.backend.state.value.sessions[f.agent.id].historyCursor.replay, { offset: 2, lastUuid: 'old-body' })
+})
+
+test('增量片段缺失本地内容时完整重读一次，不用片段覆盖思考和正文', async t => {
+  let binding
+  const offsets = []
+  const reasoning = { type: 'reasoning', text: '已有思考。' }
+  const text = { type: 'text', text: '已有正文。' }
+  const tool = { type: 'tool-call', id: 'fallback-call', name: 'local_command', arguments: '{"command":"pwd"}' }
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, capabilities: { historySync: true } }
+    assert.equal(method, 'history')
+    offsets.push(params.offset)
+    return { status: 'ok', sessionId: binding.sdkSessionId, records: [
+      ...(params.offset === 0 ? [{ type: 'assistant', uuid: 'a-head', apiId: 'fallback-api', content: [reasoning] }] : []),
+      { type: 'assistant', uuid: 'a-tail', apiId: 'fallback-api', content: [text, tool] },
+    ], runs: {}, nextOffset: 4, lastUuid: 'a-tail', done: true }
+  } }, async close() {} }))
+  recoveryEvents(f)
+  binding = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+  await f.backend.state.markStarted(f.agent.id)
+  await f.backend.state.reconcileRecovery(f.agent.id, [], { offset: 3, lastUuid: 'a-old-tail',
+    projectionVersion: 3, replay: { offset: 2, lastUuid: 'a-head' } })
+  f.agent.session.append('assistant/message', { turn: 1, step: 1,
+    message: { id: assistantIdentity('fallback-api', [reasoning, text]), content: [reasoning, text] } })
+  assert.equal((await f.backend.syncSession(f.agent)).added, 1)
+  assert.deepEqual(offsets, [2, 0])
+  assert.deepEqual(f.records.filter(event => event.type === HISTORY_ASSISTANT).at(-1).data.message.content,
+    [reasoning, text, tool])
+  assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor.replay.offset, 0)
 })

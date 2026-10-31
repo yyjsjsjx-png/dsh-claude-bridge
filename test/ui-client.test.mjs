@@ -84,8 +84,8 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   };
   await client.apply(ctx);
   const settings = slots.get('dsh-claude-bridge').options.inject();
-  await settings.save({ url: 'wss://example.test/', token: 'sample-not-a-real-secret' });
-  assert.equal(saved.token, 'sample-not-a-real-secret');
+  await settings.save({ url: 'wss://example.test/', token: 'sample-secret' });
+  assert.equal(saved.token, 'sample-secret');
   assert.equal(catalogCalls, 0);
   assert.equal(JSON.stringify(settings.hooks.settings.getSnapshot()).includes(saved.token), false);
   assert.equal(settings.hooks.settings.getSnapshot().disabledFeatures[0].name, '规划模式');
@@ -98,6 +98,40 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   await settings.saveModels();
   assert.deepEqual(modelIds, ['sonnet']);
   assert.deepEqual(Array.from(settings.hooks.settings.getSnapshot().selectedModelIds), ['sonnet']);
+});
+
+test('远程新建默认沿用上次模型和强度，目录失效时要求重新选择', async () => {
+  let entry;
+  vm.runInNewContext(await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8'),
+    { window: { __ModuleLoader__: { load: value => { entry = value; } } } });
+  const client = entry.factory(name => name === 'react' ? { createElement() {} } : name === 'zod' ? { z: {} } : {});
+  const slots = new Map();
+  let selection = { provider: 'claude-sdk-remote', model: 'haiku', reasoningEffort: 'high' };
+  const models = [{ id: 'haiku', reasoning: { efforts: [{ id: 'high' }] } }];
+  const ctx = {
+    workspaces: { list: { getSnapshot: () => ({ items: [{ workspaceId: 'w', sessionIds: ['s'] }] }) } },
+    sessions: {}, uiWorkspace: {},
+    remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
+      status: async () => ({ ok: true, value: { configured: false } }),
+      visibleModels: async () => ({ ok: true, value: { models, selection } }),
+    } },
+    slots: { inject: (_name, register) => register(), register(options) { slots.set(options.id, options); return () => {}; } },
+    inject: (_services, callback) => callback(ctx), effect() {},
+  };
+  await client.apply(ctx);
+  const show = slots.get('dsh-claude-new-session').inject('s').show;
+  const picker = slots.get('dsh-claude-session-picker').inject();
+  await show();
+  assert.equal(picker.hooks.dialog.getSnapshot().model, 'haiku');
+  assert.equal(picker.hooks.dialog.getSnapshot().effort, 'high');
+  selection = { ...selection, reasoningEffort: 'removed' };
+  await show();
+  assert.equal(picker.hooks.dialog.getSnapshot().model, 'haiku');
+  assert.equal(picker.hooks.dialog.getSnapshot().effort, '');
+  selection = { ...selection, model: 'hidden' };
+  await show();
+  assert.equal(picker.hooks.dialog.getSnapshot().model, '');
+  assert.equal(picker.hooks.dialog.getSnapshot().effort, '');
 });
 
 test('清除按钮清空凭据草稿和连接缓存，迟到的状态、模型和额度响应不能恢复旧配置', async () => {
