@@ -1,0 +1,49 @@
+name: Update latest stable tag
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: latest-stable-tag
+  cancel-in-progress: false
+
+jobs:
+  update-latest:
+    if: github.event_name == 'workflow_dispatch' || (!github.event.release.draft && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Point latest at the current stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(gh api -H 'Cache-Control: no-cache' "repos/$GH_REPO/releases/latest" --jq '.tag_name')
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Latest release must be a stable version tag.'; exit 1; }
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$tag")
+          kind=$(jq -r '.object.type' <<< "$ref")
+          sha=$(jq -r '.object.sha' <<< "$ref")
+          for _ in 1 2 3 4 5; do
+            [[ "$kind" == 'tag' ]] || break
+            object=$(gh api "repos/$GH_REPO/git/tags/$sha")
+            kind=$(jq -r '.object.type' <<< "$object")
+            sha=$(jq -r '.object.sha' <<< "$object")
+          done
+          [[ "$kind" == 'commit' && "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'Release tag does not resolve to a commit.'; exit 1; }
+          current=$(gh api "repos/$GH_REPO/git/matching-refs/tags/latest" --jq '.[] | select(.ref == "refs/tags/latest") | .object.sha')
+          if [[ "$current" == "$sha" ]]; then
+            echo "latest already points to $tag ($sha)."
+          elif [[ -n "$current" ]]; then
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/latest" -f sha="$sha" -F force=true --silent
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref='refs/tags/latest' -f sha="$sha" --silent
+          fi
+          actual=$(gh api "repos/$GH_REPO/git/ref/tags/latest" --jq '.object.sha')
+          [[ "$actual" == "$sha" ]]
+          echo "latest -> $tag ($sha)"

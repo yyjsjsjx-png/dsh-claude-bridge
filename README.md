@@ -75,7 +75,7 @@
 dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#latest
 ```
 
-`latest` 随正式版发布维护；需要固定版本时可将它换成对应的 `vX.Y.Z` 标签。已有安装仍需执行更新命令升级，不会在启动时自动替换插件。
+`latest` 在发布正式版时由 GitHub Actions 自动更新；需要固定版本时可将它换成对应的 `vX.Y.Z` 标签。已有安装仍需执行更新命令升级，不会在启动时自动替换插件。
 
 ## 版本说明
 
@@ -139,7 +139,7 @@ npm test
 
 ASAR 专用检查使用已有 DSH Electron 的 Node 模式。
 
-维护者发布正式版后，使用已授权的 GitHub CLI 执行 `node scripts/update-latest-tag.mjs`，将 `latest` 标签同步到 GitHub 最新正式版。脚本核对版本与提交，仅更新 `latest`，不修改固定版本标签。
+GitHub Actions 在正式版发布后维护 `latest` 标签，也支持手动运行。需要手动维护时，使用已授权的 GitHub CLI 执行 `node scripts/update-latest-tag.mjs`；两种方式都查询 GitHub 最新正式版并核对提交，仅更新 `latest`，不修改固定版本标签。
 
 开发用隔离 Host 可用 `node scripts/launch-isolated.mjs <DSH-resources目录> --ssh-target <已有SSH别名>` 启动，数据保存在本项目 `.local/harness`。该目录内的数据须保密。
 
