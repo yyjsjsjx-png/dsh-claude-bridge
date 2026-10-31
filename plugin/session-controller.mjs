@@ -8,6 +8,6 @@ export default class ClaudeSessionPolicy extends Service {
 
   constructor(ctx) {
     super(ctx, 'claudeSessionPolicy');
-    ctx.effect(() => installControllerGuards(ctx, RemoteError), '远程 Claude 会话策略');
+    ctx.effect(() => installControllerGuards(ctx, RemoteError), '远程会话策略');
   }
 }

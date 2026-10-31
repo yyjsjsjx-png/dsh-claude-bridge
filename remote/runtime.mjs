@@ -384,7 +384,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     const status = await authReader.read({ signal, refresh })
     if (!status.loggedIn) throw new AuthError('AUTH_REQUIRED', '请先在服务器登录 Claude Code')
     if (status.authMethod && status.authMethod !== 'claude.ai') {
-      throw new AuthError('AUTH_METHOD_UNSUPPORTED', '当前登录方式不是已配置的 Claude 账号')
+      throw new AuthError('AUTH_METHOD_UNSUPPORTED', '当前版本仅支持本人 Claude 订阅登录；API Key 等其他登录方式暂未开放')
     }
     return status
   }
@@ -399,7 +399,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       return await authReader.read({ signal: context.signal, refresh: params.refresh === true })
     } catch (error) {
       const problem = error instanceof WorkerError || error instanceof AuthError
-        ? error : new AuthError('AUTH_STATUS_UNAVAILABLE', '无法读取远程 Claude 登录状态')
+        ? error : new AuthError('AUTH_STATUS_UNAVAILABLE', '无法读取远程 Claude Code 登录状态')
       return { status: problem.code === 'CANCELLED' ? 'cancelled' : 'failed', code: problem.code, message: problem.message }
     }
   }

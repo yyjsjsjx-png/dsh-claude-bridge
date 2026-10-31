@@ -13,7 +13,7 @@ export function createClaudeLoopAgent(Base, loopCtx, id, options, session) {
   // its provisional Agent options are intentionally not checked here.
   if (session.header.origin === 'subagent'
     && (options?.provider !== CLAUDE_PROVIDER || typeof options.model !== 'string' || !options.model)) {
-    const error = new Error('远程 Claude 子代理必须继承或选择远程 Claude 模型。')
+    const error = new Error('远程会话子代理必须继承或选择远程模型。')
     error.code = 'SUBAGENT_ENGINE_MISMATCH'
     throw error
   }
@@ -22,7 +22,7 @@ export function createClaudeLoopAgent(Base, loopCtx, id, options, session) {
       this._bridgeStepOpen = true
       const bridge = this.ctx.get('claudeBridge') ?? loopCtx.get('claudeBridge')
       if (!bridge || typeof bridge.runStep !== 'function') {
-        const error = new Error('远程 Claude 桥接服务尚未就绪；未启动模型请求。')
+        const error = new Error('远程会话桥接服务尚未就绪；未启动模型请求。')
         error.code = 'BRIDGE_NOT_READY'
         throw error
       }

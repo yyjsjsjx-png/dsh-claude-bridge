@@ -7,6 +7,8 @@
 
 - `plugin/compat/agent-loop.original.mjs` 来自该版本的官方安装包；`agent-loop.mjs` 仅适配桥接构造入口和远程轮次收尾。来源和 SHA-256 见同目录 `provenance.json`，许可证见 `LICENSE`。
 - `plugin/session-client/client.js` 为该版本官方客户端原样副本；同目录保留 `provenance.json` 和 MIT `LICENSE`。
-- Claude Agent SDK 与官方 CLI 仅在远端独立安装；本仓库不分发其程序或账号认证数据。固定版本见 `remote/package.json`。
+- Claude Agent SDK 与官方 CLI 仅在远端独立安装；本仓库不分发其程序或账号认证数据。固定版本见 `remote/package.json`。Agent SDK 与 Claude Code 的使用受 Anthropic 条款约束。
+
+本项目与 Anthropic、DeepSeek 均无隶属、合作或背书关系。Claude、Claude Code 为 Anthropic 的商标，DeepSeek 为其所有者的商标，此处仅用于说明兼容对象。
 
 官方仓库：[deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)。

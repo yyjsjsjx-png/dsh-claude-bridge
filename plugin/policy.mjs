@@ -48,7 +48,7 @@ function engineForProvider(provider) {
 /** Pack creation-only selection into rc.5's declared agentPreset wire field. */
 export function encodeRemoteCreationSelection(selection) {
   const model = normalizeModel(selection);
-  if (model.provider !== CLAUDE_PROVIDER) fail('PRESET_ENGINE_MISMATCH', '远程会话需要远程 Claude 模型。');
+  if (model.provider !== CLAUDE_PROVIDER) fail('PRESET_ENGINE_MISMATCH', '远程会话需要远程模型。');
   const payload = { model: model.model,
     ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }) };
   return REMOTE_CREATE_PREFIX + encodeURIComponent(JSON.stringify(payload));
@@ -83,7 +83,7 @@ export function planSessionCreation({ selection, requestedPreset, defaultPreset 
   } else {
     preset = requiredName(requestedPreset ?? defaultPreset, '会话预设');
     if (preset === CLAUDE_PRESET) {
-      fail('PRESET_ENGINE_MISMATCH', '远程 Claude 预设只能用于远程 Claude 模型。');
+      fail('PRESET_ENGINE_MISMATCH', '远程会话预设只能用于远程模型。');
     }
   }
   return Object.freeze({ schemaVersion: BINDING_VERSION, engine, preset, initialModel });
@@ -135,7 +135,7 @@ export function assertPresetUnchanged(currentPreset, requestedPreset) {
   const preset = requiredName(requestedPreset, '会话预设');
   if (preset !== current) {
     fail('PRESET_LOCKED', preset === CLAUDE_PRESET
-      ? '请通过“新建远程 Claude”创建会话。'
+      ? '请通过“新建远程会话”创建会话。'
       : '会话创建后不能切换预设，请新建会话。');
   }
   return current;

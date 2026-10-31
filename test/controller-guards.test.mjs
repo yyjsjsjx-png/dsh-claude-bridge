@@ -86,7 +86,7 @@ test('旧版遗留远程全局默认在普通会话创建前给出专用入口�
   ctx.agentDefaultModel.currentSelection = () => ({ provider: 'claude-sdk-remote', model: 'account-default' });
   await assert.rejects(controller.create({}), error => {
     assert.equal(error.code, 'session/model-unavailable');
-    assert.match(error.message, /新建远程 Claude/);
+    assert.match(error.message, /新建远程会话/);
     return true;
   });
   assert.equal(getCreated(), undefined);
@@ -150,7 +150,7 @@ test('远程消息分支在创建分叉前拒绝，不写入新会话', async ()
   const writes = getWrites();
   await assert.rejects(controller.fork({ sessionId: 's', turn: 1 }), error => {
     assert.equal(error.code, 'session/fork-unavailable');
-    assert.equal(error.message, '远程 Claude 会话不支持分叉，请新建会话。');
+    assert.equal(error.message, '远程会话不支持分叉，请新建会话。');
     return true;
   });
   assert.equal(getWrites(), writes);
@@ -172,7 +172,7 @@ test('预设守卫在首轮之前也拒绝更改且不会重组', async () => {
   const registry = new Registry({ sessionProjections: { stateOf: () => 'standard' } }, {});
   await assert.rejects(registry.select(agent, 'claude-sdk-remote'), error => {
     assert.equal(error.code, 'agent-preset/locked');
-    assert.equal(error.message, '请通过“新建远程 Claude”创建会话。');
+    assert.equal(error.message, '请通过“新建远程会话”创建会话。');
     return true;
   });
   assert.equal(await registry.select(agent, 'standard'), 'standard');

@@ -1,6 +1,6 @@
 {
   "name": "dsh-claude-bridge",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -8,7 +8,7 @@
   "exports": { ".": "./plugin/bundle.mjs", "./package.json": "./package.json" },
   "files": ["plugin", "src", "patches", "remote/*.mjs", "remote/package.json", "remote/package-lock.json", "deploy/bridge.service.example", "更新插件.cmd", "scripts/start-update.ps1", "scripts/resolve-dsh-executable.ps1", "scripts/launch-isolated.mjs", "scripts/build-plugin.mjs", "scripts/connect-ssh.ps1", "scripts/connect-ssh.sh", "scripts/collect-performance.mjs", "scripts/update-plugin.ps1", "scripts/update-plugin.mjs", "scripts/repair-history.mjs", "docs/getting-started.md", "docs/remote-service.md", "docs/compatibility-inventory.md", "docs/performance.md", "docs/updating.md", "README.md", "LICENSE", "THIRD_PARTY.md"],
   "dsh": { "bundle": { "patch": "./patches/bundle.patch.yml" } },
-  "description": "本机 DSH 与远端官方 Claude Agent SDK 的独立桥接实验",
+  "description": "本机 DSH 与本人服务器上官方 Claude Agent SDK 的个人自用桥接实验（非 Anthropic 官方项目）",
   "engines": { "node": ">=24.9", "dsh": "*" },
   "scripts": { "test": "node --test test/*.test.mjs" }
 }

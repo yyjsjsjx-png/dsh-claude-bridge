@@ -22,8 +22,8 @@ const ACCOUNT_DEFAULT = 'account-default';
 const DEFAULT_MODEL = Object.freeze({
   provider: CLAUDE_PROVIDER,
   id: ACCOUNT_DEFAULT,
-  name: '远程 Claude（账号默认）',
-  description: '由远程 Claude 账号选择默认模型。',
+  name: '远程模型（账号默认）',
+  description: '由远程账号选择默认模型。',
 });
 const NO_CONFIGURATION = new Set(['SETTINGS_MISSING', 'TOKEN_MISSING', 'BRIDGE_NOT_CONFIGURED']);
 
@@ -36,12 +36,12 @@ export class ClaudeCatalogAdapter extends LlmAdapter {
   }
 
   providerInfo(provider) {
-    return { id: provider, name: '远程 Claude' };
+    return { id: provider, name: '远程模型' };
   }
 
   async models(visible = false) {
     const method = visible ? this.backend.visibleCatalog : this.backend.catalog;
-    if (typeof method !== 'function') throw new Error('远程 Claude 模型目录服务尚未就绪。');
+    if (typeof method !== 'function') throw new Error('远程模型目录服务尚未就绪。');
     let reply;
     try {
       reply = await method.call(this.backend);
@@ -50,19 +50,19 @@ export class ClaudeCatalogAdapter extends LlmAdapter {
       throw error;
     }
     const models = Array.isArray(reply) ? reply : reply?.status === 'ok' ? reply.models : undefined;
-    if (!Array.isArray(models)) throw new Error('远程 Claude 模型目录响应无效。');
+    if (!Array.isArray(models)) throw new Error('远程模型目录响应无效。');
     const seen = new Set([ACCOUNT_DEFAULT]);
     return models.map((model) => {
       if (!model || typeof model.value !== 'string' || !model.value
         || typeof model.displayName !== 'string' || !model.displayName
         || (model.description !== undefined && typeof model.description !== 'string')
-        || seen.has(model.value)) throw new Error('远程 Claude 模型目录包含无效或重复项目。');
+        || seen.has(model.value)) throw new Error('远程模型目录包含无效或重复项目。');
       seen.add(model.value);
       const efforts = model.supportedEffortLevels;
       if (efforts !== undefined && (!Array.isArray(efforts)
         || efforts.some(level => typeof level !== 'string' || !level)
         || new Set(efforts).size !== efforts.length)) {
-        throw new Error('远程 Claude 模型的推理强度目录无效。');
+        throw new Error('远程模型的推理强度目录无效。');
       }
       return {
         provider: CLAUDE_PROVIDER,
@@ -78,7 +78,7 @@ export class ClaudeCatalogAdapter extends LlmAdapter {
   }
 
   async listModels(provider) {
-    if (provider !== CLAUDE_PROVIDER) throw new Error('远程 Claude 提供方无效。');
+    if (provider !== CLAUDE_PROVIDER) throw new Error('远程模型提供方无效。');
     const models = await this.models(true);
     const visible = new Set(models.map(model => model.id));
     const active = new Set();
@@ -103,15 +103,15 @@ export class ClaudeCatalogAdapter extends LlmAdapter {
   }
 
   async resolveModel(provider, model) {
-    if (provider !== CLAUDE_PROVIDER) throw new Error('远程 Claude 提供方无效。');
+    if (provider !== CLAUDE_PROVIDER) throw new Error('远程模型提供方无效。');
     if (model === ACCOUNT_DEFAULT) return { ...DEFAULT_MODEL };
     const found = (await this.models()).find(item => item.id === model);
-    if (!found) throw new Error('该远程 Claude 模型不在当前账号的官方目录中。');
+    if (!found) throw new Error('该远程模型不在当前账号的官方目录中。');
     return found;
   }
 
   async *stream() {
-    throw new Error('远程 Claude 只能由专属会话引擎执行。');
+    throw new Error('远程会话只能由专属会话引擎执行。');
   }
 }
 
@@ -152,7 +152,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
         removeWorkflowGuard();
         if (typeof backend.dispose === 'function') await backend.dispose();
       };
-    }, '远程 Claude 桥接服务');
+    }, '远程会话桥接服务');
     const refreshActiveModels = session => {
       if (session?.header?.agentPreset === CLAUDE_PRESET) {
         try { this.catalogRegistration?.replace?.([CLAUDE_PROVIDER]); }
@@ -190,7 +190,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
 
   assertOwner() {
     if (principalOf(this.ctx.invocation) !== undefined) {
-      throw new RemoteError('remote-access/denied', '仅本机所有者可管理远程 Claude 连接。', {});
+      throw new RemoteError('remote-access/denied', '仅本机所有者可管理远程会话连接。', {});
     }
   }
 

@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $BridgeExitCode = 1
 $BridgeWaitForClose = $true
 try {
-    Write-Host 'DSH 远程 Claude 桥接插件更新' -ForegroundColor Cyan
+    Write-Host 'DSH 远程会话桥接插件更新' -ForegroundColor Cyan
     Write-Host '请先完全退出 DSH，包括托盘中的程序。'
     if ($Profile -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$') { throw '配置名称无效。' }
     # Resolve every target before UAC. A different administrator account must

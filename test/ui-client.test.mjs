@@ -233,7 +233,7 @@ test('设置页打开及可见时刷新统计，合并请求并保留地址草�
   assert.equal(reads, beforeMount + 1);
   assert.equal(settings.hooks.settings.getSnapshot().usageSummary.runs, 2);
   assert.equal(timers.size, 1);
-  assert.match(textOf(render()), /会话 1，运行 2/u);
+  assert.match(textOf(render()), /会话\s+1\s+运行\s+2/u);
   settings.editUrl('wss://draft.test/');
   const beforePoll = reads;
   timers.get(1)();

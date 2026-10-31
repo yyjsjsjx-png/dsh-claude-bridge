@@ -44,7 +44,7 @@ const HOST_METHODS = {
 
 export class DshCompatibilityError extends Error {
   constructor(version, detail, options) {
-    super(`远程 Claude 插件无法加载：DSH ${version || '未知版本'} 的接口不兼容（${detail}）。请更新插件或使用兼容的 DSH。`, options);
+    super(`远程会话插件无法加载：DSH ${version || '未知版本'} 的接口不兼容（${detail}）。请更新插件或使用兼容的 DSH。`, options);
     this.name = 'DshCompatibilityError';
     this.code = 'DSH_API_INCOMPATIBLE';
   }

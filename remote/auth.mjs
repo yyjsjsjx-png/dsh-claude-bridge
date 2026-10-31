@@ -29,14 +29,14 @@ export function createAuthReader({ cliPath, childEnv, exec = execFileAsync, now 
       // The CLI may return nonzero with valid JSON when no login exists.
       if (typeof error?.stdout !== 'string' || !error.stdout.trim()) {
         const detail = sdkErrorDetail(error)
-        throw new AuthError(detail?.code ?? 'AUTH_STATUS_UNAVAILABLE', detail?.message ?? '无法读取远程 Claude 登录状态')
+        throw new AuthError(detail?.code ?? 'AUTH_STATUS_UNAVAILABLE', detail?.message ?? '无法读取远程 Claude Code 登录状态')
       }
       stdout = error.stdout
     }
     let value
-    try { value = JSON.parse(stdout) } catch { throw new AuthError('AUTH_STATUS_UNAVAILABLE', '远程 Claude 登录状态格式无效') }
+    try { value = JSON.parse(stdout) } catch { throw new AuthError('AUTH_STATUS_UNAVAILABLE', '远程 Claude Code 登录状态格式无效') }
     if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.loggedIn !== 'boolean') {
-      throw new AuthError('AUTH_STATUS_UNAVAILABLE', '远程 Claude 登录状态格式无效')
+      throw new AuthError('AUTH_STATUS_UNAVAILABLE', '远程 Claude Code 登录状态格式无效')
     }
     const status = { loggedIn: value.loggedIn }
     if (typeof value.authMethod === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(value.authMethod)) {

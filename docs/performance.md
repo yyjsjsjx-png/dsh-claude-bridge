@@ -4,7 +4,7 @@ v0.1.2 默认记录诊断元数据，不记录提示词、回复正文、思考�
 
 | 日志 | 位置 | 范围 |
 | --- | --- | --- |
-| 本地 | 设置 → 远程 Claude → 诊断显示的目录，通常为 `<DSH_HOME>/claude-bridge/diagnostics` | 本地准备、历史核对、发送、首模型事件、首 token、首段正文、整轮及收到的云端诊断 |
+| 本地 | 设置 → 远程会话 → 兼容性与诊断中显示的目录，通常为 `<DSH_HOME>/claude-bridge/diagnostics` | 本地准备、历史核对、发送、首模型事件、首 token、首段正文、整轮及收到的云端诊断 |
 | 云端 | `<ROOT>/sessions/_diagnostics/<device-id>` | CLI/hooks 和工具集初始化、首模型事件、首 token、首段正文、SDK 原始耗时与结果 |
 
 两端均保留 `bridge.jsonl` 与 `bridge.previous.jsonl`，每份上限 2 MiB。云端日志写入与诊断转发分别执行，短断不会使云端日志丢失。新增记录从升级并重启后开始，旧日志无法补出从未记录过的首 token 时间。
@@ -49,17 +49,17 @@ node scripts/collect-performance.mjs --logs /path/to/diagnostics --out /path/to/
 
 “首 token”表示桥接首次收到可用思考、文字或工具参数的观测点。SDK 未提供流式增量时，以首个完整消息到达为准；不把它当作未观测到的真实生成起点。
 
-## 给虚拟机 agent 的采集提示词
+## 采集步骤
 
-复制下面整段给虚拟机中的 agent。可以在复现完一次“停轮后第一次续聊”和一次慢首响应后执行，无需重复消耗额度：
+可以在复现一次慢首响应等问题后执行，无需重复消耗额度。也可以把下面的步骤交给本机的 AI 助手代为执行：
 
 ```text
-请在这台虚拟机中，为 dsh-claude-bridge 收集一份可发回开发者的本地性能诊断包。
+为 dsh-claude-bridge 收集一份本地性能诊断包，只用于自己分析或附在公开 issue 中。
 
 只使用现有环境，不安装工具或依赖，不发起模型请求，不重启或改动 DSH、插件及连接配置。不要读取或输出桥接口令、认证文件、Cookie、token、授权 URL、聊天正文、工具参数、浏览器存储或原始 Host stdout/stderr。
 
-1. 从 DSH“设置 → 远程 Claude → 诊断”确认本地桥接诊断目录，并找到已安装插件中的 scripts/collect-performance.mjs。界面不便读取时，只检查当前用户已知的 DSH_HOME，或当前用户 .dsh/claude-bridge/diagnostics；不要全盘扫描。插件须为 v0.1.2 或更新版。旧版没有分段点时如实说明，不编造数据，也不要擅自升级。
-2. 使用已有 Node.js 执行收集器，传入 --logs <该诊断目录> 和 --out <桌面新建且唯一的输出目录>。没有独立 Node.js 时，用本机已安装的 DeepSeek Harness.exe 并临时设置 ELECTRON_RUN_AS_NODE=1；结束后恢复该环境变量。禁止安装 Node.js 或另一份 DSH。
+1. 从 DSH“设置 → 远程会话 → 兼容性与诊断”确认本地桥接诊断目录，并找到已安装插件中的 scripts/collect-performance.mjs。界面不便读取时，只检查当前用户已知的 DSH_HOME，或当前用户 .dsh/claude-bridge/diagnostics；不要全盘扫描。插件须为 v0.1.2 或更新版。旧版没有分段点时如实说明，不编造数据，也不要擅自升级。
+2. 使用已有 Node.js 执行收集器，传入 --logs <该诊断目录> 和 --out <新建且唯一的输出目录>。没有独立 Node.js 时，用本机已安装的 DeepSeek Harness.exe 并临时设置 ELECTRON_RUN_AS_NODE=1；结束后恢复该环境变量。禁止安装 Node.js 或另一份 DSH。
 3. 检查只生成 performance-report.md、performance-report.json、diagnostics.sanitized.jsonl、collection-manifest.json。确认无真实口令、认证材料、聊天正文、个人路径或 IP；不要附加原始日志和 state.json/connection.json。若发现疑似敏感内容，先移除该敏感记录并重新生成报告与摘要，不把它复制进回复。
 4. 可另写一份简短的 test-notes.txt，仅含 DSH/插件版本、测试的大致本地时间与时区、网络是否通过代理、停轮后第一次续聊是否消失、慢响应的大约等待秒数。只使用已知信息，未知项注明未知；不包含用户名、服务器地址、会话标题或对话正文。
 5. 使用系统自带压缩功能，仅将上述新建输出目录里的文件打成 ZIP 放到桌面，保留目录便于复查。最终告诉我 ZIP 的位置、SHA-256、采集了多少轮、有多少轮具备首 token 分段和两端对比。不要上传网络或把原始文件内容贴进聊天。

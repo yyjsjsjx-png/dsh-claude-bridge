@@ -29,9 +29,9 @@ function selectionFor(ctx, agent) {
   const projection = ctx.sessionProjections.stateOf(agent.session, 'modelSelection')
   const selected = projection?.pending ?? agent.session.requestHeader()?.config ?? agent.options
   if (selected?.provider !== CLAUDE_PROVIDER || typeof selected.model !== 'string' || !selected.model) {
-    throw failure('ENGINE_SELECTION_REQUIRED', '请从新会话入口选择远程 Claude 模型。')
+    throw failure('ENGINE_SELECTION_REQUIRED', '请从新会话入口选择远程模型。')
   }
-  if (agent.session.header.agentPreset !== CLAUDE_PRESET) throw failure('PRESET_ENGINE_MISMATCH', '远程 Claude 必须使用专属预设。')
+  if (agent.session.header.agentPreset !== CLAUDE_PRESET) throw failure('PRESET_ENGINE_MISMATCH', '远程会话必须使用专属预设。')
   return selected
 }
 
@@ -512,7 +512,7 @@ export class BridgeBackend {
   }
 
   async recover(agent, confirm, signal) {
-    if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { kind: 'error', text: '此命令只用于远程 Claude 会话。' }
+    if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { kind: 'error', text: '此命令只用于远程会话。' }
     if (agent.phase?.kind !== 'idle' || typeof agent.runMaintenance !== 'function') {
       return { kind: 'error', text: '请先等待当前运行结束。' }
     }
@@ -534,7 +534,7 @@ export class BridgeBackend {
 
   async compact(agent, commandSignal) {
     try {
-      if (agent.session.header.agentPreset !== CLAUDE_PRESET) throw failure('PRESET_ENGINE_MISMATCH', '此命令只用于远程 Claude 会话。')
+      if (agent.session.header.agentPreset !== CLAUDE_PRESET) throw failure('PRESET_ENGINE_MISMATCH', '此命令只用于远程会话。')
       if (agent.phase?.kind !== 'idle' || typeof agent.runMaintenance !== 'function') {
         throw failure('BRIDGE_BUSY', '请等待当前运行结束后再压缩。')
       }
@@ -781,7 +781,7 @@ export class BridgeBackend {
       await transport.peer.drainNotifications?.()
       await run.toolQueue
       signal.throwIfAborted()
-      if (result.status !== 'completed') throw failure(result.code ?? 'SDK_QUERY_FAILED', result.message ?? '远程 Claude 运行未完成。')
+      if (result.status !== 'completed') throw failure(result.code ?? 'SDK_QUERY_FAILED', result.message ?? '远程会话运行未完成。')
       await this.state.markStarted(agent.id)
       signal.throwIfAborted()
       if (injectNotice) await this.state.markRecoveryNotice(agent.id, notice.key)

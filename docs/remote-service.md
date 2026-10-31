@@ -1,14 +1,14 @@
 # 远程服务部署
 
-本项目支持**个人账号、多设备自用**：各客户端运行 DSH 和插件，共用自己的服务地址与桥接口令；Linux 服务器的独立非 root 用户运行固定版本的 Claude Code 与 Agent SDK。桥接服务只绑定回环地址，可由受信任 TLS 反向代理提供公网 WSS，或使用 SSH 加密转发。
+本项目面向**账号所有者本人自用**：你本人的设备运行 DSH 和插件，连接你自己部署的服务；Linux 服务器的独立非 root 用户运行固定版本的 Claude Code 与 Agent SDK。桥接服务只绑定回环地址，可由受信任 TLS 反向代理提供公网 WSS，或使用 SSH 加密转发。
 
-此说明供账号所有者部署自己的 VPS 和 Claude 账号使用，不提供维护者的账号、公共服务或测试口令。先完成本页，再按 [首次使用指南](getting-started.md) 安装客户端。示例中的用户、目录及 `bridge.example.invalid` 都是占位符，必须换成自己的值；`.invalid` 不能申请公网证书。
+此说明供账号所有者部署自己的 VPS 和 Claude 账号使用，不提供任何账号、公共服务或口令。使用边界见 README 的 [使用边界与合规](../README.md#使用边界与合规)。先完成本页，再按 [首次使用指南](getting-started.md) 安装客户端。示例中的用户、目录及 `bridge.example.invalid` 都是占位符，必须换成自己的值；`.invalid` 不能申请公网证书。
 
-## 已验证的版本范围
+## 版本要求与实测基线
 
 | 组件 | 本项目要求或实测基线 |
 | --- | --- |
-| 客户端插件 | `v0.1.7` |
+| 客户端插件 | `v0.2.0` |
 | DSH Desktop | 实测 `0.2.1-rc.5`，其他版本按接口能力检查，仍需实际确认 |
 | 服务器 Node.js | `>=24.9`，须准备可独立执行的 Node 和 npm |
 | Claude Agent SDK | 锁定 `0.3.314` |
@@ -20,10 +20,10 @@
 
 由服务器管理员先准备独立非 root 用户，例如 `bridge`，以及供账号所有者完成官方交互登录的服务器桌面环境。不要复用其他 Claude、网关或日常服务的账号目录。以下下载、依赖安装、生成口令和登录操作均以该服务用户执行；systemd 安装命令才使用管理员权限。
 
-从 [v0.1.7 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.1.7) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
+从 [v0.2.0 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.0) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
 
 ```sh
-git clone --branch v0.1.7 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
+git clone --branch v0.2.0 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
 cd /home/bridge/dsh-claude-bridge
 chmod 700 /home/bridge/dsh-claude-bridge
 ```
@@ -69,7 +69,7 @@ curl -fsSL https://claude.ai/install.sh | bash -s 2.1.314
 "$HOME/.local/share/claude/versions/2.1.314" --version
 ```
 
-本项目默认直接使用上述带版本的二进制路径，不使用可能指向新版的 `claude` 快捷入口；如果实际安装路径不同，在服务中设置 `BRIDGE_CLAUDE_PATH`。先确认输出以 `2.1.314` 开头。固定版本无法取得时停止部署并明确记录缺口，不把其他版本当作已验证版本。
+本项目默认直接使用上述带版本的二进制路径，不使用可能指向新版的 `claude` 快捷入口；如果实际安装路径不同，在服务中设置 `BRIDGE_CLAUDE_PATH`。先确认输出以 `2.1.314` 开头。固定版本无法取得时停止部署并明确记录缺口，不把其他版本当作实测版本。
 
 在部署根目录、仍以服务用户创建独立私有目录：
 
@@ -87,7 +87,7 @@ cd /home/bridge/dsh-claude-bridge
 CLAUDE_CONFIG_DIR="$PWD/claude-config" DISABLE_AUTOUPDATER=1 "$HOME/.local/share/claude/versions/2.1.314"
 ```
 
-只完成登录即可退出，不必发送聊天请求。使用自己具备 Claude Code 使用权限的 `claude.ai` 账号；本桥接当前拒绝其他认证方式，不将 API key、Console、云厂商或其他网关配置视为等价登录。官方流程见 [认证说明](https://code.claude.com/docs/en/authentication)。不要把授权 URL、登录令牌、认证文件或账号信息发给维护者，也不将它们复制到客户端。
+只完成登录即可退出，不必发送聊天请求。使用你本人、具备 Claude Code 使用权限的 claude.ai 订阅账号登录。当前版本只接受这一种登录方式；API Key、Console、云服务商或网关登录暂未开放（维护者尚无测试环境，已列入后续计划），检测到这些方式时服务会以 `AUTH_METHOD_UNSUPPORTED` 明确报错，不会尝试使用。官方流程见 [认证说明](https://code.claude.com/docs/en/authentication)。不要把授权 URL、登录令牌、认证文件或账号信息发给任何人，也不要复制到客户端。
 
 服务会将 worker 的 `CLAUDE_CONFIG_DIR` 固定为 `<BRIDGE_REMOTE_ROOT>/claude-config`，必须与本次登录一致；仅在另一个默认 `.claude` 目录登录不会登录此服务。凭据、配置、会话由服务用户持有，私有目录 `700`、私有文件 `600`。
 
@@ -116,7 +116,7 @@ stat -c '%U %a %n' private/service-token
 
 worker 仅接收必要的白名单配置，不继承桥接口令；CLI/SDK 版本不匹配会拒绝启动。每台设备独立 worker，会话绑定校验设备、工作区、系统提示摘要和原生 session ID。
 
-v0.1.4 及更早版本曾默认设置每轮 0.15 美元上限，这是开发阶段遗留配置，可能在已输出正文后仍以 `BUDGET_EXHAUSTED` 结束。v0.1.5 默认不再向 SDK 传入 `maxBudgetUsd`。升级时等待活动任务结束，更新远端源码后重启自己的 systemd 服务；保留 `sessions`、`claude-config`、`private` 和已有运行依赖。若单元或环境文件曾明确配置 `BRIDGE_MAX_BUDGET_USD`，须同时移除该配置才会停用它。仅更新 DSH 插件不能修复仍运行旧代码的服务器。
+v0.1.4 及更早的服务器代码曾默认设置每轮 0.15 美元上限，这是开发阶段遗留配置，可能在已输出正文后仍以 `BUDGET_EXHAUSTED` 结束。从 v0.1.5 起默认不再向 SDK 传入 `maxBudgetUsd`。升级时等待活动任务结束，更新远端源码后重启自己的 systemd 服务；保留 `sessions`、`claude-config`、`private` 和已有运行依赖。若单元或环境文件曾明确配置 `BRIDGE_MAX_BUDGET_USD`，须同时移除该配置才会停用它。仅更新 DSH 插件不能修复仍运行旧代码的服务器。
 
 命令行入口 `remote/server.mjs` 不提供 host 参数，也不读取 `BRIDGE_HOST`，始终监听 `127.0.0.1`。不要将修改该环境变量当成开放公网的方式。上表列出的配置通过 systemd 的 `Environment=` 设置；默认 CLI 路径不同时，额外增加 `Environment=BRIDGE_CLAUDE_PATH=/自己的绝对路径/2.1.314`。
 
@@ -154,7 +154,7 @@ ss -lnt 'sport = :18944'
 
 ## 客户端连接
 
-有公网 WSS 时，客户端只需在 DSH“远程 Claude”页填写地址和独立桥接口令，保存后测试连接；不需要在客户端运行 SSH。
+有公网 WSS 时，客户端只需在 DSH“设置 → 远程会话”页填写地址和独立桥接口令，保存后测试连接；不需要在客户端运行 SSH。
 
 例如域名已经指向服务器、Caddy 管理可信证书时，独立站点可转发到回环桥接：
 
@@ -164,7 +164,7 @@ bridge.example.invalid {
 }
 ```
 
-将占位域名换为自己已经配置 DNS 和可信 TLS 证书的域名，客户端填写 `wss://自己的域名/`；不要关闭客户端证书校验来掩盖域名或证书错误。反向代理须支持 WebSocket Upgrade。将新站点加入现有代理前应备份并校验配置，再平滑重载；临时测试入口使用独立后端、独立口令和明确的到期停用机制。桥接后端本身仍保持回环监听，不在防火墙或云安全组直接开放 `18944`。
+将占位域名换为自己已经配置 DNS 和可信 TLS 证书的域名，客户端填写 `wss://自己的域名/`；不要关闭客户端证书校验来掩盖域名或证书错误。反向代理须支持 WebSocket Upgrade。将新站点加入现有代理前应备份并校验配置，再平滑重载。桥接后端本身仍保持回环监听，不在防火墙或云安全组直接开放 `18944`。
 
 没有公网 WSS 时，可选 SSH 转发：
 
@@ -173,15 +173,15 @@ ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCo
   -L 127.0.0.1:18944:127.0.0.1:18944 bridge@bridge.example.invalid
 ```
 
-在 DSH 的“远程 Claude”页保存 `ws://127.0.0.1:18944/` 和独立桥接口令，再测试连接。本地地址只在转发已经建立的那台机器有效。客户端拒绝公网明文 `ws` 和 URL 中嵌入的口令。
+在 DSH 的“设置 → 远程会话”页保存 `ws://127.0.0.1:18944/` 和独立桥接口令，再测试连接。本地地址只在转发已经建立的那台机器有效。客户端拒绝公网明文 `ws` 和 URL 中嵌入的口令。
 
-私人连接包可复用 `scripts/connect-ssh.ps1`、`scripts/connect-ssh.sh`，包内放独立私钥、通过可信管理通道核实的 `known_hosts`，以及 `ssh.json`：
+也可以用 `scripts/connect-ssh.ps1` / `scripts/connect-ssh.sh` 自动保持转发；在本机私有目录放置自己的私钥、已核实的 `known_hosts` 和 `ssh.json`：
 
 ```json
-{"host":"bridge.example.invalid","port":22,"user":"bridge-test","localPort":18944,"remotePort":18944}
+{"host":"bridge.example.invalid","port":22,"user":"bridge","localPort":18944,"remotePort":18944}
 ```
 
-Windows 脚本按当前用户限制私钥权限，保持转发并退避重连。Linux/macOS 使用 `sh connect-ssh.sh HOST USER SSH_PORT LOCAL_PORT REMOTE_PORT`。SSH 账号可配置为仅本地转发、固定 `PermitOpen`、禁止终端，并给测试公钥设置到期时间。服务器地址、公钥固定文件、密钥和口令不随公开安装包分发。
+Windows 脚本按当前用户限制私钥权限，保持转发并退避重连。Linux/macOS 使用 `sh connect-ssh.sh HOST USER SSH_PORT LOCAL_PORT REMOTE_PORT`。SSH 账号可配置为仅本地转发、固定 `PermitOpen`、禁止终端。服务器地址、公钥固定文件、密钥和口令只保存在你自己的设备上，不随公开安装包分发。
 
 开发启动器的 `--ssh-target` 管理自己启动的转发，退出后自动重建；端口被占用会明确报错，不终止其他进程。
 
@@ -215,13 +215,13 @@ Windows 脚本按当前用户限制私钥权限，保持转发并退避重连。
 
 DSH 会话和受保护的本机连接设置、服务器 `claude-config`、`sessions`、`private`、备份及诊断均不属于公开源码。rc.5 本机凭据采用用户受保护文件，不能等同于操作系统加密保险库。
 
-桥接口令是共享服务访问凭据，device ID 只是会话命名空间。本版本面向账号所有者自己的设备，不把它当作多人租户隔离服务。临时测试凭据应独立生成、限制用途和有效期；撤销时移除对应 SSH 公钥并停用该测试入口。
+桥接口令等同于你 Claude 订阅的使用权，只供账号所有者本人的设备使用，不得交给他人。device ID 只是会话命名空间，不是授权边界；本项目不提供多人隔离。怀疑口令泄露时，在服务端更换口令并重启服务。
 
-客户端“清除已保存连接”只删除该客户端的地址和桥接口令，并关闭其连接；不会退出服务器 Claude，也不会使其他设备持有的同一口令失效。需要全局撤销时，在服务端更换桥接口令并重启相应服务。
+客户端“清除已保存连接”只删除该客户端的地址和桥接口令，并关闭其连接；不会退出服务器 Claude，也不会使你其他设备上保存的同一口令失效。需要全局撤销时，在服务端更换桥接口令并重启相应服务。
 
 不同 device ID 使用独立 worker，不同 SDK session 可并发；相同 SDK session 由运行门禁和跨 worker 文件锁保护。多个窗口连接同一 Host 时共用连接；复制完整 DSH_HOME 后运行两个 Host 会因相同 device ID 冲突。所有任务仍共享账号和机器资源，未实现账号级公平排队；默认 16 个连接槽位包含断线保留项，不等于订阅允许的模型并发数。
 
-公网 WSS 由反向代理终止 TLS，认证仍由桥接服务在 WebSocket 内完成。地址中不包含口令，公开源码不保存实际测试入口或凭据。
+公网 WSS 由反向代理终止 TLS，认证仍由桥接服务在 WebSocket 内完成。地址中不包含口令；公开源码和安装包不包含任何服务器地址或凭据。
 
 云端从 v0.1.2 开始把白名单诊断写入 `sessions/_diagnostics/<device-id>/bridge.jsonl`，断线时仍保留。每个设备最多当前与上一份日志，各 2 MiB。双端采集、合并报告及时间字段解释见 [性能诊断](performance.md)。更新远端源码后需在请求空闲时重启相应服务；仅更新客户端不会给旧服务器增加日志能力。
 

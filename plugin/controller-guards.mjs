@@ -60,7 +60,7 @@ async function existingPreset(ctx, RemoteError, sessionId) {
 async function restoreRemoteBlank(controller, ctx, RemoteError, input) {
   const sessionId = input.sessionId;
   if (sessionId === undefined) {
-    throw remoteFailure(RemoteError, 'session/model-unavailable', '创建远程 Claude 会话前必须选择模型。');
+    throw remoteFailure(RemoteError, 'session/model-unavailable', '创建远程会话前必须选择模型。');
   }
   if (input.workspaceId !== undefined && input.cwd !== undefined) {
     throw remoteFailure(RemoteError, 'gateway/bad-request', '工作区和目录不能同时指定。');
@@ -75,7 +75,7 @@ async function restoreRemoteBlank(controller, ctx, RemoteError, input) {
   }
   const agent = await attachedAgent(controller, sessionId);
   if (presetForAgent(ctx, RemoteError, agent) !== CLAUDE_PRESET) {
-    throw remoteFailure(RemoteError, 'agent-preset/locked', '原会话不是远程 Claude 会话。', { sessionId });
+    throw remoteFailure(RemoteError, 'agent-preset/locked', '原会话不是远程会话。', { sessionId });
   }
   const cwd = workspace?.path ?? input.cwd;
   if (cwd !== undefined && agent.session.header.cwd !== cwd) {
@@ -135,7 +135,7 @@ export function makeGuardedSessionController(Base, RemoteError) {
         // Older bridge versions saved remote selections as DSH's global default.
         // Refuse before minting a standard Session with a remote model.
         throw remoteFailure(RemoteError, 'session/model-unavailable',
-          '当前默认模型为远程 Claude，请通过“新建远程 Claude”创建会话；普通 DSH 会话请选择普通模型。');
+          '当前默认模型为远程会话，请通过“新建远程会话”创建会话；普通 DSH 会话请选择普通模型。');
       }
 
       // The rc.5 upstream can recompose an existing *cold* blank session in
@@ -196,7 +196,7 @@ export function makeGuardedSessionController(Base, RemoteError) {
       const agent = await attachedAgent(this, request.sessionId);
       if (presetForAgent(this.bridgeContext, RemoteError, agent) === CLAUDE_PRESET) {
         throw remoteFailure(RemoteError, 'session/fork-unavailable',
-          '远程 Claude 会话不支持分叉，请新建会话。', { sessionId: request.sessionId });
+          '远程会话不支持分叉，请新建会话。', { sessionId: request.sessionId });
       }
       return super.fork(request);
     }
@@ -230,7 +230,7 @@ export function installControllerGuards(ctx, RemoteError) {
       let owner = target, descriptor;
       while (owner && !(descriptor = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
       if (typeof descriptor?.value !== 'function') {
-        throw new Error(`远程 Claude 插件无法加载：DSH ${name}() 接口不兼容。`);
+        throw new Error(`远程会话插件无法加载：DSH ${name}() 接口不兼容。`);
       }
       Object.defineProperty(Delegate.prototype, name, { value: descriptor.value });
     }

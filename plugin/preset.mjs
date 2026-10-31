@@ -5,11 +5,11 @@ export const REMOTE_PRESET_LIMITATIONS = Object.freeze([
   Object.freeze({ name: '计划模式', status: 'disabled', reason: '暂不提供计划模式。' }),
   Object.freeze({ name: 'subagent_fork', status: 'disabled', reason: '不支持分叉子任务。' }),
   Object.freeze({ name: '子任务独立选型', status: 'disabled', reason: '子任务默认沿用父会话模型。' }),
-  Object.freeze({ name: 'DSH 原生压缩', status: 'disabled', reason: '远程 Claude SDK 负责自身会话的上下文和压缩。' }),
+  Object.freeze({ name: 'DSH 原生压缩', status: 'disabled', reason: '远程 Agent SDK 负责自身会话的上下文和压缩。' }),
   Object.freeze({ name: '会话分叉', status: 'disabled', reason: '请通过新建会话开始其他任务。' }),
 ]);
 export const REMOTE_PRESET_CONVERSIONS = Object.freeze([
-  Object.freeze({ name: '/compact', status: 'converted', reason: '由远程 Claude 压缩上下文，保留对话历史。' }),
+  Object.freeze({ name: '/compact', status: 'converted', reason: '由远程 Agent SDK 压缩上下文，保留对话历史。' }),
   Object.freeze({ name: '身份提示', status: 'converted', reason: '云端会话使用固定的 Claude 身份提示。' }),
   Object.freeze({ name: 'Workflow 深度限制', status: 'converted', reason: '沿用 DSH 子任务深度上限。' }),
 ]);
@@ -77,8 +77,8 @@ export function createRemoteClaudePreset(standard) {
 
   return {
     id: CLAUDE_PRESET,
-    name: '远程 Claude',
-    description: '请通过“新建远程 Claude”创建会话。',
+    name: '远程会话',
+    description: '请通过“新建远程会话”创建会话。',
     order: 5,
     plugins,
   };
