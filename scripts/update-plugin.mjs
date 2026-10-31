@@ -62,7 +62,7 @@ export async function updatePlugin({ resources, home, profile = 'desktop', packa
     }
     const history = await repairBridgeHistories({ home, backup, require })
     const result = await operations.runProfilePnpm({ profile, home: resolve(home), dir: directory,
-      installAnchor: anchor, cwd: source }, ['add', '--offline', '--ignore-scripts', `link:${source}`], {
+      installAnchor: anchor, cwd: source }, ['add', '--offline', '--ignore-scripts', `${packageName}@link:${source}`], {
       command: process.execPath, args: ['--expose-internals', pnpm],
       execution: 'service', outputBytes: 16_384, lockWaitMs: 5_000, lookupTimeoutMs: 5_000,
       idleTimeoutMs: 120_000,

@@ -52,6 +52,8 @@ export class BridgeBackend {
     this.connection = undefined
     this.connecting = undefined
     this.connectionRevision = 0
+    this.historyGeneration = 0
+    this.verifiedHistory = new WeakMap()
     this.connectionAbort = new AbortController()
     this.connectionUsers = 0
     this.connectionChanging = false
@@ -83,6 +85,7 @@ export class BridgeBackend {
     }
     this.connectionChanging = true
     this.connectionRevision++
+    this.historyGeneration++
     this.connectionAbort.abort()
     this.connectionAbort = new AbortController()
     const transport = this.connection
@@ -167,10 +170,12 @@ export class BridgeBackend {
     if (this.connectionChanging) throw failure('BRIDGE_BUSY', '连接设置正在更改，请稍后重试。')
     if (this.connection) return this.connection
     if (this.connecting) return this.connecting
+    this.historyGeneration++
     const revision = this.connectionRevision
     const connectionSignal = this.connectionAbort.signal
     const pending = (async () => {
       await this.state.ready
+      let transport
       const options = {
         signal: AbortSignal.any([signal, this.lifetime.signal, connectionSignal].filter(Boolean)),
         handlers: {
@@ -180,10 +185,14 @@ export class BridgeBackend {
         },
         onNotification: (method, params) => this.notification(method, params),
         onClose: () => {
-          if (revision === this.connectionRevision) { this.connection = undefined; this.planUsageCache = undefined }
+          if (revision === this.connectionRevision && (!this.connection || this.connection === transport)) {
+            this.historyGeneration++
+            this.connection = undefined; this.planUsageCache = undefined
+          }
         },
         onConnectionState: connection => {
-          if (revision !== this.connectionRevision) return
+          if (revision !== this.connectionRevision || (this.connection && this.connection !== transport)) return
+          if (connection !== 'connected') this.historyGeneration++
           for (const run of this.runs.values()) {
             try { this.sessionStatus(run.agent, { connection }) }
             catch { this.diagnostics.event('run.connection_status_failed', { runId: run.runId, code: 'STATUS_FAILED' }) }
@@ -192,7 +201,6 @@ export class BridgeBackend {
         },
         onDiagnostic: ({ event, ...fields }) => this.diagnostics.event(event, fields),
       }
-      let transport
       if (this.createTransport) transport = await this.createTransport(options)
       else if (this.config.transport === 'ssh') {
         if (!this.config.remoteWorkerPath || !this.config.remoteNodePath) {
@@ -320,8 +328,14 @@ export class BridgeBackend {
       run.firstModelEvent = true
       run.timing('first_model_event')
     }
+    const before = run.agent.session.seq
     await run.projection.accept(params.message)
-    await this.checkpoint(run.agent.session)
+    const after = run.agent.session.seq
+    // Live deltas only update the renderer. Flush each new durable record,
+    // and conservatively retain the old behavior without a monotonic counter.
+    if (!Number.isSafeInteger(before) || before < 0 || !Number.isSafeInteger(after) || after < 0 || after !== before) {
+      await this.checkpoint(run.agent.session)
+    }
   }
 
   async checkpoint(session) {
@@ -338,13 +352,27 @@ export class BridgeBackend {
     if (!withinRun && agent.phase?.kind !== 'idle') return { status: 'active' }
     const operation = async maintenanceSignal => {
       const combined = AbortSignal.any([signal, maintenanceSignal].filter(Boolean))
+      combined.throwIfAborted()
+      const pending = await this.state.recoveryStatus(agent.id)
+      const verified = this.verifiedHistory.get(agent.session)
+      if (withinRun && verified && verified.transport === this.connection && verified.generation === this.historyGeneration
+        && this.connection?.connected !== false && !pending.some(run => !run.reconciledAt)) {
+        return { status: 'ready', added: 0, unresolvedTools: pending.reduce((sum, run) => sum
+          + Object.values(run.tools).filter(tool => ['dispatched', 'unknown'].includes(tool.status)).length, 0) }
+      }
+      this.verifiedHistory.delete(agent.session)
       const binding = await this.state.binding(agent.id, agent.session.header.cwd)
       if (!binding.started && !Object.keys(binding.runs ?? {}).length) return { status: 'empty' }
-      const pending = await this.state.recoveryStatus(agent.id)
+      const previous = agent._bridgeStatus ?? this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
+      // Reconciled unknown tools remain in the journal for later verification.
+      // They must not turn a newer successful run back into an interrupted one.
+      const interrupted = pending.some(run => !run.reconciledAt || run.runId === previous?.runId)
+        || ['running', 'stopping', 'unknown'].includes(previous?.phase)
       this.sessionStatus(agent, { recovery: { status: 'syncing', added: 0, unresolvedTools: 0,
-        interrupted: pending.length > 0, updatedAt: Date.now() } })
+        interrupted, updatedAt: Date.now() } })
       try {
         const transport = await this.connect({ signal: combined })
+        const generation = this.historyGeneration
         combined.throwIfAborted()
         if (this.initialized?.capabilities?.historySync !== true) {
           throw failure('HISTORY_UNAVAILABLE', '服务器尚未提供云端记录同步。')
@@ -452,18 +480,19 @@ export class BridgeBackend {
         await this.checkpoint(agent.session)
         await this.state.reconcileRecovery(agent.id, updates, { ...cursor, replay, projectionVersion: 3 })
         await this.state.markStarted(agent.id)
-        const previous = agent._bridgeStatus ?? this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
-        const interrupted = pending.length > 0 || ['running', 'stopping', 'unknown'].includes(previous?.phase)
         this.sessionStatus(agent, { ...(interrupted ? { phase: 'stopped', context: { status: 'unknown' } } : {}),
-          toolMayHaveExecuted: unresolvedTools > 0, recovery: { status: 'ready', added, unresolvedTools,
+          toolMayHaveExecuted: interrupted && unresolvedTools > 0, recovery: { status: 'ready', added, unresolvedTools,
             interrupted, updatedAt: Date.now() } })
         await this.checkpoint(agent.session)
+        if (transport === this.connection && generation === this.historyGeneration) {
+          this.verifiedHistory.set(agent.session, { transport, generation })
+        }
         this.diagnostics.event('history.synced', { sessionId: agent.id, status: 'ready' })
         return { status: 'ready', added, unresolvedTools }
       } catch (error) {
         this.sessionStatus(agent, { recovery: { status: 'unavailable', added: 0, unresolvedTools: 0,
           code: typeof error.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'HISTORY_READ_FAILED',
-          interrupted: pending.length > 0, updatedAt: Date.now() } })
+          interrupted, updatedAt: Date.now() } })
         this.diagnostics.event('history.failed', { sessionId: agent.id, code: error.code ?? 'HISTORY_READ_FAILED' })
         throw error
       }
@@ -524,6 +553,7 @@ export class BridgeBackend {
         }
         const runId = randomUUID()
         await this.state.beginRun(agent.id, runId, 'compact')
+        this.verifiedHistory.delete(agent.session)
         const run = { runId, kind: 'compact', agent, signal, queryAbort: new AbortController(), toolQueue: Promise.resolve() }
         this.runs.set(runId, run)
         this.sessionStatus(agent, { model: selected.model, runId, phase: 'compacting', connection: 'connected', toolMayHaveExecuted: false })
@@ -599,22 +629,23 @@ export class BridgeBackend {
     const changedModel = patch.model !== undefined && patch.model !== previous.model
     const next = { ...previous, ...(changedModel ? { context: { status: 'unknown' }, compatibility: null } : {}),
       ...patch, updatedAt: Date.now() }
+    if (patch.runId !== undefined && ['running', 'compacting'].includes(patch.phase)) delete next.recovery
     this.helpers.appendPluginRecord(agent.session, SESSION_STATUS_RECORD, next)
     agent._bridgeStatus = next
     return next
   }
 
-  async convertTools(assembly, selected) {
+  async convertTools(assembly, selected, catalogModels) {
     let image = { supported: undefined, source: 'unknown', reason: '本次工具集合没有读图工具。' }
     if (assembly.tools.some(tool => tool.name === 'read_image')) {
-      const models = (await this.catalog()).models
-      image = imageCapability(models.find(model => model.value === selected.model))
+      catalogModels ??= (await this.catalog()).models
+      image = imageCapability(catalogModels.find(model => model.value === selected.model))
     }
     const converted = toMcpToolDefinitions(assembly.tools.filter(tool => tool.name !== 'read_image' || image.supported === true))
     if (assembly.tools.some(tool => tool.name === 'read_image') && image.supported !== true) {
       converted.compatibility.push({ name: 'read_image', status: 'disabled', reason: image.reason })
     }
-    return converted
+    return { ...converted, catalogModels }
   }
 
   async runStep(agent, decision) {
@@ -650,6 +681,7 @@ export class BridgeBackend {
     }
     timing('history_checked')
     const converted = await this.convertTools(decision.assembly, selected)
+    timing('tools_converted')
     this.compatibility = converted.compatibility
     const refreshed = this.ctx.systemPrompt.refreshContext(decision.assembly, this.helpers.assembleContextFor(agent, signal))
     const sections = this.helpers.renderContextSections(refreshed)
@@ -675,7 +707,10 @@ export class BridgeBackend {
     if (injectNotice) prompt = [{ type: 'text', text: notice.text }, ...prompt]
     signal.throwIfAborted()
     const systemPrompt = this.helpers.renderPrompt(decision.assembly)
+    timing('prompt_prepared')
     await this.state.beginRun(agent.id, runId, 'query', { turn, step })
+    this.verifiedHistory.delete(agent.session)
+    timing('journal_prepared')
     const header = { config: { provider: selected.provider, model: selected.model,
       ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
     tools: decision.assembly.tools }
@@ -685,7 +720,8 @@ export class BridgeBackend {
     }
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
     const run = { runId, agent, turn, step, signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
-      systemPrompt, toolSignature: JSON.stringify(converted.tools),
+      systemPrompt, toolSignature: JSON.stringify(converted.tools), catalogModels: converted.catalogModels,
+      historyGeneration: this.historyGeneration,
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
     run.projection = new SdkProjection({ agent, helpers: this.helpers, turn, step, model: selected.model,
       onStarted: () => this.state.markStarted(agent.id),
@@ -729,6 +765,7 @@ export class BridgeBackend {
     try {
       await this.checkpoint(agent.session)
       signal.throwIfAborted()
+      timing('checkpointed')
       await this.state.markRunSent(agent.id, runId)
       signal.throwIfAborted()
       run.requestStarted = true
@@ -753,6 +790,7 @@ export class BridgeBackend {
       run.journalStatus = 'completed'
       this.diagnostics.event('run.completed', { runId, sessionId: agent.id, durationMs: Date.now() - startedAt })
       timing('completed')
+      run.completed = true
       return { kind: 'completed' }
     } catch (error) {
       if (run.preparationError && !signal.aborted) error = run.preparationError
@@ -798,6 +836,10 @@ export class BridgeBackend {
       await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'),
         Boolean(run.toolOutcomeUnknown || run.journalError))
       await this.diagnostics.flush()
+      if (run.completed && !signal.aborted && !run.toolOutcomeUnknown && !run.journalError
+        && transport === this.connection && run.historyGeneration === this.historyGeneration) {
+        this.verifiedHistory.set(agent.session, { transport, generation: this.historyGeneration })
+      }
     }
   }
 
@@ -821,7 +863,7 @@ export class BridgeBackend {
       decision = await agent.preStep('next-step', { turn, step: run.step + 1 })
       signal.throwIfAborted()
       if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
-      const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent))
+      const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent), run.catalogModels)
       if (this.helpers.renderPrompt(decision.assembly) !== run.systemPrompt
         || JSON.stringify(tools.tools) !== run.toolSignature) {
         throw failure('QUERY_CONFIGURATION_CHANGED', '运行期间 DSH 提示词或工具集合发生变化；本次已停止，请新建会话应用新配置。')

@@ -45,13 +45,37 @@ $BridgePreviousElectron = $env:ELECTRON_RUN_AS_NODE
 try {
     $env:ELECTRON_RUN_AS_NODE = '1'
     Write-Host '正在使用 DSH 自带包管理器原地更新，请稍候。'
-    $BridgeProcess = Start-Process -FilePath $BridgeExecutable -ArgumentList $BridgeCommandLine `
-        -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput ($BridgeLogPrefix + '.out') `
-        -RedirectStandardError ($BridgeLogPrefix + '.err')
+    try {
+        $BridgeProcess = Start-Process -FilePath $BridgeExecutable -ArgumentList $BridgeCommandLine `
+            -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput ($BridgeLogPrefix + '.out') `
+            -RedirectStandardError ($BridgeLogPrefix + '.err')
+    } catch {
+        $BridgeLaunchError = $_.Exception
+        for ($BridgeDepth = 0; $null -ne $BridgeLaunchError -and $BridgeDepth -lt 16; $BridgeDepth++) {
+            if ($BridgeLaunchError -is [ComponentModel.Win32Exception] -and $BridgeLaunchError.NativeErrorCode -eq 740) {
+                $BridgeElevationMessage = 'Windows 要求提升权限，本次更新尚未启动。请完全退出 DSH，以管理员身份打开 PowerShell 后重跑同一条更新命令。'
+                $BridgeElevationException = New-Object InvalidOperationException($BridgeElevationMessage, $BridgeLaunchError)
+                $BridgeElevationRecord = New-Object Management.Automation.ErrorRecord($BridgeElevationException,
+                    'BRIDGE_UPDATE_ELEVATION_REQUIRED', [Management.Automation.ErrorCategory]::PermissionDenied, $BridgeExecutable)
+                $PSCmdlet.ThrowTerminatingError($BridgeElevationRecord)
+            }
+            $BridgeLaunchError = $BridgeLaunchError.InnerException
+        }
+        throw
+    }
     $BridgeProcess.WaitForExit()
     $BridgeProcess.Refresh()
     if ($null -eq $BridgeProcess.ExitCode -or $BridgeProcess.ExitCode -ne 0) {
-        throw ('更新未完成，请保留以下日志查看原因：' + $BridgeLogPrefix + '.err')
+        $BridgeFailureSummary = ''
+        try {
+            if (Test-Path -LiteralPath ($BridgeLogPrefix + '.err') -PathType Leaf) {
+                $BridgeFailureSummary = (Get-Content -LiteralPath ($BridgeLogPrefix + '.err') -Raw -Encoding UTF8).Trim()
+            }
+        } catch { # Failure to read a summary must not hide the original update failure.
+        }
+        if (-not $BridgeFailureSummary) { $BridgeFailureSummary = '更新未完成，未取得详细错误摘要。' }
+        throw ($BridgeFailureSummary + [Environment]::NewLine + '更新器错误日志：' + $BridgeLogPrefix + '.err' +
+            [Environment]::NewLine + '更新器输出日志：' + $BridgeLogPrefix + '.out')
     }
     $BridgeResult = Get-Content -LiteralPath ($BridgeLogPrefix + '.out') -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $BridgeResult.updated) { throw '更新结果未确认，请检查更新日志。' }

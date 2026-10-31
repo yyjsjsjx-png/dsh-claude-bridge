@@ -717,15 +717,28 @@ test('未知工具仅用匹配的云端回执核实，未核实说明随下一�
       runs: { 'interrupted-run': { status: 'failed', tools: verified ? { 'old-call': {
         name: 'local_command', argumentsSha256: createHash('sha256').update(binding.argumentsText).digest('hex') } } : {} } },
       nextOffset: 1, lastUuid: 'cloud-result', done: true }
-    assert.equal(method, 'query'); captured = params; return { status: 'completed' }
+    assert.equal(method, 'query'); captured = params; return { status: 'completed', metrics: {
+      context: { source: 'sdk-summary-approximate', totalTokens: 123, maxTokens: 1000 } } }
   } }, async close() {} }), async () => { executed++; return { content: [] } })
   binding = await interruptedTool(f)
   assert.equal((await f.backend.syncSession(f.agent)).unresolvedTools, 1)
+  assert.equal(f.agent._bridgeStatus.phase, 'stopped')
+  assert.equal(f.agent._bridgeStatus.recovery.interrupted, true)
   f.agent.phase = { kind: 'running', turn: 2, step: 1, abort: new AbortController() }
   await f.backend.runStep(f.agent, f.decision)
   assert.equal(captured.sessionId, binding.sdkSessionId); assert.equal(captured.resume, true)
   assert.match(captured.prompt[0].text, /只读检查核实/)
   assert.equal(executed, 0)
+  assert.equal(f.agent._bridgeStatus.phase, 'completed')
+  assert.equal(f.agent._bridgeStatus.context.totalTokens, 123)
+  assert.equal(Object.hasOwn(f.agent._bridgeStatus, 'recovery'), false)
+  f.agent.phase = { kind: 'idle' }
+  assert.equal((await f.backend.syncSession(f.agent)).unresolvedTools, 1)
+  assert.equal(f.agent._bridgeStatus.phase, 'completed')
+  assert.equal(f.agent._bridgeStatus.context.totalTokens, 123)
+  assert.equal(f.agent._bridgeStatus.recovery.interrupted, false)
+  assert.equal(f.agent._bridgeStatus.toolMayHaveExecuted, false)
+  assert.equal((await f.backend.state.recoveryStatus(f.agent.id))[0].tools['old-call'].status, 'unknown')
   f.agent.phase = { kind: 'running', turn: 3, step: 1, abort: new AbortController() }
   await f.backend.runStep(f.agent, f.decision)
   assert.equal(captured.prompt.some(block => block.type === 'text' && block.text.includes('[桥接插件运行说明')), false)
@@ -851,4 +864,189 @@ test('增量片段缺失本地内容时完整重读一次，不用片段覆盖�
   assert.deepEqual(f.records.filter(event => event.type === HISTORY_ASSISTANT).at(-1).data.message.content,
     [reasoning, text, tool])
   assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor.replay.offset, 0)
+})
+
+async function historyFastPathFixture(t) {
+  const counters = { history: 0, query: 0 }
+  const connections = []
+  let beforeHistory, beforeQuery
+  const f = await fixture(t, async options => {
+    connections.push(options)
+    return { peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, capabilities: { historySync: true } }
+      if (method === 'history') {
+        counters.history++
+        const override = await beforeHistory?.(options)
+        if (override) return override
+        return { status: 'ok', sessionId: params.sessionId, records: [], runs: {},
+          nextOffset: 0, lastUuid: null, done: true }
+      }
+      if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false }
+      assert.equal(method, 'query'); counters.query++
+      await beforeQuery?.(options)
+      return { status: 'completed' }
+    }, async drainNotifications() {} }, async close() {} }
+  })
+  recoveryEvents(f)
+  let turn = 0
+  return Object.assign(f, { counters, connections,
+    historyAction(action) { beforeHistory = action }, queryAction(action) { beforeQuery = action },
+    nextRun() {
+      f.currentAbort = new AbortController()
+      f.agent.phase = { kind: 'running', turn: ++turn, step: 1, abort: f.currentAbort }
+      return f.backend.runStep(f.agent, f.decision)
+    },
+  })
+}
+
+test('可靠完成和显式同步可复用同连接历史证明，短断及新连接仍重新核对', async t => {
+  const f = await historyFastPathFixture(t)
+  await f.nextRun(); await f.nextRun()
+  assert.deepEqual(f.counters, { history: 0, query: 2 })
+  f.agent.phase = { kind: 'idle' }
+  await f.backend.syncSession(f.agent)
+  assert.equal(f.counters.history, 1)
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 1, query: 3 })
+  f.connections[0].onConnectionState('reconnecting')
+  f.connections[0].onConnectionState('connected')
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 2, query: 4 })
+  f.connections[0].onClose()
+  await f.nextRun()
+  assert.equal(f.connections.length, 2)
+  assert.deepEqual(f.counters, { history: 3, query: 5 })
+})
+
+test('正在进行的显式同步先于新轮完成，失败同步不留下可复用证明', async t => {
+  const f = await historyFastPathFixture(t)
+  await f.nextRun()
+  let release, entered
+  const started = new Promise(resolve => { entered = resolve })
+  f.historyAction(async () => { entered(); await new Promise(resolve => { release = resolve }) })
+  f.agent.phase = { kind: 'idle' }
+  const sync = f.backend.syncSession(f.agent)
+  await started
+  const next = f.nextRun()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.counters.query, 1)
+  release(); await sync; await next
+  assert.deepEqual(f.counters, { history: 1, query: 2 })
+  f.historyAction(() => { throw Object.assign(new Error('合成读取失败'), { code: 'FIXTURE_HISTORY_FAILED' }) })
+  f.agent.phase = { kind: 'idle' }
+  await assert.rejects(f.backend.syncSession(f.agent), { code: 'FIXTURE_HISTORY_FAILED' })
+  f.historyAction(undefined)
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 3, query: 3 })
+})
+
+test('同步或运行期间发生短断时，迟到成功不能标记新代次历史已经核对', async t => {
+  const f = await historyFastPathFixture(t)
+  await f.nextRun()
+  f.historyAction(options => {
+    options.onConnectionState('reconnecting'); options.onConnectionState('connected')
+  })
+  f.agent.phase = { kind: 'idle' }
+  await f.backend.syncSession(f.agent)
+  f.historyAction(undefined)
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 2, query: 2 })
+  f.queryAction(options => {
+    options.onConnectionState('reconnecting'); options.onConnectionState('connected')
+  })
+  await f.nextRun()
+  f.queryAction(undefined)
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 3, query: 4 })
+})
+
+test('干净证明不能跳过新出现的未核对运行，云端忙碌和取消时不发送新 query', async t => {
+  const f = await historyFastPathFixture(t)
+  await f.nextRun()
+  await f.backend.state.beginRun(f.agent.id, 'new-interrupted', 'query', { turn: 2, step: 1 })
+  await f.backend.state.markRunSent(f.agent.id, 'new-interrupted')
+  await f.backend.state.finishRun(f.agent.id, 'new-interrupted', 'unknown')
+  f.historyAction(() => { setTimeout(() => f.currentAbort.abort(), 0); return { status: 'busy' } })
+  await assert.rejects(f.nextRun(), { name: 'AbortError' })
+  assert.deepEqual(f.counters, { history: 1, query: 1 })
+})
+
+test('失败和取消后必须核对历史，已收到 completed 但通知 drain 失败也不能复用', async t => {
+  const f = await historyFastPathFixture(t)
+  await f.nextRun()
+  f.queryAction(() => { throw Object.assign(new Error('合成执行失败'), { code: 'FIXTURE_QUERY_FAILED' }) })
+  await assert.rejects(f.nextRun(), { code: 'FIXTURE_QUERY_FAILED' })
+  f.queryAction(undefined)
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 1, query: 3 })
+  f.queryAction(() => { f.currentAbort.abort() })
+  await assert.rejects(f.nextRun(), { name: 'AbortError' })
+  f.queryAction(undefined)
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 2, query: 5 })
+  let failDrain = true
+  f.backend.connection.peer.drainNotifications = async () => {
+    if (failDrain) throw Object.assign(new Error('合成通知失败'), { code: 'RPC_NOTIFICATION_FAILED' })
+  }
+  await assert.rejects(f.nextRun(), { code: 'RPC_NOTIFICATION_FAILED' })
+  failDrain = false
+  await f.nextRun()
+  assert.deepEqual(f.counters, { history: 3, query: 7 })
+})
+
+test('步骤复用当轮图片能力快照，目录超过30秒只在下一轮重新读取', async t => {
+  let catalogs = 0, queries = 0
+  const f = await fixture(t, async options => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    if (method === 'catalog') return { status: 'ok', models: [{ value: 'chosen-model',
+      inputModalities: ++catalogs === 1 ? ['text', 'image'] : ['text'] }] }
+    assert.equal(method, 'query'); queries++
+    assert.equal(params.tools.some(tool => tool.name === 'read_image'), queries === 1)
+    if (queries === 1) {
+      f.backend.catalogCache.time = Date.now() - 31_000
+      f.backend.catalogCache.reply.models[0].inputModalities = ['text']
+      assert.deepEqual(await options.handlers['step.prepare']({ runId: params.runId },
+        { signal: new AbortController().signal }), {})
+      assert.equal(catalogs, 1)
+    }
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.agent.inbox = { nextStep: [], splice() { throw new Error('无需恢复消息') } }
+  f.agent.preStep = async () => ({ ...f.decision, messages: [] })
+  f.decision.assembly.tools.push({ name: 'read_image', description: '读取本机图片',
+    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false } })
+  await f.backend.runStep(f.agent, f.decision)
+  f.agent.phase = { kind: 'running', turn: 2, step: 1, abort: new AbortController() }
+  await f.backend.runStep(f.agent, f.decision)
+  assert.equal(catalogs, 2)
+})
+
+test('纯流通知不重复 flush，新持久记录仍等待落盘，缺少序号或落盘失败保守处理', async t => {
+  const f = await fixture(t, async () => ({ peer: {}, async close() {} }))
+  await f.backend.state.ready
+  let seq = 0, flushes = 0, release
+  Object.defineProperty(f.agent.session, 'seq', { configurable: true, get: () => seq })
+  const runId = 'notification-sequence-test'
+  f.backend.runs.set(runId, { agent: f.agent, timing() {}, projection: {
+    async accept(message) { if (message.durable) seq++ },
+  } })
+  t.after(() => f.backend.runs.delete(runId))
+  f.ctx.sessions.flush = async () => { flushes++; return true }
+  await f.backend.notification('sdk.message', { runId, message: { type: 'stream_event' } })
+  assert.equal(flushes, 0)
+  f.ctx.sessions.flush = async () => { flushes++; await new Promise(resolve => { release = resolve }); return true }
+  let finished = false
+  const saved = f.backend.notification('sdk.message', { runId, message: { type: 'assistant', durable: true } })
+    .then(() => { finished = true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(flushes, 1); assert.equal(finished, false)
+  release(); await saved
+  delete f.agent.session.seq
+  f.ctx.sessions.flush = async () => { flushes++; return true }
+  await f.backend.notification('sdk.message', { runId, message: { type: 'stream_event' } })
+  assert.equal(flushes, 2)
+  Object.defineProperty(f.agent.session, 'seq', { configurable: true, get: () => seq })
+  f.ctx.sessions.flush = async () => false
+  await assert.rejects(f.backend.notification('sdk.message', { runId, message: { type: 'assistant', durable: true } }),
+    { code: 'DURABILITY_UNAVAILABLE' })
 })

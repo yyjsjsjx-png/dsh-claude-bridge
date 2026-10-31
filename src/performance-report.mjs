@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto'
 
-const EVENTS = /^(?:perf\.(?:local|remote|sdk)|run\.[a-z_]+|history\.[a-z_]+|connection\.state|step\.[a-z_]+|tool\.[a-z_]+|diagnostics\.failed|start|complete|reserved|resumed|ready|hooks-verified|toolset-verified|dispatch|received|iterator-exited|failed|completed|lock-release-failed)$/
+const EVENTS = /^(?:perf\.(?:local|remote|sdk)|run\.[a-z_]+|history\.[a-z_]+|connection\.state|step\.[a-z_]+|tool\.[a-z_]+|diagnostics\.failed|websocket_(?:connect_failed|disconnected|close_timeout)|rpc_(?:request_failed|handler_failed)|start|complete|reserved|resumed|ready|hooks-verified|toolset-verified|dispatch|received|iterator-exited|failed|completed|lock-release-failed)$/
 const STAGES = new Set(['start', 'connected', 'history_checked', 'request_sent', 'first_model_event', 'first_token',
   'first_text', 'completed', 'hooks_verified', 'toolset_verified', 'ttft_ms', 'ttft_stream_ms',
   'time_to_request_ms', 'first_content_frame_ms', 'duration_ms', 'duration_api_ms',
-  'query', 'validation', 'session', 'mcp', 'sdk', 'tool', 'cancel', 'compact', 'pre-step', 'execute'])
+  'query', 'validation', 'session', 'mcp', 'sdk', 'tool', 'cancel', 'compact', 'pre-step', 'execute',
+  'tools_converted', 'prompt_prepared', 'journal_prepared', 'checkpointed'])
 const NUMBERS = ['durationMs', 'bytes', 'inputBytes', 'outputBytes', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']
 const anonymous = value => /^run-[a-f0-9]{12}$/.test(value) ? value
   : `run-${createHash('sha256').update(value).digest('hex').slice(0, 12)}`
@@ -20,7 +21,8 @@ export function sanitizePerformanceRecord(value) {
   for (const key of NUMBERS) if (Number.isFinite(value[key]) && value[key] >= 0) output[key] = value[key]
   if (/^[A-Z][A-Z0-9_]{1,79}$/.test(value.code ?? '')) output.code = value.code
   if (['connected', 'connecting', 'reconnecting', 'disconnected', 'closed', 'ready', 'completed', 'failed', 'cancelled', 'unknown'].includes(value.status)) output.status = value.status
-  if (['query', 'compact', 'text-delta', 'reasoning-delta', 'tool-call-delta'].includes(value.method)) output.method = value.method
+  if (['query', 'compact', 'text-delta', 'reasoning-delta', 'tool-call-delta', 'initialize', 'history',
+    'catalog', 'planUsage', 'authStatus', 'settle', 'tool.execute', 'approval.request', 'step.prepare'].includes(value.method)) output.method = value.method
   if (typeof value.model === 'string' && /^[a-z][a-z0-9_.:-]{0,100}$/i.test(value.model)
     && !/token|key|bearer|secret|password/i.test(value.model)) output.model = value.model
   if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(value.effort)) output.effort = value.effort
@@ -37,6 +39,10 @@ function summary(values) {
 const difference = (later, earlier) => Number.isFinite(later) && Number.isFinite(earlier) && later >= earlier ? later - earlier : undefined
 const METRICS = {
   localPreparationMs: '本地准备至发送', localFirstTokenMs: '本地收到首 token（含准备）',
+  localConnectionMs: '本地绑定与连接准备', historyCheckMs: '发送前历史核对',
+  localToolSetupMs: '本地工具转换与能力检查', localPromptPreparationMs: '本地消息与指令准备',
+  localJournalPreparationMs: '本地运行台账准备', localCheckpointMs: '本地记录整理与检查点',
+  localAfterCheckpointMs: '检查点后至发送',
   localWaitAfterSendMs: '发送后等待首 token', localFirstTextMs: '本地收到首段正文（含准备）',
   remoteStartupMs: '云端工具集初始化', remoteFirstTokenMs: '云端收到首 token', remoteFirstTextMs: '云端收到首段正文',
   thinkingToTextMs: '云端首 token 至首段正文', transportResidualMs: '两端传输与调度余量估算',
@@ -83,6 +89,13 @@ export function analyzePerformance(input) {
   const queries = [...runs.values()].filter(run => !run.compact).map(run => {
     run.metrics = {
       localPreparationMs: run.local.request_sent, localFirstTokenMs: run.local.first_token,
+      localConnectionMs: run.local.connected,
+      historyCheckMs: difference(run.local.history_checked, run.local.connected),
+      localToolSetupMs: difference(run.local.tools_converted, run.local.history_checked),
+      localPromptPreparationMs: difference(run.local.prompt_prepared, run.local.tools_converted),
+      localJournalPreparationMs: difference(run.local.journal_prepared, run.local.prompt_prepared),
+      localCheckpointMs: difference(run.local.checkpointed, run.local.journal_prepared),
+      localAfterCheckpointMs: difference(run.local.request_sent, run.local.checkpointed),
       localWaitAfterSendMs: difference(run.local.first_token, run.local.request_sent),
       localFirstTextMs: run.local.first_text, remoteStartupMs: run.remote.toolset_verified,
       remoteFirstTokenMs: run.remote.first_token, remoteFirstTextMs: run.remote.first_text,

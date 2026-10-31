@@ -2,7 +2,11 @@
 
 在本机 DSH 中使用远程官方 Claude Agent SDK：界面、历史、文件、命令、提问和审批留在本机，Claude 的原生会话、上下文和压缩由服务器上的 SDK 管理。
 
-本项目面向个人账号的生产试用。客户端不需要安装 Claude Code 或 Agent SDK。
+本项目是面向**个人账号、多设备自用**的实验性桥接，账号所有者的多台设备可以共用服务器地址和桥接口令。客户端不需要安装 Claude Code 或 Agent SDK。
+
+**本项目由人工驱动的 vibe coding 完成。**
+
+第一次使用请从 [首次使用与自部署指南](docs/getting-started.md) 开始；服务器安装与配置见 [远程服务部署](docs/remote-service.md)。公共源码不附带账号、服务地址或访问口令。
 
 ## 兼容版本
 
@@ -22,14 +26,14 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.3
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.4
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
 3. 在 **设置 → 远程 Claude** 保存服务提供方给出的 **`wss://…` 服务器地址**和**独立桥接口令**，点击“测试连接并刷新模型”。公网 WSS 直接连接，不需要 SSH、密钥文件或额外启动脚本。
 4. 在会话首页点击“新建远程 Claude”，选择账号实际返回的模型与推理强度，再开始对话。之后默认沿用上次成功选择；型号或强度不可用时回退为重新选择或模型默认强度。
 
-已有安装可保留数据原地升级，无须还原快照。下载 [v0.1.3 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.3/dsh-claude-bridge-0.1.3.zip)，解压并完全退出 DSH，在包目录运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-plugin.ps1`。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
+已有安装可保留数据原地升级，无须还原快照。下载 [v0.1.4 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.4/dsh-claude-bridge-0.1.4.zip)，解压并完全退出 DSH，双击包根目录的 **`更新插件.cmd`**。结果窗口会保留，Windows 确实要求管理员权限时才请求 UAC。请保留解压目录。自定义路径、高级命令行、备份及失败处理见 [更新说明](docs/updating.md)。
 
 设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销其他设备持有的同一口令。
 
@@ -47,7 +51,7 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.3
+dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.4
 ```
 
 ## 已实现
@@ -75,6 +79,8 @@ dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-c
 
 会话分叉、`subagent_fork`、计划模式和 DSH 本机压缩保持关闭。步骤和工具附加上下文只接受文本。多设备各自拥有独立历史，device ID 不是多用户授权边界。
 
+执行中追加的消息会在工具批次边界作为 SDK hook 的附加上下文送达。模型对这类消息的理解和响应存在差异，不能保证立刻回应或逐字复述；需要中止当前执行时，请使用停止按钮。模型自然结束一轮也不等于网络恢复失败，不会因此自动发起新一轮推理。
+
 ## 多设备与并发
 
 同一服务地址和桥接口令可以供账号所有者自己的多台设备使用。各设备首次运行时生成独立 device ID；只复制连接地址和口令，不复制整个 DSH 数据目录。
@@ -86,7 +92,7 @@ dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-c
 | 普通 DSH 子代理 | 新建独立会话，继承父代理模型；可与其他会话并行，沿用 DSH 深度限制 |
 | 同一 device ID 启动两个独立 Host | 已有连接仍活跃时拒绝后者；不允许两端抢写相同设备状态 |
 
-普通新建子代理与会话分叉不同，`subagent_fork` 仍关闭。设备、窗口和子代理共享服务器资源与同一 Claude 账号额度，可能受到上游限流。本版本没有账号级公平排队器；服务默认最多保留 16 个连接槽位（含短断保留项），这不是模型会话并发数保证。基础设备隔离、不同会话并行及同会话锁已有确定性测试；复杂并发父子崩溃恢复和容量压测尚未验收。
+普通新建子代理与会话分叉不同，`subagent_fork` 仍关闭。设备、窗口和子代理共享服务器资源与同一 Claude 账号额度，可能受到上游限流。多租户权限隔离不在本项目的验收范围。本版本没有账号级公平排队器；服务默认最多保留 16 个连接槽位（含短断保留项），这不是模型会话并发数保证。基础设备隔离、不同会话并行及同会话锁已有确定性测试；复杂并发父子崩溃恢复和容量压测尚未验收。
 
 ## 部署与验证
 
