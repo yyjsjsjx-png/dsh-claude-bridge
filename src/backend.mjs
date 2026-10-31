@@ -1,0 +1,875 @@
+import { randomUUID, createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+import { setTimeout as delay } from 'node:timers/promises'
+import { join } from 'node:path'
+import { BridgeState } from './state.mjs'
+import { createDiagnostics } from './diagnostics.mjs'
+import { createSshTransport } from './ssh-transport.mjs'
+import { createWebSocketTransport } from './websocket-transport.mjs'
+import { createConnectionSettings } from './connection-settings.mjs'
+import { toMcpToolDefinitions, toSdkPrompt, toMcpContent } from './dsh-content.mjs'
+import { SdkProjection, dshUsage } from './sdk-projection.mjs'
+import { CLAUDE_PROVIDER, CLAUDE_PRESET } from '../plugin/policy.mjs'
+import { defaultVisibleIds, validateVisibleIds } from './model-preferences.mjs'
+import { imageCapability } from './model-capabilities.mjs'
+import { contextSnapshot, initialSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
+import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
+import { localHistory, coalesceHistory, restoreAssistant, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { recoveryNotice } from './recovery-notice.mjs'
+
+function failure(code, message) {
+  const error = new Error(`[${code}] ${message}`)
+  error.code = code
+  return error
+}
+
+function selectionFor(ctx, agent) {
+  const projection = ctx.sessionProjections.stateOf(agent.session, 'modelSelection')
+  const selected = projection?.pending ?? agent.session.requestHeader()?.config ?? agent.options
+  if (selected?.provider !== CLAUDE_PROVIDER || typeof selected.model !== 'string' || !selected.model) {
+    throw failure('ENGINE_SELECTION_REQUIRED', '请从新会话入口选择远程 Claude 模型。')
+  }
+  if (agent.session.header.agentPreset !== CLAUDE_PRESET) throw failure('PRESET_ENGINE_MISMATCH', '远程 Claude 必须使用专属预设。')
+  return selected
+}
+
+/** Host-side coordinator. It never imports or starts a local Claude SDK. */
+export class BridgeBackend {
+  constructor(ctx, config = {}, { helpers, createTransport } = {}) {
+    this.ctx = ctx
+    this.config = config
+    this.helpers = helpers
+    this.createTransport = createTransport
+    this.directory = config.stateDirectory ?? join(helpers.resolveDshHome(), 'claude-bridge')
+    this.state = new BridgeState(this.directory)
+    this.diagnostics = createDiagnostics({ directory: join(this.directory, 'diagnostics') })
+    this.runs = new Map()
+    this.syncing = new Map()
+    this.retiredRuns = new Set()
+    this.compatibility = []
+    this.connection = undefined
+    this.connecting = undefined
+    this.disposed = false
+    this.lifetime = new AbortController()
+  }
+
+  async settings() {
+    await this.state.ready
+    return this.connectionSettings ??= createConnectionSettings({
+      configPath: join(this.directory, 'connection.json'), credentials: this.ctx.credentials,
+      credentialKey: this.helpers.credentialKey('dsh-claude-bridge', 'connection'),
+      deviceId: this.state.value.deviceId,
+    })
+  }
+
+  async saveConnection(value) {
+    if (this.runs.size) throw failure('BRIDGE_BUSY', '请等待当前任务结束后更改服务器。')
+    const accepted = await (await this.settings()).save(value)
+    if (this.connection) await this.connection.close()
+    this.connection = undefined
+    this.authentication = 'unknown'
+    this.catalogCache = undefined
+    this.planUsageCache = undefined
+    return accepted
+  }
+
+  async status() {
+    await this.state.ready
+    const settings = await (await this.settings()).read()
+    return { ...settings, connected: this.connection?.connected ?? Boolean(this.connection), compatibility: this.compatibility,
+      diagnosticsPath: this.diagnostics.path, activeRuns: this.runs.size,
+      authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary() }
+  }
+
+  usageSummary() {
+    const summary = { sessions: 0, runs: 0, inputTokens: 0, outputTokens: 0,
+      cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCostUsd: 0, costKind: 'sdk-estimate' }
+    for (const session of Object.values(this.state.value.sessions)) {
+      const reports = Object.values(session.usage ?? {})
+      if (reports.length) summary.sessions++
+      for (const report of reports) {
+        summary.runs++
+        const usage = dshUsage(report)
+        if (usage) for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']) summary[key] += usage[key]
+      }
+      // SDK costs include the session's earlier turns. Take its latest value.
+      const latest = reports.findLast(report => Number.isFinite(report.total_cost_usd) && report.total_cost_usd >= 0)
+      if (latest) summary.estimatedCostUsd += latest.total_cost_usd
+    }
+    return summary
+  }
+
+  async refreshAuthentication() {
+    this.planUsageCache = undefined
+    const transport = await this.connect()
+    try {
+      const status = await transport.peer.request('authStatus', { refresh: true }, { timeoutMs: 30000 })
+      if (status.status === 'failed' || typeof status.loggedIn !== 'boolean') {
+        throw failure(status.code ?? 'AUTH_STATUS_UNAVAILABLE', status.message ?? '无法验证服务器上的 Claude 登录状态。')
+      }
+      this.authentication = status.loggedIn === true ? 'logged-in' : 'login-required'
+      if (status.loggedIn !== true) throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
+      return status
+    } catch (error) {
+      this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
+      throw error
+    }
+  }
+
+  async connect({ signal } = {}) {
+    if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
+    if (this.connection) return this.connection
+    if (this.connecting) return this.connecting
+    this.connecting = (async () => {
+      await this.state.ready
+      const options = {
+        signal: AbortSignal.any([signal, this.lifetime.signal].filter(Boolean)),
+        handlers: {
+          'tool.execute': (params, context) => this.dispatchTool(params, context),
+          'approval.request': (params, context) => this.dispatchApproval(params, context),
+          'step.prepare': (params, context) => this.prepareStep(params, context),
+        },
+        onNotification: (method, params) => this.notification(method, params),
+        onClose: () => { this.connection = undefined; this.planUsageCache = undefined },
+        onConnectionState: connection => {
+          for (const run of this.runs.values()) {
+            try { this.sessionStatus(run.agent, { connection }) }
+            catch { this.diagnostics.event('run.connection_status_failed', { runId: run.runId, code: 'STATUS_FAILED' }) }
+          }
+          this.diagnostics.event('connection.state', { status: connection })
+        },
+        onDiagnostic: ({ event, ...fields }) => this.diagnostics.event(event, fields),
+      }
+      let transport
+      if (this.createTransport) transport = await this.createTransport(options)
+      else if (this.config.transport === 'ssh') {
+        if (!this.config.remoteWorkerPath || !this.config.remoteNodePath) {
+          throw failure('BRIDGE_NOT_CONFIGURED', '开发用 SSH 入口尚未配置。')
+        }
+        transport = createSshTransport({ ...options, workerPath: this.config.remoteWorkerPath,
+          nodeCommand: this.config.remoteNodePath })
+      } else {
+        const configured = await (await this.settings()).resolve()
+        transport = await createWebSocketTransport({ ...options, ...configured, initialConnectWindowMs: 60_000 })
+      }
+      try {
+        const initialized = await transport.peer.request('initialize', { protocolVersion: 1 }, { timeoutMs: 30000 })
+        if (initialized.protocolVersion !== 1) throw failure('PROTOCOL_MISMATCH', '服务器协议不兼容。')
+        this.initialized = initialized
+        this.authentication = initialized.authenticated === true ? 'logged-in' : initialized.authenticated === false ? 'login-required' : 'unknown'
+        if (initialized.authenticated === false) throw failure('AUTH_REQUIRED', '请在服务器上完成 Claude 官方登录。')
+        this.connection = transport
+        return transport
+      } catch (error) { await transport.close(); throw error }
+    })()
+    try { return await this.connecting } finally { this.connecting = undefined }
+  }
+
+  async catalog({ refresh = false } = {}) {
+    if (!refresh && this.catalogCache && Date.now() - this.catalogCache.time < 30000) return structuredClone(this.catalogCache.reply)
+    if (this.catalogPending) return this.catalogPending
+    const pending = (async () => {
+      const transport = await this.connect()
+      // Automatic model resolution may call this once for every catalog row.
+      // Only the explicit refresh action forces a fresh CLI auth check.
+      if (refresh) await this.refreshAuthentication()
+      const reply = await transport.peer.request('catalog', { refresh }, { timeoutMs: 45000 })
+      if (reply.status !== 'ok') throw failure(reply.code ?? 'CATALOG_UNAVAILABLE', reply.message ?? '无法获取当前账号模型目录。')
+      this.catalogCache = { time: Date.now(), reply: structuredClone(reply) }
+      return reply
+    })()
+    this.catalogPending = pending
+    try { return await pending } finally { if (this.catalogPending === pending) this.catalogPending = undefined }
+  }
+
+  async planUsage(refresh = false) {
+    if (typeof refresh !== 'boolean') return { status: 'unavailable', code: 'INVALID_REQUEST' }
+    if (!refresh && this.planUsageCache?.until > Date.now()) return structuredClone(this.planUsageCache.value)
+    if (this.planUsagePending) return this.planUsagePending
+    const pending = (async () => {
+      let value
+      try {
+        const transport = await this.connect()
+        if (this.initialized?.capabilities?.planUsage !== true) {
+          return { status: 'unavailable', code: 'SDK_QUOTA_UNAVAILABLE' }
+        }
+        const reply = await transport.peer.request('planUsage', { refresh }, { timeoutMs: 20_000 })
+        if (this.connection !== transport) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
+        value = sanitizePlanUsage(reply)
+      } catch (error) { value = sanitizePlanUsage({ status: 'unavailable', code: error.code ?? 'QUOTA_READ_FAILED' }) }
+      if (['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(value.code)) this.authentication = 'login-required'
+      this.planUsageCache = { value, until: value.status === 'available' ? planUsageFreshUntil(value) : Date.now() + 30_000 }
+      return structuredClone(value)
+    })()
+    this.planUsagePending = pending
+    try { return await pending } finally { if (this.planUsagePending === pending) this.planUsagePending = undefined }
+  }
+
+  async listModelPreferences() {
+    const catalog = await this.catalog()
+    await this.state.ready
+    const saved = this.state.value.modelPreferences
+    if (saved !== undefined && saved.version !== 1) throw failure('MODEL_PREFERENCES_INVALID', '模型显示设置版本不兼容。')
+    const selected = saved === undefined ? defaultVisibleIds(catalog.models) : validateVisibleIds({ enabledIds: saved.enabledIds })
+    const enabled = new Set(selected)
+    return { models: catalog.models, enabledIds: catalog.models.filter(model => enabled.has(model.value)).map(model => model.value),
+      usingDefaults: saved === undefined }
+  }
+
+  async saveModelPreferences(value) {
+    const enabledIds = validateVisibleIds(value)
+    const catalog = await this.catalog()
+    const available = new Set(catalog.models.map(model => model.value))
+    if (enabledIds.some(id => !available.has(id))) throw failure('MODEL_CATALOG_CHANGED', '模型目录已经变化，请刷新后重新选择。')
+    await this.state.update(state => {
+      state.modelPreferences = { version: 1, enabledIds, updatedAt: new Date().toISOString() }
+    })
+    return { enabledIds: [...enabledIds], usingDefaults: false }
+  }
+
+  async visibleCatalog() {
+    const preferences = await this.listModelPreferences()
+    const enabled = new Set(preferences.enabledIds)
+    return { status: 'ok', models: preferences.models.filter(model => enabled.has(model.value)) }
+  }
+
+  async notification(method, params) {
+    if (method === 'diagnostic') {
+      this.diagnostics.event(params.event ?? 'remote.event', params)
+      return
+    }
+    if (method !== 'sdk.message') return
+    const run = this.runs.get(params?.runId)
+    if (!run) {
+      if (this.retiredRuns.has(params?.runId)) return
+      throw failure('UNEXPECTED_RUN_EVENT', '收到不属于当前运行的 SDK 事件。')
+    }
+    if (run.kind === 'compact') return
+    await run.projection.accept(params.message)
+    await this.checkpoint(run.agent.session)
+  }
+
+  async checkpoint(session) {
+    if (typeof this.ctx.sessions?.flush !== 'function' || await this.ctx.sessions.flush(session) !== true) {
+      throw failure('DURABILITY_UNAVAILABLE', '无法确认本机会话已可靠保存，已停止派发。')
+    }
+  }
+
+  async syncSession(agent, { signal, withinRun = false } = {}) {
+    if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { status: 'not-remote' }
+    if (this.syncing.has(agent.id)) return this.syncing.get(agent.id)
+    if ([...this.runs.values()].some(run => run.agent.id === agent.id)) return { status: 'active' }
+    if (!withinRun && agent.phase?.kind !== 'idle') return { status: 'active' }
+    const operation = async maintenanceSignal => {
+      const combined = AbortSignal.any([signal, maintenanceSignal].filter(Boolean))
+      const binding = await this.state.binding(agent.id, agent.session.header.cwd)
+      if (!binding.started && !Object.keys(binding.runs ?? {}).length) return { status: 'empty' }
+      const pending = await this.state.recoveryStatus(agent.id)
+      this.sessionStatus(agent, { recovery: { status: 'syncing', added: 0, unresolvedTools: 0,
+        interrupted: pending.length > 0, updatedAt: Date.now() } })
+      try {
+        const transport = await this.connect({ signal: combined })
+        combined.throwIfAborted()
+        if (this.initialized?.capabilities?.historySync !== true) {
+          throw failure('HISTORY_UNAVAILABLE', '服务器尚未提供云端记录同步。')
+        }
+        const local = localHistory(agent.session)
+        local.turn = pending.findLast(run => Number.isSafeInteger(run.turn))?.turn
+          ?? Math.max(1, local.turn - (withinRun ? 1 : 0))
+        const cloudResults = new Map()
+        let cursor = pending.some(run => !run.reconciledAt) ? { offset: 0, lastUuid: null }
+          : binding.historyCursor ?? { offset: 0, lastUuid: null }
+        let cloudRuns = {}, added = 0, bytes = 0, reset = false, done = false
+        const records = []
+        for (let page = 0; page < 3200; page++) {
+          combined.throwIfAborted()
+          const reply = await transport.peer.request('history', { deviceId: binding.deviceId,
+            dshSessionId: agent.id, sessionId: binding.sdkSessionId, projectPath: binding.projectPath,
+            offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 })
+          if (reply.status === 'busy') {
+            this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
+              interrupted: true, updatedAt: Date.now() } })
+            return { status: 'waiting' }
+          }
+          if (reply.status === 'cursor-reset' && !reset) { cursor = { offset: 0, lastUuid: null }; records.length = 0; bytes = 0; reset = true; continue }
+          if (reply.status !== 'ok' || reply.sessionId !== binding.sdkSessionId || !Array.isArray(reply.records)
+            || !Number.isSafeInteger(reply.nextOffset) || reply.nextOffset < cursor.offset
+            || (reply.nextOffset === cursor.offset && reply.done !== true)
+            || (reply.lastUuid !== null && typeof reply.lastUuid !== 'string')) {
+            throw failure(reply.code ?? 'HISTORY_INVALID', '云端记录尚未同步，未继续执行。')
+          }
+          bytes += Buffer.byteLength(JSON.stringify(reply.records))
+          if (bytes > 64 * 1024 * 1024) throw failure('HISTORY_TOO_LARGE', '本次恢复内容过大，已保留已同步记录。')
+          cloudRuns = reply.runs ?? {}
+          records.push(...reply.records)
+          cursor = { offset: reply.nextOffset, lastUuid: reply.lastUuid }
+          if (reply.done) { done = true; break }
+        }
+        if (!done) throw failure('HISTORY_TOO_LARGE', '云端记录超过本次同步上限，未静默省略。')
+        for (const record of coalesceHistory(records)) {
+            if (record.type === 'prompt' && binding.runs?.[record.uuid]?.turn) {
+              local.turn = binding.runs[record.uuid].turn; local.step = binding.runs[record.uuid].step
+            } else if (record.type === 'assistant') {
+              added += restoreAssistant(agent.session, record, local, this.helpers,
+                agent._bridgeStatus?.model ?? selectionFor(this.ctx, agent).model)
+            } else if (record.type === 'tool-result') cloudResults.set(record.callId, record)
+        }
+        const updates = []
+        let unresolvedTools = 0
+        for (const run of pending) {
+          const tools = {}
+          for (const [callId, tool] of Object.entries(run.tools)) {
+            if (tool.status === 'not-sent') { tools[callId] = { status: 'not-sent' }; continue }
+            let result = local.results.get(callId)
+            if (!knownToolResult(result)) {
+              const receipt = cloudRuns[run.runId]?.tools?.[callId]
+              const cloud = cloudResults.get(callId)
+              const call = local.calls.get(callId)
+              let expectedHash
+              try { expectedHash = createHash('sha256').update(JSON.stringify(JSON.parse(call?.data.arguments))).digest('hex') } catch {}
+              if (cloud?.content && call?.seq === tool.callSeq && call.data.name === tool.name
+                && receipt?.name === tool.name && receipt.argumentsSha256 === expectedHash) {
+                result = agent.session.append('tool/result', { turn: call.data.turn, step: call.data.step,
+                  message: this.helpers.createToolResultMessage({ callId, content: cloud.content, isError: cloud.isError }),
+                  meta: { claudeBridgeRecovered: true } }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+                local.results.set(callId, result)
+              }
+            }
+            if (knownToolResult(result) && (result.data.message.toolCallId ?? result.data.message.source?.callId) === callId) {
+              tools[callId] = { status: 'completed', resultSeq: result.seq }
+            }
+            else if (tool.status === 'prepared') tools[callId] = { status: 'not-sent' }
+            else { tools[callId] = { status: 'unknown' }; unresolvedTools++ }
+          }
+          const observed = cloudRuns[run.runId]?.status
+          updates.push({ runId: run.runId, status: ['completed', 'cancelled', 'failed'].includes(observed)
+            ? observed : run.status === 'prepared' ? 'not-sent' : 'unknown', tools })
+        }
+        await this.checkpoint(agent.session)
+        await this.state.reconcileRecovery(agent.id, updates, cursor)
+        await this.state.markStarted(agent.id)
+        const previous = agent._bridgeStatus ?? this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
+        const interrupted = pending.length > 0 || ['running', 'stopping', 'unknown'].includes(previous?.phase)
+        this.sessionStatus(agent, { ...(interrupted ? { phase: 'stopped', context: { status: 'unknown' } } : {}),
+          toolMayHaveExecuted: unresolvedTools > 0, recovery: { status: 'ready', added, unresolvedTools,
+            interrupted, updatedAt: Date.now() } })
+        await this.checkpoint(agent.session)
+        this.diagnostics.event('history.synced', { sessionId: agent.id, status: 'ready' })
+        return { status: 'ready', added, unresolvedTools }
+      } catch (error) {
+        this.sessionStatus(agent, { recovery: { status: 'unavailable', added: 0, unresolvedTools: 0,
+          code: typeof error.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'HISTORY_READ_FAILED',
+          interrupted: pending.length > 0, updatedAt: Date.now() } })
+        this.diagnostics.event('history.failed', { sessionId: agent.id, code: error.code ?? 'HISTORY_READ_FAILED' })
+        throw error
+      }
+    }
+    const task = !withinRun && typeof agent.runMaintenance === 'function'
+      ? agent.runMaintenance(operation) : operation(signal)
+    this.syncing.set(agent.id, task)
+    try { return await task } finally { if (this.syncing.get(agent.id) === task) this.syncing.delete(agent.id) }
+  }
+
+  requestRunStop(run) {
+    if (run.stopPersistence) return
+    run.stopPersistence = this.state.requestStop(run.agent.id, run.runId).catch(error => {
+      run.journalError = error
+      this.diagnostics.event('run.stop_record_failed', { runId: run.runId, code: 'STOP_RECORD_FAILED' })
+    }).finally(() => run.queryAbort.abort())
+  }
+
+  async recover(agent, confirm, signal) {
+    if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { kind: 'error', text: '此命令只用于远程 Claude 会话。' }
+    if (agent.phase?.kind !== 'idle' || typeof agent.runMaintenance !== 'function') {
+      return { kind: 'error', text: '请先等待当前运行结束。' }
+    }
+    return agent.runMaintenance(async maintenanceSignal => {
+      AbortSignal.any([signal, maintenanceSignal]).throwIfAborted()
+      if ([...this.runs.values()].some(run => run.agent.id === agent.id)) return { kind: 'error', text: '当前会话仍在收尾，请稍后核实。' }
+      const records = await this.state.recoveryStatus(agent.id)
+      if (!records.length) return { kind: 'success', text: '当前会话没有待核实的中断记录。' }
+      if (confirm) {
+        await this.state.acknowledgeRecovery(agent.id)
+        this.sessionStatus(agent, { phase: 'unknown', context: { status: 'unknown' }, toolMayHaveExecuted: true })
+        await this.checkpoint(agent.session)
+        return { kind: 'success', text: '已记录你的核实确认，允许后续对话；原请求不会重发，原有未知结果保留。' }
+      }
+      const tools = records.flatMap(run => Object.values(run.tools).filter(tool => ['dispatched', 'unknown'].includes(tool.status)))
+      return { kind: 'success', text: `有 ${records.length} 轮执行状态待核实，${tools.length} 个工具未确认结果。请先核对实际文件、进程或外部操作；核实后使用 /bridge-recovery confirm 允许后续对话。原请求不会自动重试。` }
+    })
+  }
+
+  async compact(agent, commandSignal) {
+    try {
+      if (agent.session.header.agentPreset !== CLAUDE_PRESET) throw failure('PRESET_ENGINE_MISMATCH', '此命令只用于远程 Claude 会话。')
+      if (agent.phase?.kind !== 'idle' || typeof agent.runMaintenance !== 'function') {
+        throw failure('BRIDGE_BUSY', '请等待当前运行结束后再压缩。')
+      }
+      return await agent.runMaintenance(async maintenanceSignal => {
+        const signal = AbortSignal.any([maintenanceSignal, commandSignal])
+        signal.throwIfAborted()
+        const selected = selectionFor(this.ctx, agent)
+        if (selected.model === 'account-default') throw failure('MODEL_SELECTION_REQUIRED', '请先选择明确的远程模型。')
+        await this.state.ready
+        if (!this.state.value.sessions[agent.id]?.started) throw failure('NATIVE_CONTEXT_MISSING', '会话尚未建立可恢复的远端上下文。')
+        const binding = await this.state.binding(agent.id, agent.session.header.cwd)
+        const transport = await this.connect()
+        signal.throwIfAborted()
+        if (this.initialized?.capabilities?.manualCompact !== true) {
+          throw failure('COMPACT_UNAVAILABLE', '当前服务器版本尚未接入主动压缩。')
+        }
+        const runId = randomUUID()
+        await this.state.beginRun(agent.id, runId, 'compact')
+        const run = { runId, kind: 'compact', agent, signal, queryAbort: new AbortController(), toolQueue: Promise.resolve() }
+        this.runs.set(runId, run)
+        this.sessionStatus(agent, { model: selected.model, runId, phase: 'compacting', connection: 'connected', toolMayHaveExecuted: false })
+        const onStop = () => {
+          this.requestRunStop(run)
+          this.diagnostics.event('compact.stop_requested', { runId, sessionId: agent.id })
+          try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
+          catch { this.diagnostics.event('compact.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
+        }
+        signal.addEventListener('abort', onStop, { once: true })
+        if (signal.aborted) onStop()
+        this.diagnostics.event('compact.started', { runId, sessionId: agent.id })
+        try {
+          await this.checkpoint(agent.session)
+          signal.throwIfAborted()
+          await this.state.markRunSent(agent.id, runId)
+          signal.throwIfAborted()
+          run.requestStarted = true
+          const result = await transport.peer.request('query', { action: 'compact', runId,
+            deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
+            projectPath: binding.projectPath, resume: true, model: selected.model,
+            ...(selected.reasoningEffort ? { effort: selected.reasoningEffort } : {}),
+          }, { signal: run.queryAbort.signal })
+          signal.throwIfAborted()
+          if (result.status !== 'completed') throw failure(result.code ?? 'COMPACT_FAILED', result.message ?? '远端压缩未完成。')
+          if (!['compacted', 'unchanged'].includes(result.compaction?.status)) throw failure('COMPACT_UNCONFIRMED', 'SDK 未提供可验证的压缩结果。')
+          if (result.metrics) {
+            await this.state.recordUsage(agent.id, runId, { usage: result.metrics.usage,
+              usageScope: 'current-turn-main-agent', modelUsage: result.metrics.modelUsage?.models,
+              modelUsageScope: 'session-cumulative', total_cost_usd: result.metrics.cost?.usd,
+              costScope: 'session-cumulative-estimate' })
+          }
+          signal.throwIfAborted()
+          if (result.compaction.status === 'compacted') await this.state.markRecoveryNotice(agent.id, null)
+          this.sessionStatus(agent, { model: selected.model, phase: 'completed', context: contextSnapshot(result.metrics?.context) })
+          await this.checkpoint(agent.session)
+          run.journalStatus = 'completed'
+          this.diagnostics.event('compact.completed', { runId, status: result.compaction.status })
+          return { kind: 'success', text: result.compaction.status === 'compacted'
+            ? '已压缩远端 Claude 原生上下文；本机展示历史保留。' : 'SDK 本次未执行压缩，当前可能没有足够的可压缩内容。' }
+        } catch (error) {
+          if (signal.aborted && run.requestStarted) {
+            await run.stopPersistence
+            try { await transport.peer.request('settle', { runId }, { timeoutMs: 15000 }) }
+            catch { /* A missing reply cannot prove compaction did not occur. */ }
+          }
+          this.sessionStatus(agent, { phase: 'unknown', context: { status: 'unknown' }, toolMayHaveExecuted: false })
+          this.diagnostics.event('compact.failed', { runId, code: error.code ?? 'COMPACT_FAILED' })
+          throw error
+        } finally {
+          await run.stopPersistence
+          signal.removeEventListener('abort', onStop)
+          this.runs.delete(runId)
+          this.retiredRuns.add(runId)
+          if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
+          await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'), Boolean(run.journalError))
+          await this.diagnostics.flush()
+        }
+      })
+    } catch (error) {
+      const messages = { BRIDGE_BUSY: '请等待当前运行结束后再压缩。',
+        NATIVE_CONTEXT_MISSING: '会话尚未建立可恢复的远端上下文。',
+        COMPACT_UNAVAILABLE: '当前服务器或 SDK 尚未提供主动压缩。',
+        RECOVERY_REQUIRED: '上一轮状态待核实；请先使用 /bridge-recovery 查看并核实。',
+        MODEL_SELECTION_REQUIRED: '请先选择明确的远程模型。', AUTH_REQUIRED: '请先在服务器完成官方登录。' }
+      return { kind: 'error', text: messages[error.code] ?? '压缩未能确认完成；已发送的请求可能已生效，请核实会话状态后再决定是否重试。' }
+    }
+  }
+
+  sessionStatus(agent, patch) {
+    const current = this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
+    const previous = current?.version === 1 ? current : agent._bridgeStatus ?? initialSessionStatus()
+    const changedModel = patch.model !== undefined && patch.model !== previous.model
+    const next = { ...previous, ...(changedModel ? { context: { status: 'unknown' }, compatibility: null } : {}),
+      ...patch, updatedAt: Date.now() }
+    this.helpers.appendPluginRecord(agent.session, SESSION_STATUS_RECORD, next)
+    agent._bridgeStatus = next
+    return next
+  }
+
+  async convertTools(assembly, selected) {
+    let image = { supported: undefined, source: 'unknown', reason: '本次工具集合没有读图工具。' }
+    if (assembly.tools.some(tool => tool.name === 'read_image')) {
+      const models = (await this.catalog()).models
+      image = imageCapability(models.find(model => model.value === selected.model))
+    }
+    const converted = toMcpToolDefinitions(assembly.tools.filter(tool => tool.name !== 'read_image' || image.supported === true))
+    if (assembly.tools.some(tool => tool.name === 'read_image') && image.supported !== true) {
+      converted.compatibility.push({ name: 'read_image', status: 'disabled', reason: image.reason })
+    }
+    return converted
+  }
+
+  async runStep(agent, decision) {
+    const phase = agent.phase
+    if (phase?.kind !== 'running') throw failure('INVALID_AGENT_PHASE', '会话尚未进入执行阶段。')
+    const { turn, step, abort: { signal } } = phase
+    signal.throwIfAborted()
+    const selected = selectionFor(this.ctx, agent)
+    let binding = await this.state.binding(agent.id, agent.session.header.cwd)
+    const transport = await this.connect({ signal })
+    if (this.initialized?.capabilities?.historySync === true) {
+      const deadline = Date.now() + 120_000
+      let retries = 0
+      for (;;) {
+        const recovered = await this.syncSession(agent, { signal, withinRun: true })
+        if (recovered.status !== 'waiting') break
+        if (Date.now() >= deadline) throw failure('RECOVERY_PENDING', '云端原运行仍未完成收尾，已保留对话记录，请等待连接恢复。')
+        await delay(Math.min(8000, 1000 * 2 ** retries++), undefined, { signal })
+      }
+      binding = await this.state.binding(agent.id, agent.session.header.cwd)
+    }
+    const runId = randomUUID()
+    const converted = await this.convertTools(decision.assembly, selected)
+    this.compatibility = converted.compatibility
+    const refreshed = this.ctx.systemPrompt.refreshContext(decision.assembly, this.helpers.assembleContextFor(agent, signal))
+    const sections = this.helpers.renderContextSections(refreshed)
+    const refreshedContext = agent.runtimeContext.project(this.helpers.joinContextSections(sections), sections)
+    let contextAdmitted = false
+    const messages = []
+    for (const message of decision.messages) {
+      if (message.source.kind === 'runtime-context') {
+        if (refreshedContext && !contextAdmitted) { messages.push(refreshedContext); contextAdmitted = true }
+      } else messages.push(message)
+    }
+    if (refreshedContext && !contextAdmitted) messages.push(refreshedContext)
+    if (messages.some(message => message.content.some(block => block.type === 'text'
+      && block.text.includes('Workspace instructions were omitted or truncated to fit the configured byte budget.')))) {
+      throw failure('INSTRUCTION_BUDGET_EXCEEDED', 'DSH 报告项目指令被省略或截断；请调整专属预设的指令预算后继续。')
+    }
+    const media = { attachments: this.ctx.attachments, signal,
+      imageInput: converted.tools.some(tool => tool.name === 'read_image'),
+      mapHostPath: path => this.ctx.fs.processPathFromHostPath(path) }
+    let prompt = await toSdkPrompt(messages, media)
+    const notice = recoveryNotice(binding.runs)
+    const injectNotice = notice && notice.key !== binding.lastRecoveryNoticeKey
+    if (injectNotice) prompt = [{ type: 'text', text: notice.text }, ...prompt]
+    signal.throwIfAborted()
+    const systemPrompt = this.helpers.renderPrompt(decision.assembly)
+    await this.state.beginRun(agent.id, runId, 'query', { turn, step })
+    const header = { config: { provider: selected.provider, model: selected.model,
+      ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
+    tools: decision.assembly.tools }
+    agent.session.append('request/header', { header, reason: binding.started ? 'resume' : 'initial' })
+    for (const { message, intent } of agent.systemPrompt.project(systemPrompt, { inHistory: false, startsSeries: true })) {
+      agent.session.append('system/message', { turn, step, message }, intent)
+    }
+    for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
+    const run = { runId, agent, turn, step, signal, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
+      systemPrompt, toolSignature: JSON.stringify(converted.tools),
+      toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
+    run.projection = new SdkProjection({ agent, helpers: this.helpers, turn, step, model: selected.model,
+      onStarted: () => this.state.markStarted(agent.id),
+      onModelStart: async () => {
+        if (signal.aborted) return
+        if (!run.modelStarted) { run.modelStarted = true; return run.step }
+        if (run.stepPrepared) { run.stepPrepared = false; return run.step }
+        await run.toolQueue
+        if (signal.aborted) return
+        agent.session.append('step/end', { turn, step: run.step })
+        agent._bridgeStepOpen = false
+        run.step++
+        phase.step = run.step
+        agent.session.append('step/start', { turn, step: run.step })
+        agent._bridgeStepOpen = true
+        return run.step
+      },
+      onUsage: async message => {
+        const report = { usage: message.usage, usageScope: 'current-turn-main-agent',
+          modelUsage: message.modelUsage, modelUsageScope: 'session-cumulative',
+          total_cost_usd: message.total_cost_usd, costScope: 'session-cumulative-estimate' }
+        await this.state.recordUsage(agent.id, runId, report)
+      } })
+    this.runs.set(runId, run)
+    this.sessionStatus(agent, { model: selected.model, runId, phase: 'running', connection: 'connected', toolMayHaveExecuted: false,
+      compatibility: { model: selected.model, version: 1, tools: converted.compatibility } })
+    const onStop = () => {
+      this.requestRunStop(run)
+      this.diagnostics.event('run.stop_requested', { runId, sessionId: agent.id })
+      try { run.projection.interrupt() }
+      catch { this.diagnostics.event('run.stop_projection_failed', { runId, code: 'STOP_PROJECTION_FAILED' }) }
+      try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
+      catch { this.diagnostics.event('run.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
+    }
+    signal.addEventListener('abort', onStop, { once: true })
+    if (signal.aborted) onStop()
+    this.diagnostics.event('run.started', { runId, sessionId: agent.id, deviceId: binding.deviceId, stage: 'query' })
+    const startedAt = Date.now()
+    try {
+      await this.checkpoint(agent.session)
+      signal.throwIfAborted()
+      await this.state.markRunSent(agent.id, runId)
+      signal.throwIfAborted()
+      run.requestStarted = true
+      const result = await transport.peer.request('query', {
+        runId, deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
+        resume: binding.started, projectPath: binding.projectPath, prompt, systemPrompt,
+        tools: converted.tools,
+        ...(selected.model === 'account-default' ? {} : { model: selected.model }),
+        ...(selected.reasoningEffort ? { effort: selected.reasoningEffort } : {}),
+      }, { signal: run.queryAbort.signal })
+      if (['completed', 'cancelled', 'failed'].includes(result.status)) run.observedOutcome = result.status
+      await transport.peer.drainNotifications?.()
+      await run.toolQueue
+      signal.throwIfAborted()
+      if (result.status !== 'completed') throw failure(result.code ?? 'SDK_QUERY_FAILED', result.message ?? '远程 Claude 运行未完成。')
+      await this.state.markStarted(agent.id)
+      signal.throwIfAborted()
+      if (injectNotice) await this.state.markRecoveryNotice(agent.id, notice.key)
+      this.sessionStatus(agent, { model: selected.model, phase: 'completed', context: contextSnapshot(result.metrics?.context) })
+      await this.checkpoint(agent.session)
+      run.journalStatus = 'completed'
+      this.diagnostics.event('run.completed', { runId, sessionId: agent.id, durationMs: Date.now() - startedAt })
+      return { kind: 'completed' }
+    } catch (error) {
+      if (run.preparationError && !signal.aborted) error = run.preparationError
+      if (['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_FLOW_FAILED'].includes(error.code)) {
+        this.authentication = error.code === 'AUTH_FLOW_FAILED' ? 'verification-failed' : 'login-required'
+      }
+      if (signal.aborted) {
+        await run.stopPersistence
+        let stopState = { phase: run.requestStarted ? 'unknown' : 'stopped', toolMayHaveExecuted: Boolean(run.requestStarted) }
+        try {
+          const settled = run.requestStarted ? await transport.peer.request('settle', { runId }, { timeoutMs: 15000 })
+            : { status: 'cancelled', toolMayHaveExecuted: false }
+          if (['completed', 'cancelled', 'failed'].includes(settled.status)) {
+            run.observedOutcome = settled.status
+            stopState = { phase: settled.status === 'cancelled' ? 'stopped' : settled.status,
+              toolMayHaveExecuted: settled.toolMayHaveExecuted === true }
+          }
+          this.diagnostics.event('run.stop_settled', { runId, status: settled.status, code: settled.code,
+            durationMs: Date.now() - startedAt })
+          if (settled.toolMayHaveExecuted) this.diagnostics.event('run.cancelled', { runId, code: 'TOOL_OUTCOME_REQUIRES_CHECK', toolMayHaveExecuted: true })
+        } catch {
+          this.diagnostics.event('run.unknown', { runId, code: 'UNKNOWN_EXECUTION_OUTCOME', toolMayHaveExecuted: true })
+        }
+        run.stopState = stopState
+      }
+      await run.toolQueue.catch(() => {})
+      await transport.peer.drainNotifications?.().catch(() => {})
+      run.projection.finish({ interrupted: true })
+      this.sessionStatus(agent, { ...(run.stopState ?? { phase: run.requestStarted && !run.observedOutcome ? 'unknown' : 'failed', toolMayHaveExecuted: run.calls.size > 0 }),
+        ...(run.toolOutcomeUnknown ? { toolMayHaveExecuted: true } : {}),
+        context: { status: 'unknown' } })
+      await this.checkpoint(agent.session)
+      run.journalStatus = run.observedOutcome ?? (run.requestStarted ? 'unknown' : 'not-sent')
+      this.diagnostics.event('run.failed', { runId, sessionId: agent.id, code: error.code ?? 'BRIDGE_RUN_FAILED',
+        errorName: error.name, durationMs: Date.now() - startedAt })
+      throw error
+    } finally {
+      await run.stopPersistence
+      signal.removeEventListener('abort', onStop)
+      this.runs.delete(runId)
+      this.retiredRuns.add(runId)
+      if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
+      await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'),
+        Boolean(run.toolOutcomeUnknown || run.journalError))
+      await this.diagnostics.flush()
+    }
+  }
+
+  async prepareStep(params, context) {
+    const run = this.runs.get(params?.runId)
+    if (!run) throw failure('UNKNOWN_RUN', '准备下一步的运行已结束。')
+    const signal = AbortSignal.any([run.signal, context.signal])
+    signal.throwIfAborted()
+    await run.toolQueue
+    signal.throwIfAborted()
+    if (run.concluded) return { continue: false }
+    const { agent, turn } = run
+    if (typeof agent.preStep !== 'function') throw failure('DSH_PRE_STEP_UNAVAILABLE', '当前 DSH 未提供所需的步骤准备接口。')
+    const pending = [...agent.inbox.nextStep]
+    let decision
+    let accepted = false
+    try {
+      // DSH waits for nested instruction projections at its native step boundary.
+      agent.session.append('step/end', { turn, step: run.step })
+      agent._bridgeStepOpen = false
+      decision = await agent.preStep('next-step', { turn, step: run.step + 1 })
+      signal.throwIfAborted()
+      if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
+      const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent))
+      if (this.helpers.renderPrompt(decision.assembly) !== run.systemPrompt
+        || JSON.stringify(tools.tools) !== run.toolSignature) {
+        throw failure('QUERY_CONFIGURATION_CHANGED', '运行期间 DSH 提示词或工具集合发生变化；本次已停止，请新建会话应用新配置。')
+      }
+      const messages = decision.messages.filter(message => message.source.kind !== 'runtime-context')
+      const refreshed = this.ctx.systemPrompt.refreshContext(decision.assembly, this.helpers.assembleContextFor(agent, signal))
+      const sections = this.helpers.renderContextSections(refreshed)
+      const runtime = agent.runtimeContext.project(this.helpers.joinContextSections(sections), sections)
+      if (runtime) messages.push(runtime)
+      if (messages.some(message => message.source.kind === 'agent-instructions' && message.content.some(block => block.type === 'text'
+        && block.text.includes('Workspace instructions were omitted or truncated to fit the configured byte budget.')))) {
+        throw failure('INSTRUCTION_BUDGET_EXCEEDED', 'DSH 报告项目指令被省略或截断；已停止后续推理。')
+      }
+      const blocks = messages.length ? await toSdkPrompt(messages, { ...run.media, signal }) : []
+      if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_STEP_CONTEXT', '步骤附加上下文含有无法在此处投递的图片等内容；已停止。')
+      signal.throwIfAborted()
+      for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
+      run.step++
+      agent.phase.step = run.step
+      agent.session.append('step/start', { turn, step: run.step })
+      agent._bridgeStepOpen = true
+      run.stepPrepared = true
+      run.projection.step = run.step
+      accepted = true
+      this.diagnostics.event('step.prepared', { runId: run.runId, stage: 'pre-step' })
+      return { ...(blocks.length ? { additionalContexts: blocks.map(block => block.text) } : {}) }
+    } catch (error) {
+      run.preparationError = error
+      this.diagnostics.event('step.failed', { runId: run.runId, stage: 'pre-step', code: error.code ?? 'DSH_PRE_STEP_FAILED' })
+      throw error
+    } finally {
+      if (!accepted) {
+        // preStep claims from the durable inbox. Restore unsent context on a
+        // rejected configuration or cancellation, including newly found files.
+        const restore = [...pending, ...(decision?.messages ?? [])]
+          .filter(message => message.source.kind !== 'runtime-context')
+        const present = new Set(agent.inbox.nextStep.map(message => message.id))
+        for (const message of restore) if (!present.has(message.id)) {
+          agent.inbox.splice('next-step', agent.inbox.nextStep.length, 0, [message]); present.add(message.id)
+        }
+      }
+    }
+  }
+
+  async dispatchTool(params, context) {
+    // Assistant tool-use events must settle before DSH starts their tool cards.
+    await context.peer?.drainNotifications?.()
+    const run = this.runs.get(params?.runId)
+    if (!run || !run.toolNames.has(params.name) || typeof params.callId !== 'string') {
+      throw failure('UNADMITTED_TOOL', '工具不属于当前运行的能力集合。')
+    }
+    const advertised = run.projection.committedToolCalls.get(params.callId)
+    if (!advertised || advertised.name !== params.name) throw failure('TOOL_EVENT_UNCOMMITTED', '工具调用尚未在本地历史中登记，未执行。')
+    let parsed
+    try { parsed = JSON.parse(advertised.arguments) } catch { throw failure('TOOL_ARGUMENTS_INVALID', '模型声明的工具参数不是有效 JSON，未执行。') }
+    if (!isDeepStrictEqual(parsed, params.arguments)) throw failure('TOOL_ARGUMENTS_MISMATCH', '声明参数与实际工具参数不一致，未执行。')
+    if (run.calls.has(params.callId)) return run.calls.get(params.callId)
+    const operation = run.toolQueue.then(async () => {
+      const signal = AbortSignal.any([run.signal, context.signal])
+      signal.throwIfAborted()
+      if (run.concluded) return { content: [{ type: 'text', text: '当前工具已结束本轮，请直接给出最终回复。' }], isError: true }
+      const { agent, turn, step } = run
+      const previous = await this.state.previousTool(agent.id, params.callId)
+      if (previous && previous.runId !== run.runId) {
+        const call = agent.session.eventAt?.(previous.callSeq)
+        let original
+        try { original = JSON.parse(call?.data.arguments) } catch {}
+        if (previous.name !== params.name || !isDeepStrictEqual(original, params.arguments)) {
+          throw failure('TOOL_ARGUMENTS_MISMATCH', '恢复调用与原工具参数不一致，未执行。')
+        }
+        const result = agent.session.eventAt?.(previous.resultSeq)
+        if (call?.type !== 'tool/call' || call.data.callId !== params.callId
+          || !knownToolResult(result) || (result.data.message.toolCallId ?? result.data.message.source?.callId) !== params.callId) {
+          throw failure('UNKNOWN_TOOL_OUTCOME', '原工具结果仍未知，未重复执行。')
+        }
+        return { content: await toMcpContent(result.data.message.content, run.media), isError: Boolean(result.data.message.isError) }
+      }
+      await this.state.beginTool(agent.id, run.runId, params.callId, params.name,
+        createHash('sha256').update(advertised.arguments).digest('hex'))
+      const call = agent.session.append('tool/call', { turn, step, callId: params.callId, name: params.name,
+        // DSH's durable validator requires the exact advertised JSON string,
+        // including whitespace/key order. Execution uses the checked object.
+        arguments: advertised.arguments })
+      this.diagnostics.event('tool.started', { runId: run.runId, callId: params.callId, toolName: params.name })
+      const startedAt = Date.now()
+      let result
+      let dispatched = false
+      try {
+        await this.checkpoint(agent.session)
+        signal.throwIfAborted()
+        await this.state.markToolDispatched(agent.id, run.runId, params.callId, call.seq)
+        signal.throwIfAborted()
+        dispatched = true
+        result = await this.ctx.agents.withInitiator(agent, () => this.ctx.tools.execute({
+          callId: params.callId, name: params.name, arguments: params.arguments, agent, signal,
+        }))
+      } catch (error) {
+        if (!dispatched) {
+          await this.state.finishTool(agent.id, run.runId, params.callId, 'not-sent')
+          throw error
+        }
+        run.toolOutcomeUnknown = true
+        const unknownResult = agent.session.append('tool/result', { turn, step,
+          message: this.helpers.createToolResultMessage({ callId: params.callId, isError: true,
+            content: [{ type: 'text', text: UNKNOWN_TOOL_TEXT }] }),
+          meta: { claudeBridgeOutcome: 'unknown' },
+        }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+        await this.checkpoint(agent.session)
+        await this.state.finishTool(agent.id, run.runId, params.callId, 'unknown', unknownResult.seq)
+        this.diagnostics.event('tool.unknown', { runId: run.runId, callId: params.callId, toolName: params.name,
+          code: 'UNKNOWN_TOOL_OUTCOME', toolMayHaveExecuted: true, durationMs: Date.now() - startedAt })
+        throw error
+      }
+      const resultEvent = agent.session.append('tool/result', { turn, step,
+        message: this.helpers.createToolResultMessage({ callId: params.callId, content: result.content, isError: Boolean(result.isError) }),
+        ...(result.meta === undefined ? {} : { meta: result.meta }),
+        ...(result.error?.info ? { error: result.error.info } : {}),
+      }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+      try {
+        await this.checkpoint(agent.session)
+        await this.state.finishTool(agent.id, run.runId, params.callId, 'completed', resultEvent.seq)
+      } catch (error) { run.toolOutcomeUnknown = true; throw error }
+      const content = await toMcpContent(result.content, run.media)
+      const additionalContexts = []
+      if (result.isError === true && typeof result.error?.info?.code === 'string'
+        && /^[A-Z0-9_]{1,80}$/.test(result.error.info.code)) {
+        additionalContexts.push(`[桥接插件工具说明] ${params.name}（${params.callId}）返回错误码 ${result.error.info.code}。请依据实际工具结果调整做法；错误本身不能证明操作未生效。涉及先前副作用时先只读核实，并遵守用户停止和审批结果。`)
+      }
+      for (const additional of result.additionalContexts ?? []) {
+        const blocks = await toSdkPrompt([additional], run.media)
+        if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_TOOL_CONTEXT', '工具附加上下文含有当前无法转换的内容。')
+        additionalContexts.push(blocks.map(block => block.text).join('\n'))
+        agent.session.append('user/message', additional, { surfaceOp: 'append' })
+        this.diagnostics.event('tool.context_converted', { runId: run.runId, callId: params.callId, toolName: params.name })
+      }
+      if (result.concludesTurn) run.concluded = true
+      this.diagnostics.event('tool.completed', { runId: run.runId, callId: params.callId, toolName: params.name,
+        durationMs: Date.now() - startedAt, status: result.isError ? 'error' : 'ok' })
+      return { content, isError: Boolean(result.isError),
+        ...(additionalContexts.length ? { additionalContexts } : {}),
+        ...(result.concludesTurn ? { concludesTurn: true } : {}),
+      }
+    })
+    run.calls.set(params.callId, operation)
+    run.toolQueue = operation.then(() => {}, () => {})
+    return operation
+  }
+
+  async dispatchApproval(params, context) {
+    const run = this.runs.get(params?.runId)
+    if (!run) return { behavior: 'deny', message: '审批运行已结束。' }
+    // Tool permissions are enforced by the local DSH tool pipeline. Native SDK
+    // tools are not silently granted a second execution world.
+    if (params.toolName !== 'AskUserQuestion') return { behavior: 'deny', message: '请通过本机 DSH 工具执行。' }
+    return { behavior: 'deny', message: '请使用 DSH 的 ask_user_question 工具提出问题。' }
+  }
+
+  async dispose() {
+    if (this.disposing) return this.disposing
+    this.disposed = true
+    this.lifetime.abort()
+    this.disposing = (async () => {
+      try { if (this.connection) await this.connection.close() }
+      finally {
+        await Promise.allSettled([...this.runs.values()].map(run => run.toolQueue))
+        try { await this.state.flush() } finally { await this.diagnostics.flush() }
+      }
+    })()
+    return this.disposing
+  }
+}

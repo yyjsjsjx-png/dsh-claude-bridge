@@ -1,0 +1,29 @@
+# Template only: replace the file URL placeholders in an isolated desktop
+# profile. Do not copy this file into the user's existing profile.
+- id: agent-loop
+  disabled: true
+- id: session-controller
+  disabled: true
+- id: agent-preset-registry
+  disabled: true
+- insert:
+    - id: claude-agent-loop
+      name: '__AGENT_LOOP_URL__'
+      config:
+        agents: []
+    - id: claude-bridge
+      name: '__BRIDGE_SERVICE_URL__'
+      config:
+        transport: wss
+    - id: claude-session-controller
+      name: '__SESSION_CONTROLLER_URL__'
+    - id: claude-session-client
+      name: '__SESSION_CLIENT_URL__'
+    - id: claude-preset-registry
+      name: '__PRESET_REGISTRY_URL__'
+      config:
+        default: standard
+    - id: preset-claude-sdk-remote
+      name: '__PRESET_SERVICE_URL__'
+    - id: claude-bridge-ui
+      name: '__BRIDGE_UI_URL__'

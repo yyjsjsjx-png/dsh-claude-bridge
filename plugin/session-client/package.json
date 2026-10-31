@@ -1,0 +1,24 @@
+{
+  "name": "@deepseek-ai/dsh-api-session-controller",
+  "version": "0.2.1-rc.5",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "external": [
+        "@deepseek-ai/dsh-api-gateway/client"
+      ],
+      "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-client-file-upload"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}

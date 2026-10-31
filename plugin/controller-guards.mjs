@@ -1,0 +1,212 @@
+/** rc.5 controller wrappers. They act before the upstream mutating methods. */
+import {
+  CLAUDE_PRESET, EnginePolicyError, planSessionCreation, decodeRemoteCreationSelection,
+  assertModelForPreset, assertPresetUnchanged,
+} from './policy.mjs';
+
+function remoteFailure(RemoteError, code, message, data = {}) {
+  return new RemoteError(code, message, data);
+}
+
+function policyFailure(RemoteError, error, sessionId) {
+  if (!(error instanceof EnginePolicyError)) throw error;
+  throw remoteFailure(RemoteError, 'agent-preset/locked', error.message,
+    sessionId === undefined ? {} : { sessionId });
+}
+
+function checkedPreset(RemoteError, session, projected) {
+  const original = session?.header?.agentPreset;
+  if (typeof original !== 'string' || !original || projected !== original) {
+    throw remoteFailure(RemoteError, 'agent-preset/locked',
+      '会话创建预设与当前预设不一致，不能继续操作。', { sessionId: session?.id });
+  }
+  return original;
+}
+
+async function attachedAgent(controller, sessionId) {
+  const result = await controller.resolveAgent(sessionId);
+  if (result?.error) throw result.error;
+  if (!result?.agent?.session) throw new Error('无法解析会话智能体。');
+  return result.agent;
+}
+
+function presetForAgent(ctx, RemoteError, agent) {
+  return checkedPreset(RemoteError, agent.session,
+    ctx.sessionProjections.stateOf(agent.session, 'agentPreset'));
+}
+
+/** Read a preset without exposing or logging the session transcript. */
+async function existingPreset(ctx, RemoteError, sessionId) {
+  const attached = ctx.sessions.get(sessionId);
+  if (attached) return checkedPreset(RemoteError, attached,
+    ctx.sessionProjections.stateOf(attached, 'agentPreset'));
+  let observation;
+  try {
+    observation = await ctx.sessionQuery.observeSession(sessionId);
+  } catch (error) {
+    if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return undefined;
+    throw error;
+  }
+  try {
+    return checkedPreset(RemoteError, { id: sessionId, header: observation.header },
+      observation.projections?.values?.agentPreset);
+  } finally {
+    if (typeof observation[Symbol.asyncDispose] === 'function') await observation[Symbol.asyncDispose]();
+    else observation[Symbol.dispose]?.();
+  }
+}
+
+/** Restore a named remote blank without allowing upstream create to mint a new unselected Session. */
+async function restoreRemoteBlank(controller, ctx, RemoteError, input) {
+  const sessionId = input.sessionId;
+  if (sessionId === undefined) {
+    throw remoteFailure(RemoteError, 'session/model-unavailable', '创建远程 Claude 会话前必须选择模型。');
+  }
+  if (input.workspaceId !== undefined && input.cwd !== undefined) {
+    throw remoteFailure(RemoteError, 'gateway/bad-request', '工作区和目录不能同时指定。');
+  }
+  const workspace = input.workspaceId === undefined ? undefined : ctx.workspaceRegistry.get(input.workspaceId);
+  if (input.workspaceId !== undefined && workspace === undefined) {
+    throw remoteFailure(RemoteError, 'workspace/not-found', '无法找到指定工作区。', { workspaceId: input.workspaceId });
+  }
+  if (ctx.workspaceRegistry.archivedSessionIds.includes(sessionId)
+    || (workspace !== undefined && !workspace.sessionIds.includes(sessionId))) {
+    throw remoteFailure(RemoteError, 'session/model-unavailable', '原会话已归档或不属于该工作区，不能恢复为空白会话。', { sessionId });
+  }
+  const agent = await attachedAgent(controller, sessionId);
+  if (presetForAgent(ctx, RemoteError, agent) !== CLAUDE_PRESET) {
+    throw remoteFailure(RemoteError, 'agent-preset/locked', '原会话不是远程 Claude 会话。', { sessionId });
+  }
+  const cwd = workspace?.path ?? input.cwd;
+  if (cwd !== undefined && agent.session.header.cwd !== cwd) {
+    throw remoteFailure(RemoteError, 'session/model-unavailable', '原会话的工作目录与当前工作区不一致。', { sessionId });
+  }
+  const boundary = ctx.sessionProjections.stateOf(agent.session, 'turnBoundary');
+  if (boundary !== undefined && (boundary.openTurnStartSeq !== null || boundary.lastTurn !== 0)) {
+    throw remoteFailure(RemoteError, 'session/model-unavailable', '该会话已开始，不能作为新建会话复用。', { sessionId });
+  }
+  const state = ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
+  const selection = state?.pending ?? state?.lastUsed;
+  try { assertModelForPreset(CLAUDE_PRESET, selection); }
+  catch (error) {
+    if (!(error instanceof EnginePolicyError)) throw error;
+    throw remoteFailure(RemoteError, 'session/model-unavailable', '原远程会话没有有效的已选模型，不能恢复。', { sessionId });
+  }
+  return { sessionId, agentPreset: CLAUDE_PRESET };
+}
+
+/** Preserve every upstream Session API while guarding the public mutators. */
+export function makeGuardedSessionController(Base, RemoteError) {
+  return class GuardedSessionController extends Base {
+    static inject = [...new Set([...(Base.inject ?? []), 'agentPresets'])];
+
+    constructor(ctx, config, ...rest) {
+      super(ctx, config, ...rest);
+      this.bridgeContext = ctx;
+    }
+
+    async create(request) {
+      const ctx = this.bridgeContext;
+      const { initialModel: suppliedModel, ...input } = request;
+      let encodedModel;
+      try { encodedModel = decodeRemoteCreationSelection(input.agentPreset); }
+      catch (error) { policyFailure(RemoteError, error); }
+      if (encodedModel !== undefined && suppliedModel !== undefined) {
+        throw remoteFailure(RemoteError, 'gateway/bad-request', '创建会话的模型选择重复。');
+      }
+      const initialModel = encodedModel ?? suppliedModel;
+      let target = input.agentPreset ?? ctx.agentPresets.defaultId;
+      if (initialModel !== undefined) {
+        let plan;
+        try {
+          plan = planSessionCreation({ selection: initialModel, requestedPreset: input.agentPreset,
+            defaultPreset: ctx.agentPresets.defaultId });
+        } catch (error) { policyFailure(RemoteError, error); }
+        target = plan.preset;
+        // Check catalog and call controls before creating or reusing a session.
+        const models = await ctx.llm.listModels(plan.initialModel.provider);
+        if (!models.some(model => model.id === plan.initialModel.model)) {
+          throw remoteFailure(RemoteError, 'session/model-unavailable', '所选模型不在当前目录中。');
+        }
+        await ctx.llm.resolveCallConfig(plan.initialModel);
+      } else if (target === CLAUDE_PRESET) {
+        return restoreRemoteBlank(this, ctx, RemoteError, input);
+      }
+
+      // The rc.5 upstream can recompose an existing *cold* blank session in
+      // create(), bypassing select(). Only reuse an already matching preset.
+      if (input.sessionId !== undefined) {
+        const current = await existingPreset(ctx, RemoteError, input.sessionId);
+        if (current !== target) delete input.sessionId;
+      }
+      const created = await super.create({ ...input, agentPreset: target });
+      if (created.agentPreset !== target) {
+        throw remoteFailure(RemoteError, 'agent-preset/locked', '创建结果的会话预设不一致。',
+          { sessionId: created.sessionId });
+      }
+      if (initialModel !== undefined) {
+        try {
+          await this.selectModel({ sessionId: created.sessionId, ...initialModel });
+        } catch (error) {
+          // The upstream has already published this identity; never imply it
+          // was rolled back, or silently use a different model.
+          throw remoteFailure(RemoteError, 'session/model-unavailable',
+            '会话已创建，但初始模型未能写入；请检查模型或新建会话。', { sessionId: created.sessionId });
+        }
+      }
+      return created;
+    }
+
+    async selectModel(request) {
+      const agent = await attachedAgent(this, request.sessionId);
+      const preset = presetForAgent(this.bridgeContext, RemoteError, agent);
+      try { assertModelForPreset(preset, request); }
+      catch (error) { policyFailure(RemoteError, error, request.sessionId); }
+      return super.selectModel(request);
+    }
+
+    async prompt(request, signal) {
+      const ctx = this.bridgeContext;
+      const agent = await attachedAgent(this, request.sessionId);
+      const preset = presetForAgent(ctx, RemoteError, agent);
+      const state = ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
+      if (state === undefined) throw new Error('模型选择投影尚未就绪。');
+      const header = agent.session.requestHeader();
+      const selection = state.pending ?? header?.config ?? ctx.agentDefaultModel.currentSelection();
+      if (preset === CLAUDE_PRESET && state.pending === null && header === undefined) {
+        throw remoteFailure(RemoteError, 'session/model-unavailable', '远程会话尚未记录初始模型。',
+          { sessionId: request.sessionId });
+      }
+      try { assertModelForPreset(preset, selection); }
+      catch (error) { policyFailure(RemoteError, error, request.sessionId); }
+      return super.prompt(request, signal);
+    }
+
+    async fork(request) {
+      const agent = await attachedAgent(this, request.sessionId);
+      if (presetForAgent(this.bridgeContext, RemoteError, agent) === CLAUDE_PRESET) {
+        throw remoteFailure(RemoteError, 'session/fork-unavailable',
+          '远程 Claude 会话不支持分叉，请新建会话。', { sessionId: request.sessionId });
+      }
+      return super.fork(request);
+    }
+  };
+}
+
+/** Lock preset changes from creation, including before the first turn. */
+export function makeLockedPresetRegistry(Base, RemoteError) {
+  return class LockedPresetRegistry extends Base {
+    constructor(ctx, config, ...rest) {
+      super(ctx, config, ...rest);
+      this.bridgeContext = ctx;
+    }
+
+    async select(agent, requestedPreset) {
+      const current = presetForAgent(this.bridgeContext, RemoteError, agent);
+      try { assertPresetUnchanged(current, requestedPreset); }
+      catch (error) { policyFailure(RemoteError, error, agent.id); }
+      // Re-selecting the same preset is a no-op; do not recompose or append.
+      return current;
+    }
+  };
+}

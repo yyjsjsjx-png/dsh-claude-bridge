@@ -1,0 +1,17 @@
+node_modules/
+.local/
+*.log
+*.env
+!*.env.example
+sessions/
+claude-config/
+private/
+runtime/
+backups/
+validation/
+id_ed25519*
+known_hosts
+connection.json
+ssh.json
+*.pem
+*.key

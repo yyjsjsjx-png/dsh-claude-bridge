@@ -1,0 +1,28 @@
+# DSH 0.2.1-rc.5 bundle. Enable in a dedicated profile.
+- id: agent-loop
+  disabled: true
+- id: session-controller
+  disabled: true
+- id: agent-preset-registry
+  disabled: true
+- insert:
+    - id: claude-agent-loop
+      name: '../plugin/compat/agent-loop.mjs'
+      config:
+        agents: []
+    - id: claude-bridge
+      name: '../plugin/index.mjs'
+      config:
+        transport: wss
+    - id: claude-session-controller
+      name: '../plugin/session-controller.mjs'
+    - id: claude-session-client
+      name: '../plugin/session-client/index.mjs'
+    - id: claude-preset-registry
+      name: '../plugin/preset-registry.mjs'
+      config:
+        default: standard
+    - id: preset-claude-sdk-remote
+      name: '../plugin/preset-service.mjs'
+    - id: claude-bridge-ui
+      name: '../plugin/ui/index.mjs'

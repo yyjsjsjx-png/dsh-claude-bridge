@@ -1,0 +1,31 @@
+# DSH Claude Bridge managed service
+[Unit]
+Description=DSH Claude Agent SDK bridge
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+Environment=HOME=__HOME__
+Environment=BRIDGE_REMOTE_ROOT=__ROOT__
+Environment=BRIDGE_PORT=__PORT__
+Environment=BRIDGE_TOKEN_FILE=__TOKEN_FILE__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/runtime/bin/node __ROOT__/remote/server.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=12
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__ROOT__/sessions __ROOT__/claude-config
+
+[Install]
+WantedBy=multi-user.target
