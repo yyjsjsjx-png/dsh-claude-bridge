@@ -22,10 +22,10 @@
 
 由服务器管理员先准备独立非 root 用户，例如 `bridge`，以及供账号所有者完成官方交互登录的服务器桌面环境。不要复用其他 Claude、网关或日常服务的账号目录。以下下载、依赖安装、生成口令和登录操作均以该服务用户执行；systemd 安装命令才使用管理员权限。
 
-从 [v0.2.1 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.2) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
+从[最新正式版发布页](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/latest)下载并解压插件包，或用已有 Git 获取 `latest` 正式版标签源码，放到独立目录：
 
 ```sh
-git clone --branch v0.2.2 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
+git clone --branch latest --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
 cd /home/bridge/dsh-claude-bridge
 chmod 700 /home/bridge/dsh-claude-bridge
 ```

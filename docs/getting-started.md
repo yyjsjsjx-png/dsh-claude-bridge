@@ -17,7 +17,7 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 | 本机 | 自己的服务器 |
 | --- | --- |
 | DSH Desktop，实测基线 `0.2.1-rc.5` | Linux VPS、独立非 root 服务用户及独立部署目录 |
-| `v0.2.2` 插件 | Node.js `>=24.9`、npm、锁定 SDK `0.3.314` |
+| 最新正式版插件 | Node.js `>=24.9`、npm、锁定 SDK `0.3.314` |
 | 无需安装 Claude Code 或 SDK | 官方 CLI `2.1.314` 和本人具备使用权限的 `claude.ai` 登录 |
 
 上表是本项目的要求及维护者实测范围，不是最新版声明，也不构成兼容性承诺。DSH 其他版本会按实际接口能力检查，仍需确认使用效果；服务器 SDK/CLI 不应静默升级。
@@ -34,13 +34,13 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 ## 安装插件并连接
 
 1. 安装并打开 DSH。若本机已有日常数据，用独立配置和数据目录试用，不改动其他插件和既有会话。
-2. 在“插件 → 添加插件”填入固定标签：
+2. 在“插件 → 添加插件”填入最新正式版入口：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.2
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#latest
    ```
 
-   如果 GitHub 安装路径不可用，从 [v0.2.1 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.2.2) 下载插件 ZIP，解压后添加其中包含 `package.json` 的目录。启用 bundle，并按 DSH 提示重载。Release 已包含运行文件，无需编译。
+   `latest` 指向最新正式版；需要固定版本时改用对应的 `vX.Y.Z` 标签。如果 GitHub 安装路径不可用，从[最新正式版发布页](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/latest)下载插件 ZIP，解压后添加其中包含 `package.json` 的目录。启用 bundle，并按 DSH 提示重载。Release 已包含运行文件，无需编译。
 3. 打开“设置 → 远程会话”，填写自己的服务器地址和桥接口令，保存后点击“测试连接并刷新模型”。这一步核对连接、官方登录及目录，不发送聊天提示词。
 4. 在会话首页点“新建远程会话”，选择账号目录实际返回的明确模型和受支持强度，再创建会话。不要依赖未知账号默认模型；普通原生“新会话”也不等价于此专用入口。
 5. 先用一条简短消息确认实际回复和本机工具权限。开始真实对话及工具任务会消耗你自己的 Claude 账号额度；模型目录成功不能代替对话验收。
@@ -57,7 +57,7 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 
 也可完全退出 DSH 后使用 [PowerShell 一行在线更新](updating.md#powershell-一行更新)，无需手动下载或解压。
 
-1. 下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.2/dsh-claude-bridge-0.2.2.zip)，解压到 DSH 数据目录以外。
+1. 从[最新正式版发布页](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/latest)下载插件 ZIP，解压到 DSH 数据目录以外。
 2. 等当前任务结束，完全退出 DSH，包括托盘程序。
 3. 双击包根目录的 **`更新插件.cmd`**。结果窗口会保留；仅在 Windows 确实要求提升权限时请求 UAC，提权前确定的目标目录不变。拒绝 UAC 会明确提示未执行，安装失败不会自动重复执行。
 4. 看到成功版本后，按回车关闭窗口并重启 DSH，核对插件版本及原会话。
@@ -92,7 +92,7 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 | TLS 正常但认证失败 | 核对桥接口令；若提示 `AUTH_REQUIRED` / `AUTH_EXPIRED`，由本人在服务器原配置目录重新登录 Claude |
 | `AUTH_METHOD_UNSUPPORTED` | 服务器当前不是本人 claude.ai 订阅登录；本版本暂不支持 API Key 等其他登录方式 |
 | 目录无模型或强度不可用 | 刷新账号目录并选择实际返回值；没有特定型号时不猜测或强制使用默认型号 |
-| 更新报旧 GitHub 包的 `ERR_PNPM_NO_OFFLINE_TARBALL` | 换用 v0.2.0 完整更新包并双击更新，不下载旧压缩包来填缓存，不关闭离线模式 |
+| 更新报旧 GitHub 包的 `ERR_PNPM_NO_OFFLINE_TARBALL` | 使用一行更新命令，或最新完整更新包的双击入口，不下载旧压缩包来填缓存，不关闭离线模式 |
 | 更新失败 | 保留窗口显示的备份与实际 `pnpm.log` 路径；安装日志和外层 `.err` 是两层不同文件 |
 | 工具显示“待核实” | 先核对文件、进程或外部状态；不要把“没有回执”当成“没有执行” |
 | 运行中发消息却未立刻照做 | hook 附加上下文的响应由模型决定；需要结束当前操作时使用停止按钮 |

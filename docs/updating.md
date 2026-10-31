@@ -25,7 +25,7 @@
 ## Windows Desktop
 
 1. 等待任务结束，完全退出 DSH，包括托盘中的程序。
-2. 下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.2/dsh-claude-bridge-0.2.2.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
+2. 从[最新正式版发布页](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/latest)下载插件 ZIP，解压到下载或文档目录，放在 DSH 配置目录以外。
 3. 双击包根目录的 **`更新插件.cmd`**。更新结果窗口会保留；Windows 确实要求提升权限时才请求管理员 UAC，提权前确定的安装位置、配置和数据目录保持不变。取消 UAC 时会明确提示本次更新未执行。
 4. 看到版本更新成功后，按回车关闭更新窗口，再启动 DSH。在插件页核对目标版本，再打开原会话继续使用。
 

@@ -43,10 +43,10 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.2
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#latest
    ```
 
-   也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
+   `latest` 指向最新正式版，不跟随开发分支。也可从[最新正式版发布页](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/latest)下载插件 ZIP，解压后添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
 3. 在 **设置 → 远程会话** 保存你在自己服务器上部署的 **`wss://…` 地址**和你自己生成的**桥接口令**，点击“测试连接并刷新模型”。公网 WSS 直接连接，不需要 SSH、密钥文件或额外启动脚本。
 4. 在会话首页点击“新建远程会话”，选择账号实际返回的模型与推理强度，再开始对话。之后默认沿用上次成功选择；型号或强度不可用时回退为重新选择或模型默认强度。
 
@@ -56,7 +56,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/yyjsjsjx-png/dsh-claude-bridge/main/scripts/update-online.ps1').TrimStart([char]0xFEFF)))
 ```
 
-也可下载 [v0.2.1 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.2.2/dsh-claude-bridge-0.2.2.zip)，解压后双击 **`更新插件.cmd`**。请保留安装目录。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
+也可在[最新正式版发布页](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/latest)下载插件 ZIP，解压后双击 **`更新插件.cmd`**。请保留安装目录。自定义路径、备份及失败处理见 [更新说明](docs/updating.md)。
 
 设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销你其他设备上保存的同一口令。
 
@@ -72,8 +72,10 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.2.2
+dsh plugin --profile your-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#latest
 ```
+
+`latest` 随正式版发布维护；需要固定版本时可将它换成对应的 `vX.Y.Z` 标签。已有安装仍需执行更新命令升级，不会在启动时自动替换插件。
 
 ## 版本说明
 
@@ -136,6 +138,8 @@ npm test
 ```
 
 ASAR 专用检查使用已有 DSH Electron 的 Node 模式。
+
+维护者发布正式版后，使用已授权的 GitHub CLI 执行 `node scripts/update-latest-tag.mjs`，将 `latest` 标签同步到 GitHub 最新正式版。脚本核对版本与提交，仅更新 `latest`，不修改固定版本标签。
 
 开发用隔离 Host 可用 `node scripts/launch-isolated.mjs <DSH-resources目录> --ssh-target <已有SSH别名>` 启动，数据保存在本项目 `.local/harness`。该目录内的数据须保密。
 
