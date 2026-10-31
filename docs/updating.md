@@ -5,13 +5,13 @@
 ## Windows Desktop
 
 1. 等待任务结束，完全退出 DSH，包括托盘中的程序。
-2. 下载 [v0.1.4 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.4/dsh-claude-bridge-0.1.4.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
+2. 下载 [v0.1.5 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.5/dsh-claude-bridge-0.1.5.zip)，解压到下载或文档目录，放在 DSH 配置目录以外。
 3. 双击包根目录的 **`更新插件.cmd`**。更新结果窗口会保留；Windows 确实要求提升权限时才请求管理员 UAC，提权前确定的安装位置、配置和数据目录保持不变。取消 UAC 时会明确提示本次更新未执行。
 4. 看到版本更新成功后，按回车关闭更新窗口，再启动 DSH。在插件页核对目标版本，再打开原会话继续使用。
 
 脚本使用现有 DSH 自带的 Electron、pnpm 和官方插件管理接口，以离线本地包替换同名插件；不安装新的工具链，不执行包生命周期脚本，不自动启动或终止 DSH。**请保留解压目录，更新后不要移动或删除它**，包管理器可能保留对本地目录的引用。运行中的配置会被拒绝更新。
 
-从 GitHub 安装的旧版本更新时，更新器使用带包名的 `dsh-claude-bridge@link:本地目录` 替换依赖。若旧更新器报 `ERR_PNPM_NO_OFFLINE_TARBALL` 并指向旧 GitHub 压缩包，请换用 v0.1.4 完整更新包再运行；无需下载旧版本或关闭离线模式。安装阶段失败时，脚本会直接显示错误摘要和实际 `pnpm.log` 路径；不要把该日志与更新器外层 `.err` 混淆。安装失败不会触发自动提权或重试。
+从 GitHub 安装的旧版本更新时，更新器使用带包名的 `dsh-claude-bridge@link:本地目录` 替换依赖。若旧更新器报 `ERR_PNPM_NO_OFFLINE_TARBALL` 并指向旧 GitHub 压缩包，请换用 v0.1.5 完整更新包再运行；无需下载旧版本或关闭离线模式。安装阶段失败时，脚本会直接显示错误摘要和实际 `pnpm.log` 路径；不要把该日志与更新器外层 `.err` 混淆。安装失败不会触发自动提权或重试。
 
 ## 高级命令行
 

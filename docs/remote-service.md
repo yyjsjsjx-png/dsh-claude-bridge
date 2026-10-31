@@ -8,7 +8,7 @@
 
 | 组件 | 本项目要求或实测基线 |
 | --- | --- |
-| 客户端插件 | `v0.1.4` |
+| 客户端插件 | `v0.1.5` |
 | DSH Desktop | 实测 `0.2.1-rc.5`，其他版本按接口能力检查，仍需实际确认 |
 | 服务器 Node.js | `>=24.9`，须准备可独立执行的 Node 和 npm |
 | Claude Agent SDK | 锁定 `0.3.314` |
@@ -20,10 +20,10 @@
 
 由服务器管理员先准备独立非 root 用户，例如 `bridge`，以及供账号所有者完成官方交互登录的服务器桌面环境。不要复用其他 Claude、网关或日常服务的账号目录。以下下载、依赖安装、生成口令和登录操作均以该服务用户执行；systemd 安装命令才使用管理员权限。
 
-从 [v0.1.4 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.1.4) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
+从 [v0.1.5 Release](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/tag/v0.1.5) 解压插件包，或用已有 Git 获取固定标签源码，放到独立目录：
 
 ```sh
-git clone --branch v0.1.4 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
+git clone --branch v0.1.5 --depth 1 https://github.com/yyjsjsjx-png/dsh-claude-bridge.git /home/bridge/dsh-claude-bridge
 cd /home/bridge/dsh-claude-bridge
 chmod 700 /home/bridge/dsh-claude-bridge
 ```
@@ -111,10 +111,12 @@ stat -c '%U %a %n' private/service-token
 | `BRIDGE_TOKEN_FILE` | 私有桥接口令文件的绝对路径 |
 | `BRIDGE_CLAUDE_PATH` | 可选，固定版本 CLI 的绝对路径 |
 | `BRIDGE_CLAUDE_VERSION` | 默认 `2.1.314`；升级须重新验证兼容性 |
-| `BRIDGE_MAX_BUDGET_USD` | SDK 每轮费用估算上限，默认 `0.15`；不是订阅剩余额度 |
+| `BRIDGE_MAX_BUDGET_USD` | 可选，明确配置正数时才向 SDK 设置美元费用估算上限；不配置或留空默认不设额外美元预算。不是订阅剩余额度 |
 | `BRIDGE_WORKER_PATH` | 可选，独立 worker 的绝对路径 |
 
 worker 仅接收必要的白名单配置，不继承桥接口令；CLI/SDK 版本不匹配会拒绝启动。每台设备独立 worker，会话绑定校验设备、工作区、系统提示摘要和原生 session ID。
+
+v0.1.4 及更早版本曾默认设置每轮 0.15 美元上限，这是开发阶段遗留配置，可能在已输出正文后仍以 `BUDGET_EXHAUSTED` 结束。v0.1.5 默认不再向 SDK 传入 `maxBudgetUsd`。升级时等待活动任务结束，更新远端源码后重启自己的 systemd 服务；保留 `sessions`、`claude-config`、`private` 和已有运行依赖。若单元或环境文件曾明确配置 `BRIDGE_MAX_BUDGET_USD`，须同时移除该配置才会停用它。仅更新 DSH 插件不能修复仍运行旧代码的服务器。
 
 命令行入口 `remote/server.mjs` 不提供 host 参数，也不读取 `BRIDGE_HOST`，始终监听 `127.0.0.1`。不要将修改该环境变量当成开放公网的方式。上表列出的配置通过 systemd 的 `Environment=` 设置；默认 CLI 路径不同时，额外增加 `Environment=BRIDGE_CLAUDE_PATH=/自己的绝对路径/2.1.314`。
 
@@ -205,7 +207,7 @@ Windows 脚本按当前用户限制私钥权限，保持转发并退避重连。
 | `AUTH_REQUIRED` / `AUTH_EXPIRED` | 账号所有者在同一服务用户、同一 `claude-config` 目录重新完成官方登录 |
 | `SDK_VERSION_MISMATCH` / `CLI_VERSION_MISMATCH` | 核对锁定 SDK 和固定 CLI 绝对路径，不直接升级依赖来消除报错 |
 | `MODEL_UNAVAILABLE` / `EFFORT_UNSUPPORTED` | 刷新账号目录，选择实际返回的明确模型及受支持强度 |
-| `BUDGET_EXHAUSTED` | 本轮达到服务配置的 SDK 费用估算上限；与订阅剩余额度不是同一个值 |
+| `BUDGET_EXHAUSTED` | 检查是否明确配置了 SDK 美元预算；默认不设。SDK 已输出正文后仍可能报告预算终态，与订阅剩余额度不是同一个值 |
 | 连接后仍无模型目录或 RPC 关闭 | 检查自己服务器 worker 的简短启动错误；主服务 active 只证明监听进程存在 |
 | 工具结果待核实 | 先检查实际文件、进程或外部状态，再决定是否重做；不能凭超时推断未执行 |
 

@@ -8,6 +8,8 @@
 
 第一次使用请从 [首次使用与自部署指南](docs/getting-started.md) 开始；服务器安装与配置见 [远程服务部署](docs/remote-service.md)。公共源码不附带账号、服务地址或访问口令。
 
+v0.1.5 移除了开发阶段遗留的每轮 0.15 美元费用估算上限。默认不设置额外的 SDK 美元预算；它与 Claude 订阅剩余额度无关。已有服务器须更新远端代码并重启服务，仅更新客户端不会改变服务器行为。
+
 ## 兼容版本
 
 | 组件 | 版本 |
@@ -26,14 +28,14 @@
 2. 在 **插件 → 添加插件** 中填入：
 
    ```text
-   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.4
+   https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.5
    ```
 
    也可解压 Release 的插件 ZIP，添加其中**包含 package.json 的目录**。启用 bundle，按 DSH 提示重载。
 3. 在 **设置 → 远程 Claude** 保存服务提供方给出的 **`wss://…` 服务器地址**和**独立桥接口令**，点击“测试连接并刷新模型”。公网 WSS 直接连接，不需要 SSH、密钥文件或额外启动脚本。
 4. 在会话首页点击“新建远程 Claude”，选择账号实际返回的模型与推理强度，再开始对话。之后默认沿用上次成功选择；型号或强度不可用时回退为重新选择或模型默认强度。
 
-已有安装可保留数据原地升级，无须还原快照。下载 [v0.1.4 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.4/dsh-claude-bridge-0.1.4.zip)，解压并完全退出 DSH，双击包根目录的 **`更新插件.cmd`**。结果窗口会保留，Windows 确实要求管理员权限时才请求 UAC。请保留解压目录。自定义路径、高级命令行、备份及失败处理见 [更新说明](docs/updating.md)。
+已有安装可保留数据原地升级，无须还原快照。下载 [v0.1.5 插件 ZIP](https://github.com/yyjsjsjx-png/dsh-claude-bridge/releases/download/v0.1.5/dsh-claude-bridge-0.1.5.zip)，解压并完全退出 DSH，双击包根目录的 **`更新插件.cmd`**。结果窗口会保留，Windows 确实要求管理员权限时才请求 UAC。请保留解压目录。自定义路径、高级命令行、备份及失败处理见 [更新说明](docs/updating.md)。
 
 设置页的“清除已保存连接”会关闭本机桥接连接，删除保存的服务器地址和桥接口令，清空未保存的口令草稿。会话历史、设备身份和服务器上的 Claude 登录保留；重新填写原连接后可继续原会话。执行任务或同步历史时需先等待结束。此操作不会撤销其他设备持有的同一口令。
 
@@ -51,7 +53,7 @@
 现有 DSH CLI 也可执行：
 
 ```sh
-dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.4
+dsh plugin --profile your-test-profile add https://github.com/yyjsjsjx-png/dsh-claude-bridge#v0.1.5
 ```
 
 ## 已实现

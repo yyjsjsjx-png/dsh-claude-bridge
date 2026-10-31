@@ -340,8 +340,17 @@ async function readMetadata(path) {
   }
 }
 
+/** An optional operator setting; an omitted/blank value adds no SDK dollar cap. */
+export function parseServiceBudget(value) {
+  if (value === undefined || (typeof value === 'string' && !value.trim())) return undefined
+  if (typeof value !== 'string') throw new TypeError('预算配置必须是正数文本')
+  const limit = Number(value)
+  if (!Number.isFinite(limit) || limit <= 0) throw new TypeError('预算配置必须是正数')
+  return limit
+}
+
 /** Create handlers for one private stdio worker. Dependencies are injected for offline tests. */
-export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd = 0.15, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000 }) {
+export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000 }) {
   if (!sdk || typeof sdk.query !== 'function' || typeof sdk.tool !== 'function'
     || typeof sdk.createSdkMcpServer !== 'function' || typeof sdk.getSessionInfo !== 'function') {
     throw new TypeError('SDK 接口不完整')
@@ -353,7 +362,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   if (authorizedDeviceId !== undefined && (typeof authorizedDeviceId !== 'string' || !SESSION_ID.test(authorizedDeviceId))) {
     throw new TypeError('已认证的 deviceId 必须是 UUID')
   }
-  if (typeof maxBudgetUsd !== 'number' || !Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) {
+  if (maxBudgetUsd !== undefined && (typeof maxBudgetUsd !== 'number' || !Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0)) {
     throw new TypeError('服务预算上限必须是正数')
   }
   if (!Number.isSafeInteger(toolEventTimeoutMs) || toolEventTimeoutMs < 1 || toolEventTimeoutMs > 60_000) {
@@ -424,7 +433,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         toolConclusionViaPostHook: true,
         stepPreparationViaBatchHook: true,
         maxPromptBytes: MAX_PROMPT_BYTES,
-        maxBudgetUsd,
+        ...(maxBudgetUsd === undefined ? {} : { maxBudgetUsd }),
       },
     }
   }
@@ -530,7 +539,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       if (params.model !== undefined) requireString(params.model, 'model', 256)
       if (params.effort !== undefined) requireString(params.effort, 'effort', 64)
       if (params.maxBudgetUsd !== undefined && (typeof params.maxBudgetUsd !== 'number'
-        || !Number.isFinite(params.maxBudgetUsd) || params.maxBudgetUsd <= 0 || params.maxBudgetUsd > maxBudgetUsd)) {
+        || !Number.isFinite(params.maxBudgetUsd) || params.maxBudgetUsd <= 0
+        || (maxBudgetUsd !== undefined && params.maxBudgetUsd > maxBudgetUsd))) {
         throw new WorkerError('BUDGET_LIMIT_EXCEEDED', '请求预算无效或超过服务上限')
       }
       if (params.maxTurns !== undefined && (!Number.isSafeInteger(params.maxTurns) || params.maxTurns < 1 || params.maxTurns > 1000)) {
@@ -877,7 +887,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           // The SDK catalog is the authority for adaptive support. On supported
           // models ask for Anthropic's summary, never the raw thinking trace.
           ...(selectedModel.supportsAdaptiveThinking === true ? { thinking: { type: 'adaptive', display: 'summarized' } } : {}),
-          maxBudgetUsd: params.maxBudgetUsd ?? maxBudgetUsd,
+          ...((params.maxBudgetUsd ?? maxBudgetUsd) === undefined ? {} : { maxBudgetUsd: params.maxBudgetUsd ?? maxBudgetUsd }),
           ...(compact ? { maxTurns: 1 } : params.maxTurns === undefined ? {} : { maxTurns: params.maxTurns }),
           canUseTool: (toolName, input, options) => trackCallback((async () => {
             if (controller.signal.aborted) return { behavior: 'deny', message: '请求已取消' }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join, dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createWorkerHandlers } from '../remote/runtime.mjs'
+import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
 import { createAuthReader } from '../remote/auth.mjs'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
@@ -294,7 +294,8 @@ test('流式输入、DSH 提示词、工具 ID、审批和诊断保留边界', a
   assert.equal(Object.hasOwn(options.env, 'ANTHROPIC_API_KEY'), false)
   assert.equal(options.sessionId, SESSION)
   assert.equal(Object.hasOwn(options, 'model'), false)
-  assert.equal(options.maxBudgetUsd, 0.15)
+  assert.equal(Object.hasOwn(options, 'maxBudgetUsd'), false)
+  assert.equal(Object.hasOwn(options, 'maxTurns'), false)
   assert.equal(f.state.requests[0].params.callId, 'toolu_1')
   assert.deepEqual(f.state.requests[0].params.arguments, { cwd: 'D:\\project', command: 'Get-Location' })
   assert.equal(f.state.requests.some((request) => request.method === 'approval.request'), false)
@@ -411,14 +412,53 @@ test('模型目录只读取初始化结果，严格检查模型和推理档位',
   assert.equal(f.state.catalogQueries.length, 1)
 })
 
-test('预算越限或默认模型无法确认时不发推理请求', async (t) => {
+test('明确配置预算后越限或默认模型无法确认时不发推理请求', async (t) => {
   const f = await fixture(t, async function* () { throw new Error('should not run') })
-  const overBudget = await f.worker.handlers.query({ ...f.params, maxBudgetUsd: 0.2 }, f.context)
+  const capped = createWorkerHandlers({ ...f.config, maxBudgetUsd: 0.15 })
+  const overBudget = await capped.handlers.query({ ...f.params, maxBudgetUsd: 0.2 }, f.context)
   assert.equal(overBudget.code, 'BUDGET_LIMIT_EXCEEDED')
   delete f.state.models[0].resolvedModel
   const unknown = await f.worker.handlers.query({ ...f.params, runId: 'run-unknown' }, f.context)
   assert.equal(unknown.code, 'DEFAULT_MODEL_UNRESOLVED')
   assert.equal(f.state.queries.length, 0)
+})
+
+test('未配置美元预算时不广告或传递上限，超过旧测试值的成功结果仍正常完成', async t => {
+  const f = await fixture(t, async function* (_request, state) {
+    state.exists = true
+    yield { type: 'assistant', message: { content: [{ type: 'text', text: '合成完整答复' }] } }
+    yield { type: 'result', subtype: 'success', session_id: SESSION, total_cost_usd: 3.5 }
+  })
+  const initialized = await f.worker.handlers.initialize({ protocolVersion: 1 })
+  assert.equal(Object.hasOwn(initialized.capabilities, 'maxBudgetUsd'), false)
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.status, 'completed')
+  assert.equal(result.metrics.cost.usd, 3.5)
+  assert.equal(Object.hasOwn(f.state.queries[0].options, 'maxBudgetUsd'), false)
+  assert.equal(Object.hasOwn(f.state.queries[0].options, 'maxTurns'), false)
+  const requested = await f.worker.handlers.query({ ...f.params, runId: 'explicit-budget', resume: true, maxBudgetUsd: 2 }, f.context)
+  assert.equal(requested.status, 'completed')
+  assert.equal(f.state.queries[1].options.maxBudgetUsd, 2)
+})
+
+test('服务预算仅接受显式正数配置，空配置不恢复测试默认值', () => {
+  for (const value of [undefined, '', '  ']) assert.equal(parseServiceBudget(value), undefined)
+  assert.equal(parseServiceBudget('2.5'), 2.5)
+  for (const value of ['0', '-1', 'NaN', 'Infinity', 'bad', null]) assert.throws(() => parseServiceBudget(value), TypeError)
+})
+
+test('明确配置预算后SDK在正文后返回预算错误仍如实报告，不把失败伪装成成功', async t => {
+  const f = await fixture(t, async function* () {
+    yield { type: 'assistant', message: { content: [{ type: 'text', text: '合成已输出正文' }] } }
+    yield { type: 'result', subtype: 'error_max_budget_usd', session_id: SESSION }
+  })
+  const capped = createWorkerHandlers({ ...f.config, maxBudgetUsd: 1 })
+  assert.equal((await capped.handlers.initialize({ protocolVersion: 1 })).capabilities.maxBudgetUsd, 1)
+  const result = await capped.handlers.query(f.params, f.context)
+  assert.equal(result.status, 'failed')
+  assert.equal(result.code, 'BUDGET_EXHAUSTED')
+  assert.equal(f.state.queries[0].options.maxBudgetUsd, 1)
+  assert.ok(f.state.notifications.some(item => item.method === 'sdk.message' && item.params.message.type === 'assistant'))
 })
 
 test('恢复会话必须匹配系统提示基线；旧基线缺失不猜测', async (t) => {

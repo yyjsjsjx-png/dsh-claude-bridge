@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { createRpcPeer } from '../src/rpc.mjs'
-import { createWorkerHandlers } from './runtime.mjs'
+import { createWorkerHandlers, parseServiceBudget } from './runtime.mjs'
 
 const execFileAsync = promisify(execFile)
 const expectedSdkVersion = '0.3.314'
@@ -34,8 +34,9 @@ async function main() {
   if (absolutePath(process.env.CLAUDE_CONFIG_DIR, 'CONFIG_INVALID') !== configDir) throw new StartupError('CONFIG_MISMATCH')
   const expectedCliVersion = process.env.BRIDGE_CLAUDE_VERSION ?? defaultCliVersion
   if (!/^\d+\.\d+\.\d+$/.test(expectedCliVersion)) throw new StartupError('CLI_VERSION_INVALID')
-  const maxBudgetUsd = process.env.BRIDGE_MAX_BUDGET_USD === undefined ? 0.15 : Number(process.env.BRIDGE_MAX_BUDGET_USD)
-  if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) throw new StartupError('BUDGET_INVALID')
+  let maxBudgetUsd
+  try { maxBudgetUsd = parseServiceBudget(process.env.BRIDGE_MAX_BUDGET_USD) }
+  catch { throw new StartupError('BUDGET_INVALID') }
   const cliPath = absolutePath(process.env.BRIDGE_CLAUDE_PATH
     ?? join(homeDir, '.local/share/claude/versions', expectedCliVersion), 'CLI_PATH_INVALID')
 
