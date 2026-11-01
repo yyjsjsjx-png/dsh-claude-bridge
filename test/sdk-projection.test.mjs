@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import { SdkProjection } from '../src/sdk-projection.mjs'
 import { HISTORY_ASSISTANT } from '../src/history-records.mjs'
@@ -10,6 +12,85 @@ import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
 // The ordinary Node test suite skips these cases if its ASAR reader is absent.
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
+
+test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订阅逐增量抵达客户端', { skip: !available, timeout: 5000 }, async t => {
+  const f = await fixture()
+  const controllerUrl = resolveDshModule('@deepseek-ai/dsh-api-session-controller')
+  const require = createRequire(controllerUrl)
+  const load = name => import(pathToFileURL(require.resolve(name)).href)
+  const [{ Context }, { agentEvents }, { createScope }, sessionModule, { Deque }, { SessionQueryError }]
+    = await Promise.all([load('@deepseek-ai/cordis'), load('@deepseek-ai/dsh-agent'),
+      load('@deepseek-ai/dsh-scope'), load('@deepseek-ai/dsh-session'),
+      load('@deepseek-ai/dsh-deque'), load('@deepseek-ai/dsh-session-query')])
+  const ctx = new Context()
+  const source = await readFile(new URL(controllerUrl), 'utf8')
+  const region = name => {
+    const start = source.indexOf(`//#region ${name}`), end = source.indexOf('//#endregion', start)
+    assert.ok(start >= 0 && end > start)
+    return source.slice(start, end)
+  }
+  // Execute the installed private follow implementation, with its real Cordis
+  // event routing; no Host, persistence, auth or model service is started.
+  const { SessionHistoryController } = vm.runInNewContext([
+    region('lib/types/assistant-stream.js'), region('lib/types/history.js'),
+    '({ SessionHistoryController })',
+  ].join('\n'), { AssistantStreamAccumulator: f.helpers.AssistantStreamAccumulator,
+    ...sessionModule, Deque, SessionQueryError, RemoteError: f.helpers.RemoteError, Symbol })
+  const id = 'native-follow-projection'
+  const session = sessionModule.Session.create(id, undefined, { id, version: sessionModule.SESSION_FORMAT_VERSION,
+    createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote', cwd: process.cwd() })
+  const append = session.append.bind(session)
+  session.append = (...args) => {
+    const event = append(...args)
+    ctx.emit('session/event', session, event)
+    return event
+  }
+  ctx.sessionQuery = { async observeSession() { return { header: session.header,
+    events: session.snapshotEvents(), cursor: session.seq - 1, inheritedEventCount: 0,
+    source: 'attached', [Symbol.dispose]() {} } } }
+  const history = new SessionHistoryController(ctx, () => { throw new Error('不得激活会话') })
+  const abort = new AbortController()
+  const followed = history.follow({ address: { kind: 'session', sessionId: id }, assistantStream: true }, abort.signal)
+  t.after(async () => { abort.abort(); await followed.return(); await ctx.fiber.dispose() })
+  session.append('turn/start', { turn: 1 })
+  session.append('step/start', { turn: 1, step: 1 })
+  const opening = (await followed.next()).value
+  assert.equal(opening.type, 'snapshot')
+  assert.equal(opening.assistantStream.revision, 0)
+  const clientSource = await readFile(new URL('../plugin/session-client/client.js', import.meta.url), 'utf8')
+  const start = clientSource.indexOf('var ClientAssistantStream = class')
+  const end = clientSource.indexOf('//#endregion', start)
+  const client = vm.runInNewContext(`${clientSource.slice(start, end)}; new ClientAssistantStream()`)
+  client.replace(opening.records.map(record => ({ type: 'durable', event: record.event })), opening.assistantStream)
+  const agent = { id, session, assistantStreamRevision: 0 }
+  agent.dispatch = agentEvents(ctx, agent)
+  agent.scope = createScope(ctx, agent)
+  agent.ctx = agent.scope.ctx
+  t.after(() => agent.scope.dispose())
+  const projection = new SdkProjection({ agent, helpers: f.helpers, turn: 1, step: 1, model: 'fixture' })
+  const stream = event => projection.accept({ type: 'stream_event', event })
+  const nextFrame = async () => {
+    const result = await followed.next()
+    assert.equal(result.value.type, 'assistant-stream')
+    const decision = client.acceptFrame(result.value.frame)
+    assert.notEqual(decision?.type, 'rebaseline')
+    return { frame: result.value.frame, decision }
+  }
+  await stream({ type: 'message_start', message: { id: 'native-follow-api' } })
+  await stream({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
+  const first = await nextFrame()
+  assert.equal(first.frame.type, 'start')
+  assert.equal(first.frame.startedAfterSeq, opening.cursor)
+  await nextFrame()
+  for (const text of ['合成第一段', '合成第二段']) {
+    await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })
+    const delivered = await nextFrame()
+    assert.equal(delivered.decision.type, 'transient')
+    assert.equal(delivered.decision.entry.event.data.chunk.type, 'text-delta')
+    assert.equal(delivered.decision.entry.event.data.chunk.text, text)
+    assert.equal(session.snapshotEvents().some(event => event.type === 'assistant/message'), false)
+  }
+})
 
 test('实际 rc5 helper：工具使用最终 SDK 参数登记，Unicode 流式差异不进入执行历史', { skip: !available }, async () => {
   const { records, projection } = await fixture()
