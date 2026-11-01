@@ -3,8 +3,9 @@ import { createObservabilityIpc } from './observability-ipc.mjs'
 /** Worker-side adapter. The parent alone owns the account sampler and database. */
 export function createWorkerObservability(channel, { fetchQuota, onWarning = () => {} } = {}) {
   if (typeof channel?.send !== 'function') return undefined
-  const endpoint = createObservabilityIpc(channel, { handlers: {
+  const endpoint = createObservabilityIpc(channel, { onDiagnostic: onWarning, handlers: {
     fetchQuota: (_params, context) => fetchQuota(context),
+  }, controls: {
     warning: value => { onWarning(value); return { status: 'ok' } },
   } })
   return {
@@ -13,7 +14,7 @@ export function createWorkerObservability(channel, { fetchQuota, onWarning = () 
     summarize: filters => endpoint.request('summarize', filters),
     status: () => endpoint.request('status', {}),
     quota: (reason = 'manual') => endpoint.request('quota', { reason }),
-    activity: reason => endpoint.notify('activity', { reason }),
+    activity: (key, active) => endpoint.notify('activity', { key, active }),
     close: endpoint.close,
   }
 }

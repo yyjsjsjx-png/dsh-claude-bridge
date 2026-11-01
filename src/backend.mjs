@@ -16,6 +16,8 @@ import { defaultVisibleIds, validateVisibleIds, validateCreationSelection,
 import { imageCapability } from './model-capabilities.mjs'
 import { contextSnapshot, initialSessionStatus, reconcileSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
+import { retainedPlanUsage } from './observability-plan-usage.mjs'
+import { createLocalRunTiming } from './local-run-timing.mjs'
 import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
@@ -63,6 +65,13 @@ export class BridgeBackend {
       this.diagnostics.event('host.compatibility', { stage: check.id, evidence: check.evidence, status: check.status })
     }
     this.runs = new Map()
+    this.localTiming = createLocalRunTiming({ onTiming: row => {
+      if (this.initialized?.capabilities?.observability !== true) return
+      const unavailable = () => this.notification('observability.warning', { code: 'OBSERVABILITY_UPLOAD_FAILED', observedAt: Date.now(), gap: true })
+      if (!this.connection) { void unavailable(); return }
+      void this.connection.peer.request('observabilityTiming', row, { timeoutMs: 5000 })
+        .then(reply => { if (reply?.status !== 'queued') void unavailable() }).catch(() => { void unavailable() })
+    } })
     this.syncing = new Map()
     this.retiredRuns = new Set()
     this.compatibility = []
@@ -153,6 +162,7 @@ export class BridgeBackend {
     return { ...settings, connected: this.connection?.connected ?? Boolean(this.connection), compatibility: this.compatibility,
       remoteCapabilities: this.remoteCapabilities, bridgeCompatibility: this.bridgeCompatibility,
       diagnosticsPath: this.diagnostics.path, activeRuns: this.runs.size,
+      observabilityWarning: this.observabilityWarning ?? null,
       authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary(),
       modelCatalog: this.displayCatalogStatus ?? { status: 'idle' },
       contextPreferences: this.contextPreferences(),
@@ -235,6 +245,7 @@ export class BridgeBackend {
           'step.prepare': (params, context) => this.prepareStep(params, context),
         },
         onNotification: (method, params) => this.notification(method, params),
+        onTraffic: event => this.localTiming.observe(event),
         onClose: () => {
           if (revision === this.connectionRevision && (!this.connection || this.connection === transport)) {
             this.historyGeneration++
@@ -418,7 +429,8 @@ export class BridgeBackend {
         }
         const reply = await transport.peer.request('planUsage', { refresh }, { timeoutMs: 20_000 })
         if (this.connection !== transport) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
-        value = sanitizePlanUsage(reply)
+        value = this.initialized?.capabilities?.observability === true
+          ? retainedPlanUsage(reply) : sanitizePlanUsage(reply)
       } catch (error) { value = sanitizePlanUsage({ status: 'unavailable', code: error.code ?? 'QUOTA_READ_FAILED' }) }
       if (revision !== this.connectionRevision) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
       if (['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID'].includes(value.code)) {
@@ -492,6 +504,13 @@ export class BridgeBackend {
   }
 
   async notification(method, params) {
+    if (method === 'observability.warning') {
+      if (params && /^[A-Z][A-Z0-9_]{0,79}$/.test(params.code)) {
+        this.observabilityWarning = { code: params.code, observedAt: Number.isSafeInteger(params.observedAt) ? params.observedAt : Date.now(), gap: params.gap === true }
+        this.diagnostics.event('observability.failed', this.observabilityWarning)
+      }
+      return
+    }
     if (method === 'diagnostic') {
       this.diagnostics.event(params.event ?? 'remote.event', params)
       return
@@ -1071,6 +1090,7 @@ export class BridgeBackend {
       await run.stopPersistence
       signal.removeEventListener('abort', onStop)
       this.runs.delete(runId)
+      this.localTiming.finish(runId)
       this.retiredRuns.add(runId)
       if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
       await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'),

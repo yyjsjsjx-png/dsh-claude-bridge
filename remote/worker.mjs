@@ -78,6 +78,9 @@ async function main() {
     observability,
   })
   peer = createRpcPeer({ input: process.stdin, output: process.stdout, handlers: worker.handlers, onClose: worker.close })
+  if (observability) void observability.status().then(reply => {
+    if (reply?.warning) { try { peer.notify('observability.warning', reply.warning) } catch {} }
+  }).catch(() => {})
   await peer.closed
   await worker.close()
   observability?.close()

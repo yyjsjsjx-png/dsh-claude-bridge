@@ -9,6 +9,7 @@ export function retainedPlanUsage(view, now = Date.now()) {
     error: view?.error && /^[A-Z][A-Z0-9_]{0,79}$/.test(view.error.code)
       ? { code: view.error.code, observedAt: view.error.observedAt } : null,
     inFlight: view?.inFlight === true }
+  sampling.active = view?.active === true
   if (!raw || !Number.isSafeInteger(raw.observedAt) || raw.observedAt > now + 30_000 || now >= raw.observedAt + retainMs) {
     return { status: 'unavailable', code: sampling.error?.code ?? 'PLAN_LIMITS_UNAVAILABLE', sampling }
   }

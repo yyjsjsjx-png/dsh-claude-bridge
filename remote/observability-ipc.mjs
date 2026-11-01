@@ -4,16 +4,17 @@ const TYPE = 'dsh-observability-v1'
 const unavailable = code => ({ status: 'unavailable', code })
 
 /** Private Node IPC only; these requests never enter the client JSON-RPC wire. */
-export function createObservabilityIpc(channel, { handlers = {}, timeoutMs = 20_000, maxPending = 32 } = {}) {
+export function createObservabilityIpc(channel, { handlers = {}, controls = {}, timeoutMs = 20_000, maxPending = 32, onDiagnostic = () => {} } = {}) {
   const pending = new Map(), running = new Map()
   let closed = false
+  const warn = (code, message) => { try { onDiagnostic({ code, gap: message?.kind === 'notify' && message.method === 'record' }) } catch {} }
   const send = value => {
-    if (closed || typeof channel?.send !== 'function' || channel.connected === false) return false
+    if (closed || typeof channel?.send !== 'function' || channel.connected === false) { warn('OBSERVABILITY_CHANNEL_UNAVAILABLE', value); return false }
     try {
-      if (Buffer.byteLength(JSON.stringify(value)) > 2 * 1024 * 1024) return false
-      channel.send(value, () => {})
+      if (Buffer.byteLength(JSON.stringify(value)) > 2 * 1024 * 1024) { warn('OBSERVABILITY_FRAME_TOO_LARGE', value); return false }
+      channel.send(value, error => { if (error) warn('OBSERVABILITY_CHANNEL_SEND_FAILED', value) })
       return true
-    } catch { return false }
+    } catch { warn('OBSERVABILITY_CHANNEL_SEND_FAILED', value); return false }
   }
   const receive = message => {
     if (closed || message?.type !== TYPE || typeof message.id !== 'string' || message.id.length > 128) return
@@ -24,15 +25,28 @@ export function createObservabilityIpc(channel, { handlers = {}, timeoutMs = 20_
       return
     }
     if (!['request', 'notify'].includes(message.kind) || typeof message.method !== 'string') return
+    // Tiny synchronous ownership controls must survive a saturated analytics queue.
+    // In particular, dropping the last inactive message would leave a quota timer alive.
+    const control = Object.hasOwn(controls, message.method) ? controls[message.method] : undefined
+    if (typeof control === 'function') {
+      let value
+      try {
+        value = control(message.params)
+        if (value?.then) throw new TypeError('异步处理不能占用控制路径')
+      } catch { warn('OBSERVABILITY_OPERATION_FAILED', message); value = unavailable('OBSERVABILITY_OPERATION_FAILED') }
+      if (message.kind === 'request') send({ type: TYPE, kind: 'reply', id: message.id, value })
+      return
+    }
     const handler = Object.hasOwn(handlers, message.method) ? handlers[message.method] : undefined
     if (typeof handler !== 'function' || running.size >= maxPending || running.has(message.id)) {
+      warn('OBSERVABILITY_REQUEST_REFUSED', message)
       if (message.kind === 'request') send({ type: TYPE, kind: 'reply', id: message.id, value: unavailable('OBSERVABILITY_REQUEST_REFUSED') })
       return
     }
     const controller = new AbortController()
     running.set(message.id, controller)
     void Promise.resolve().then(() => handler(message.params, { signal: controller.signal }))
-      .catch(() => unavailable('OBSERVABILITY_OPERATION_FAILED'))
+      .catch(() => { warn('OBSERVABILITY_OPERATION_FAILED', message); return unavailable('OBSERVABILITY_OPERATION_FAILED') })
       .then(value => { if (message.kind === 'request') send({ type: TYPE, kind: 'reply', id: message.id, value }) })
       .finally(() => running.delete(message.id))
   }
