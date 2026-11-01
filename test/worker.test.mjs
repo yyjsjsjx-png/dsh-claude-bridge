@@ -1151,6 +1151,121 @@ test('批次后本机要求结束或准备失败时不会静默继续', async (t
   assert.equal(failed.toolMayHaveExecuted, true)
 })
 
+const STEER_ONE = '5c0d6e2b-0df1-4d24-98a7-873eb74b4db5'
+const STEER_TWO = '3385ab1a-f2d9-459f-a292-2c5d494671a2'
+const steer = (id, text) => ({ id, content: [{ type: 'text', text }] })
+
+function pumpSdkInput(prompt, received) {
+  return (async () => { for await (const input of prompt) { received.push(input); await Promise.resolve() } })()
+}
+
+test('运行中真实用户消息进入 SDK 输入流，hook 来源不升权且同 UUID 不重复', async t => {
+  const received = [], hooks = []
+  const f = await fixture(t, async function* ({ prompt, options }) {
+    const pump = pumpSdkInput(prompt, received)
+    for (let i = 0; i < 2; i++) hooks.push(await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] }))
+    assert.equal(received.length, 3)
+    assert.deepEqual(received.slice(1).map(message => [message.type, message.uuid, message.message.role, message.priority]),
+      [['user', STEER_ONE, 'user', 'now'], ['user', STEER_TWO, 'user', 'now']])
+    assert.deepEqual(received.slice(1).map(message => message.message.content), [steer(STEER_ONE, 'USER_ONE').content, steer(STEER_TWO, 'USER_TWO').content])
+    yield { type: 'result', subtype: 'success', session_id: SESSION, user_message_uuids: [STEER_ONE, STEER_TWO] }
+    await pump
+  })
+  f.peer.request = async method => {
+    assert.equal(method, 'step.prepare')
+    return { additionalContexts: ['TOOL_CONTEXT_STAYS_HOOK', 'RULE_STAYS_HOOK'], userMessages: [steer(STEER_ONE, 'USER_ONE'), steer(STEER_TWO, 'USER_TWO')] }
+  }
+  assert.equal((await f.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.userInputViaStream, true)
+  assert.equal((await f.worker.handlers.query(f.params, f.context)).status, 'completed')
+  for (const hook of hooks) assert.deepEqual(hook, { hookSpecificOutput: { hookEventName: 'PostToolBatch', additionalContext: 'TOOL_CONTEXT_STAYS_HOOK\n\nRULE_STAYS_HOOK' } })
+  assert.equal(f.state.notifications.filter(event => event.method === 'sdk.message' && event.params.message.type === 'result').length, 1)
+})
+
+test('插话另起 SDK turn 时等待消费确认，主 usage 合并且累计 modelUsage/cost 不叠加', async t => {
+  const received = []
+  const f = await fixture(t, async function* ({ prompt, options }) {
+    const pump = pumpSdkInput(prompt, received)
+    await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] })
+    const first = { type: 'result', uuid: 'result-one', subtype: 'success', session_id: SESSION,
+      usage: { input_tokens: 2, output_tokens: 3, cache_read_input_tokens: 5, cache_creation_input_tokens: 7 },
+      modelUsage: { model: { inputTokens: 100 } }, total_cost_usd: 0.1 }
+    yield first
+    yield first // A replay cannot charge the earlier SDK turn twice.
+    assert.equal(f.state.notifications.some(event => event.method === 'sdk.message' && event.params.message.type === 'result'), false)
+    yield { type: 'result', uuid: 'result-two', subtype: 'success', session_id: SESSION, user_message_uuids: [STEER_ONE],
+      usage: { input_tokens: 11, output_tokens: 13, cache_read_input_tokens: 17, cache_creation_input_tokens: 19 },
+      modelUsage: { model: { inputTokens: 200 } }, total_cost_usd: 0.2 }
+    await pump
+  })
+  f.peer.request = async () => ({ userMessages: [steer(STEER_ONE, 'STEER_AFTER_FIRST_TURN')] })
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.status, 'completed')
+  assert.deepEqual(result.metrics.usage, { scope: 'current-turn-main-agent', input_tokens: 13, output_tokens: 16, cache_creation_input_tokens: 26, cache_read_input_tokens: 22 })
+  assert.equal(result.metrics.modelUsage.models.model.inputTokens, 200)
+  assert.equal(result.metrics.cost.usd, 0.2)
+  const finals = f.state.notifications.filter(event => event.method === 'sdk.message' && event.params.message.type === 'result')
+  assert.equal(finals.length, 1)
+  assert.equal(finals[0].params.message.usage.output_tokens, 16)
+})
+
+test('用户 echo 不能替代 SDK 消费确认，不确认时明确失败且不自动再发', async t => {
+  const received = []
+  const f = await fixture(t, async function* ({ prompt, options }) {
+    const pump = pumpSdkInput(prompt, received)
+    await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] })
+    yield received[1]
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+    // Mock SDK exits before confirming; the real SDK's idle path is bounded.
+    void pump
+  })
+  f.peer.request = async () => ({ userMessages: [steer(STEER_ONE, 'UNCONFIRMED_USER')] })
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.code, 'USER_INPUT_UNCONFIRMED')
+  assert.equal(result.toolMayHaveExecuted, true)
+  assert.equal(received.length, 2)
+  assert.equal(f.state.notifications.some(event => event.method === 'sdk.message' && event.params.message.type === 'result'), false)
+})
+
+test('运行结束或取消先于 SDK 消费插话时，不静默完成也不遗留输入泵', async t => {
+  for (const cancel of [false, true]) {
+    let extraInputs = 0
+    const abort = new AbortController()
+    const f = await fixture(t, async function* ({ prompt, options }) {
+      await prompt.next() // Initial user prompt only; do not consume the queued interjection.
+      const pending = options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] })
+      // Let the step response queue the input before racing with the result.
+      await new Promise(resolve => setImmediate(resolve))
+      if (cancel) abort.abort()
+      else yield { type: 'result', subtype: 'success', session_id: SESSION }
+      await pending.catch(() => {})
+      const next = await prompt.next()
+      if (!next.done) extraInputs++
+    }, { inputConfirmationTimeoutMs: 20 })
+    f.peer.request = async () => ({ userMessages: [steer(STEER_ONE, 'UNSENT_USER')] })
+    const result = await f.worker.handlers.query(f.params, { ...f.context, signal: abort.signal })
+    assert.equal(result.status, cancel ? 'cancelled' : 'failed')
+    if (!cancel) assert.equal(result.code, 'USER_INPUT_UNCONFIRMED')
+    assert.equal(extraInputs, 0)
+  }
+})
+
+test('续聊仅发送本轮 prompt，不重投上一运行已消费的插话', async t => {
+  const received = []
+  let invocation = 0
+  const f = await fixture(t, async function* ({ prompt, options }, state) {
+    const current = ++invocation, pump = pumpSdkInput(prompt, received)
+    if (current === 1) await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] })
+    state.exists = true
+    yield { type: 'result', subtype: 'success', session_id: SESSION, ...(current === 1 ? { user_message_uuids: [STEER_ONE] } : {}) }
+    await pump
+  })
+  f.peer.request = async () => ({ userMessages: [steer(STEER_ONE, 'ONLY_FIRST_RUN')] })
+  assert.equal((await f.worker.handlers.query(f.params, f.context)).status, 'completed')
+  assert.equal((await f.worker.handlers.query({ ...f.params, runId: 'run-resume-steer', resume: true, prompt: 'NEW_TURN' }, f.context)).status, 'completed')
+  assert.equal(received.filter(message => message.uuid === STEER_ONE).length, 1)
+  assert.equal(received.at(-1).message.content, 'NEW_TURN')
+})
+
 test('必要 hooks 未获 SDK 确认时不发送用户消息', async (t) => {
   const f = await fixture(t, async function* () { throw new Error('must not consume prompt') })
   f.state.hooksApplied = false

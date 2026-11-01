@@ -29,6 +29,7 @@ import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } f
 import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+const USER_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const uncheckedBridgeCompatibility = () => ({ status: 'unchecked', clientVersion,
   serverVersion: undefined, minimumClientVersion: undefined, message: '尚未检查服务器版本要求。' })
 
@@ -502,6 +503,7 @@ export class BridgeBackend {
       throw failure('UNEXPECTED_RUN_EVENT', '收到不属于当前运行的 SDK 事件。')
     }
     if (run.kind === 'compact') return
+    if (params.message?.type === 'result') run.inputClosed = true
     if (!run.firstModelEvent && (params.message?.type === 'stream_event'
       || (params.message?.type === 'assistant' && !isNoResponsePlaceholder(params.message.message)))) {
       run.firstModelEvent = true
@@ -1089,7 +1091,7 @@ export class BridgeBackend {
     await run.toolQueue
     signal.throwIfAborted()
     if (run.preparationError) throw run.preparationError
-    if (run.concluded) return { continue: false }
+    if (run.concluded || run.inputClosed) return { continue: false }
     const { agent, turn } = run
     if (typeof agent.preStep !== 'function') throw failure('DSH_PRE_STEP_UNAVAILABLE', '当前 DSH 未提供所需的步骤准备接口。')
     const pending = [...agent.inbox.nextStep]
@@ -1111,9 +1113,22 @@ export class BridgeBackend {
           : '运行期间工具集合已更新，本轮已在安全边界停止并保留当前对话；继续时将重新检查最新工具。')
       }
       const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true)
-      const blocks = messages.length ? await toSdkPrompt(messages, { ...run.media, signal }) : []
-      if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_STEP_CONTEXT', '步骤附加上下文含有无法在此处投递的图片等内容；已停止。')
+      const additionalContexts = [], userMessages = []
+      for (const message of messages) {
+        const blocks = await toSdkPrompt([message], { ...run.media, signal })
+        if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_STEP_CONTEXT', '步骤附加上下文含有无法在此处投递的图片等内容；已停止。')
+        // The durable event name is also used for instructions, tool context
+        // and subagent delivery. Only native user provenance may steer as user.
+        if (message.source.kind === 'user') {
+          if (!USER_MESSAGE_ID.test(message.id)) throw failure('USER_INPUT_INVALID', '用户插话缺少有效消息标识，已停止且保留未发送消息。')
+          userMessages.push({ id: message.id, content: blocks })
+        } else additionalContexts.push(...blocks.map(block => block.text))
+      }
+      if (userMessages.length && this.initialized?.capabilities?.userInputViaStream !== true) {
+        throw failure('USER_INTERJECTION_UNSUPPORTED', '服务器不支持以用户身份接收运行中插话，请更新服务器；已停止且保留未发送消息。')
+      }
       signal.throwIfAborted()
+      if (run.inputClosed) throw failure('USER_INPUT_CLOSED', '当前运行已结束接收插话，未发送消息已保留。')
       for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
       run.step++
       agent.phase.step = run.step
@@ -1123,7 +1138,8 @@ export class BridgeBackend {
       run.projection.step = run.step
       accepted = true
       this.diagnostics.event('step.prepared', { runId: run.runId, stage: 'pre-step' })
-      return { ...(blocks.length ? { additionalContexts: blocks.map(block => block.text) } : {}) }
+      return { ...(additionalContexts.length ? { additionalContexts } : {}),
+        ...(userMessages.length ? { userMessages } : {}) }
     } catch (error) {
       run.preparationError = error
       this.diagnostics.event('step.failed', { runId: run.runId, stage: 'pre-step', code: error.code ?? 'DSH_PRE_STEP_FAILED' })
