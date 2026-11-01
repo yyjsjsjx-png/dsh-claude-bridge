@@ -22,7 +22,7 @@ function textError(error) {
 function createSettingsController({ rpc, createStore, textError, createModelController, onConnectionChange }) {
   const store = createStore({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
-    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null,
+    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
@@ -55,6 +55,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
           remotePreset: status.remotePreset ?? null, remoteCapabilities: status.remoteCapabilities ?? null,
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
+          host: status.host ?? null,
           usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
@@ -848,6 +849,19 @@ const SETTINGS_CSS = `
     const authTone = state.authentication === 'logged-in' ? 'ok' : state.authentication === 'login-required' ? 'error' : 'warn';
     const bridgeCompatibility = state.bridgeCompatibility;
     const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
+    const hostChecks = Array.isArray(state.host?.checks) ? state.host.checks : [];
+    const checkRows = [
+      ['host-interfaces', 'interface', 'Host 接口', '接口检查'],
+      ['session-protocol', 'synthetic', '会话协议', '内存探针'],
+      ['session-restore', 'synthetic', '严格会话恢复', '内存探针'],
+      ['desktop-acceptance', 'desktop', '当前桌面行为', '桌面实测'],
+      ['remote-sdk', 'real-sdk', '真实远程 SDK', '真实 SDK 验收'],
+    ].map(([id, evidence, label, kind]) => {
+      const check = hostChecks.find(item => item?.id === id && item.evidence === evidence);
+      const reading = check?.status === 'passed' ? '通过' : check?.status === 'failed' ? '未通过'
+        : check?.status === 'not-run' ? '本次未执行' : '未取得';
+      return { id, text: `${label}（${kind}）：${reading}` };
+    });
     return h('section', { className: 'dcb-page' },
       h('style', null, SETTINGS_CSS),
       h('header', { className: 'dcb-header' },
@@ -955,9 +969,12 @@ const SETTINGS_CSS = `
         bridgeCompatibility?.status === 'compatible' && h('p', null, bridgeCompatibility.message || '客户端符合服务端版本要求。'),
         bridgeCompatibility?.status === 'unchecked' && h('p', null, '连接后核对服务端版本要求。'),
         state.desktopCompatibility && h('p', null,
-          `DSH ${state.desktopCompatibility.version}；已验证支持：${(state.desktopCompatibility.verifiedVersions ?? []).join('、')}`),
+          `DSH ${state.desktopCompatibility.version}；已验证基线：${(state.desktopCompatibility.verifiedVersions ?? []).join('、')}`),
         state.desktopCompatibility && !state.desktopCompatibility.verifiedVersions?.includes(state.desktopCompatibility.version)
           && h('p', { role: 'status', className: 'dcb-notice' }, '此桌面版本尚未完成回归验证，建议继续使用已验证版本。'),
+        h('p', null, '本次启动自动检查仅覆盖接口与内存探针；桌面行为和真实远程 SDK 未自动验收。'),
+        hostChecks.length ? h('ul', null, ...checkRows.map(row => h('li', { key: `host-check-${row.id}` }, row.text)))
+          : h('p', null, '本次启动尚未取得自动检查结果。'),
         state.remotePreset && h('p', { role: state.remotePreset.mode === 'unavailable' ? 'alert' : 'status' },
           `远程预设：${({ unchecked: '尚未检查', full: '完整', degraded: '部分能力已关闭', basic: '基础', unavailable: '插件不可用' })[state.remotePreset.mode] ?? '未知'}`),
         ...(state.remotePreset?.reasons ?? []).map((reason, index) => h('p', { key: `preset-reason-${index}` }, reason)),
@@ -1030,6 +1047,12 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
             || !context.matches.some(({ event }) => event.type === 'assistant/message'
               && (event.data.message.source?.provider === 'claude-sdk-remote'
                 || event.data.message.id?.startsWith('claude-sdk:')))) return result;
+          const process = result.location?.kind === 'step' ? result.location.turn.data.get('turn-process') : undefined;
+          // The native answer boundary also controls whole-turn disclosure. Moving
+          // its answer before that boundary hides both the reply and its toggle.
+          if (process?.answerStep === result.data.step && Number.isFinite(process.answerAnchorSeq)) {
+            return result.anchorSeq >= process.answerAnchorSeq ? result : { ...result, anchorSeq: process.answerAnchorSeq };
+          }
           const start = context.start?.event.type === 'step/start' ? context.start.event
             : result.location?.kind === 'step' ? result.location.step.start : undefined;
           const first = context.matches.find(({ event }) => event.type === 'assistant/message');

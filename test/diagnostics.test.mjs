@@ -18,6 +18,17 @@ test('诊断仅记录元数据，排除正文、凭据和任意错误文本', ()
   assert.doesNotMatch(JSON.stringify(record), /secret|private|Bearer/)
 })
 
+test('兼容诊断只记录固定证据等级，不把合成探针当作桌面或真实 SDK 实测', () => {
+  const checked = diagnosticRecord('host.compatibility', {
+    stage: 'session-restore', evidence: 'synthetic', status: 'passed', detail: 'private-transcript',
+  })
+  assert.equal(checked.evidence, 'synthetic')
+  assert.equal(checked.status, 'passed')
+  assert.equal(checked.detail, undefined)
+  assert.equal(diagnosticRecord('host.compatibility', { evidence: 'private-error' }).evidence, undefined)
+  assert.equal(diagnosticRecord('host.compatibility', { evidence: 'real-sdk', status: 'not-run' }).status, 'not-run')
+})
+
 test('诊断顺序落盘并保持有界轮转', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-diagnostic-'))
   try {

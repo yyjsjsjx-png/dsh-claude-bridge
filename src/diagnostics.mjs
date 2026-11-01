@@ -3,6 +3,7 @@ import { join } from 'node:path'
 
 const STRING_FIELDS = new Set(['stage', 'code', 'method', 'requestId', 'sessionId', 'deviceId', 'runId', 'callId', 'toolName', 'status', 'signal', 'errorName', 'model', 'effort'])
 const NUMBER_FIELDS = new Set(['durationMs', 'bytes', 'inputBytes', 'outputBytes', 'exitCode', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'])
+const EVIDENCE_LEVELS = new Set(['interface', 'synthetic', 'desktop', 'real-sdk'])
 
 function safeLabel(value) {
   if (typeof value !== 'string') return undefined
@@ -18,6 +19,7 @@ export function diagnosticRecord(event, fields = {}) {
       const accepted = safeLabel(value)
       if (accepted !== undefined) record[key] = accepted
     } else if (NUMBER_FIELDS.has(key) && Number.isFinite(value)) record[key] = value
+    else if (key === 'evidence' && EVIDENCE_LEVELS.has(value)) record[key] = value
     else if (key === 'toolMayHaveExecuted' && typeof value === 'boolean') record[key] = value
   }
   return record

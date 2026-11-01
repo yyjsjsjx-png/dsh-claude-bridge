@@ -5,8 +5,52 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
+import { HOST_FUNCTIONS, assertHostContract } from '../plugin/compat/host-contract.mjs'
+import { assertSessionRestore } from '../plugin/compat/session-restore-probe.mjs'
 
 const native = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
+
+test('实际 rc5：严格恢复探针验证完整合成工具回合，损坏生命周期或编码行为明确阻断', { skip: !native }, async t => {
+  const { resolveDshModule } = await import('../plugin/compat/resolve-dsh-module.mjs')
+  const modules = Object.fromEntries(await Promise.all(Object.keys(HOST_FUNCTIONS)
+    .map(async name => [name, await import(resolveDshModule(name))])))
+  assert.deepEqual(assertHostContract(modules, '0.2.1-rc.5'), [
+    { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
+    { id: 'session-protocol', evidence: 'synthetic', status: 'passed' },
+    { id: 'session-restore', evidence: 'synthetic', status: 'passed' },
+  ])
+  const codecName = '@deepseek-ai/dsh-session-format-v3-to-v4'
+  const catalogName = '@deepseek-ai/dsh-session-format-catalog'
+  const codec = modules[codecName].releasedV4SessionFormatCodec
+  await t.test('真实 strict/current 拒绝与 assistant 声明不符的工具调用', () => {
+    const broken = { ...modules, [codecName]: { releasedV4SessionFormatCodec: { ...codec,
+      encodeEvent(event) {
+        return codec.encodeEvent(event.type === 'tool/call'
+          ? { ...event, data: { ...event.data, callId: 'unadvertised-probe-call' } } : event)
+      },
+    } } }
+    assert.throws(() => assertSessionRestore(broken),
+      /tool\/call unadvertised-probe-call has no advertised tool lifecycle/)
+    assert.throws(() => assertHostContract(broken, '0.2.1-rc.5'), error =>
+      error.code === 'DSH_API_INCOMPATIBLE' && /原生会话严格恢复检查失败/u.test(error.message))
+  })
+  await t.test('codec 和 catalog 的行为失败不回显原始异常', () => {
+    const sensitive = 'UNTRUSTED_PROBE_EXCEPTION'
+    const reject = () => { throw new Error(sensitive) }
+    for (const replacements of [
+      { [codecName]: { releasedV4SessionFormatCodec: { ...codec, encodeHeader: reject } } },
+      { [catalogName]: { sessionFormatCatalog: { createRestore: reject } } },
+      { [catalogName]: { sessionFormatCatalog: { createRestore: () => ({}) } } },
+      { [catalogName]: { sessionFormatCatalog: { createRestore: () => ({ decodeRow() {}, finish: () => ({}) }) } } },
+    ]) assert.throws(() => assertHostContract({ ...modules, ...replacements }, '0.2.1-rc.5'), error => {
+      assert.equal(error.code, 'DSH_API_INCOMPATIBLE')
+      assert.match(error.message, /原生会话严格恢复检查失败/u)
+      assert.equal(error.message.includes(sensitive), false)
+      return true
+    })
+  })
+})
+
 test('实际 rc5：标准 bundle 接受不同版本号并检查实际 Host 能力', { skip: !native }, async () => {
   const root = dirname(dirname(fileURLToPath(import.meta.url)))
   const dir = join(process.env.DSH_CLAUDE_BRIDGE_RESOURCES, 'app.asar/dsh/node_modules/@deepseek-ai/dsh-app-boot')

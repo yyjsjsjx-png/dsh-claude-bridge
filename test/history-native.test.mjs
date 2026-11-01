@@ -12,6 +12,7 @@ import { nativeChat } from './fixtures/native-chat.mjs'
 import { strictSession } from './fixtures/native-persistence.mjs'
 import { HISTORY_TOOL_RESULT, appendHistoryRecord } from '../src/history-records.mjs'
 import { repairBridgeHistories } from '../scripts/repair-history.mjs'
+import { createClient } from '../plugin/ui/client/entry.mjs'
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
 test('实际 rc5：闭合轮次补齐消息和真实工具结果，原生日志与显示历史可重新回放', { skip: !available }, async () => {
@@ -105,6 +106,49 @@ async function historyClient() {
     { window: { __ModuleLoader__: { load: value => { entry = value } } } })
   return entry.factory(name => name === 'zod' ? { z: {} } : {})
 }
+
+test('实际 rc5 展示：冷回放与实时追加的最终正文在折叠模式可见，工作过程仍可折叠', { skip: !available }, async () => {
+  const { Session, SESSION_FORMAT_VERSION } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const helpers = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
+  for (const reasoning of [false, true]) {
+    const session = Session.create(`native-final-${reasoning}`, undefined, { version: SESSION_FORMAT_VERSION,
+      id: `native-final-${reasoning}`, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+    const append = (step, content) => session.append('assistant/message', { turn: 1, step, stream: [],
+      message: helpers.createAssistantMessage({ content, source: { provider: 'claude-sdk-remote', model: 'fixture' } }) },
+    { surfaceOp: 'append' })
+    session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
+    append(1, [{ type: 'reasoning', text: '合成工作过程' },
+      { type: 'tool-call', id: 'fixture-tool', name: 'local_command', arguments: '{}' }])
+    const call = session.append('tool/call', { turn: 1, step: 1, callId: 'fixture-tool', name: 'local_command', arguments: '{}' })
+    session.append('tool/result', { turn: 1, step: 1, message: helpers.createToolResultMessage({ callId: 'fixture-tool',
+      content: [{ type: 'text', text: '合成工具结果' }], isError: false }) }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+    session.append('step/end', { turn: 1, step: 1 }); session.append('step/start', { turn: 1, step: 2 })
+    append(2, [...reasoning ? [{ type: 'reasoning', text: '合成最终分析' }] : [], { type: 'text', text: '合成最终正文' }])
+    session.append('step/end', { turn: 1, step: 2 }); session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    for (const lifecycle of ['cold', 'live']) {
+      const view = await nativeChat()
+      createClient({}).installTranscriptOrder(view.ctx)
+      const events = session.snapshotEvents()
+      if (lifecycle === 'cold') view.replace(events)
+      else for (const event of events) view.append(event)
+      const final = view.order().find(node => node.kind === 'assistant-step' && node.data.step === 2)
+      const tool = view.order().find(node => node.kind === 'tool-call')
+      for (const mode of ['compact', 'standard', 'detailed', 'verbose']) {
+        const answer = view.seat(final, { mode, groupPart: 'response' })
+        assert.equal(answer['data-turn-process-member'], undefined, `${lifecycle}/${mode}: final answer outside process`)
+        assert.equal(answer['data-turn-process-hidden'], undefined, `${lifecycle}/${mode}: final answer visible`)
+        assert.equal(answer.children.turnProcess?.hasContent, true, `${lifecycle}/${mode}: disclosure retains process`)
+        const collapsed = view.seat(tool, { mode })
+        assert.equal(collapsed['data-turn-process-hidden'], mode === 'verbose' ? undefined : true,
+          `${lifecycle}/${mode}: work still follows native folding`)
+        assert.equal(view.seat(tool, { mode, open: true })['data-turn-process-hidden'], undefined,
+          `${lifecycle}/${mode}: work can be opened`)
+        if (reasoning) assert.equal(view.seat(final, { mode, groupPart: 'reasoning' })['data-turn-process-hidden'],
+          mode === 'verbose' ? undefined : true, `${lifecycle}/${mode}: reasoning stays in process`)
+      }
+    }
+  }
+})
 
 test('原生离线迁移：旧损坏历史先备份、完整校验并原子写回，再次更新不改写', { skip: !available }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-migration-'))

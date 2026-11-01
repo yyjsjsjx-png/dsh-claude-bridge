@@ -18,6 +18,7 @@ import { createSessionStatusProjection } from '../src/session-status.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
+const hostCompatibility = await assertDshCompatibility();
 
 const ACCOUNT_DEFAULT = 'account-default';
 const DEFAULT_MODEL = Object.freeze({
@@ -136,7 +137,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
       createAssistantMessage, createToolResultMessage, createSystemMessage, appendPluginRecord,
       AssistantStreamAccumulator, BlockAssembler,
     };
-    this.backend = new BridgeBackend(ctx, config, { helpers });
+    this.backend = new BridgeBackend(ctx, config, { helpers, hostCompatibility });
     ctx.sessionProjections.register(createSessionStatusProjection(z));
     const backend = this.backend;
     const adapter = new ClaudeCatalogAdapter(backend, ctx);
@@ -201,7 +202,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
     const status = await this.backend.status();
     const remotePreset = remotePresetStatus(this.ctx);
     const host = await assertDshCompatibility();
-    return { ...status, remotePreset,
+    return { ...status, remotePreset, host,
       desktopCompatibility: { version: host.version, verifiedVersions: ['0.2.1-rc.5'] },
       ...remotePresetFeatures(remotePreset) };
   }

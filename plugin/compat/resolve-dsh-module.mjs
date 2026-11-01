@@ -82,8 +82,13 @@ export function assertDshCompatibility() {
         throw new DshCompatibilityError(installed.version, `无法加载 ${name}`, { cause: error });
       }
     }
-    assertHostContract(modules, installed.version);
-    return { version: installed.version, baselineVersion: '0.2.1-rc.5', status: 'compatible' };
+    const checks = assertHostContract(modules, installed.version);
+    return Object.freeze({ version: installed.version, baselineVersion: '0.2.1-rc.5', status: 'compatible',
+      // Startup probes cannot attest to a desktop interaction or an upstream SDK run.
+      checks: Object.freeze([...checks,
+        { id: 'desktop-acceptance', evidence: 'desktop', status: 'not-run' },
+        { id: 'remote-sdk', evidence: 'real-sdk', status: 'not-run' },
+      ].map(check => Object.freeze(check))) });
   })();
 }
 

@@ -15,6 +15,21 @@ const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
 const nextClientVersion = `${BigInt(currentClientVersion.split('.')[0]) + 1n}.0.0`
 
+test('启动诊断保留 Host 证据分级，记录未自动实测项且不连接服务器', async t => {
+  const checks = [
+    { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
+    { id: 'session-restore', evidence: 'synthetic', status: 'passed' },
+    { id: 'desktop-acceptance', evidence: 'desktop', status: 'not-run' },
+    { id: 'remote-sdk', evidence: 'real-sdk', status: 'not-run' },
+  ]
+  const f = await fixture(t, async () => { throw new Error('启动探针不应连接服务器') }, undefined, { checks })
+  await f.backend.diagnostics.flush()
+  const records = (await readFile(f.backend.diagnostics.path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual(records.map(({ event, stage, evidence, status }) => ({ event, stage, evidence, status })),
+    checks.map(({ id, ...check }) => ({ event: 'host.compatibility', stage: id, ...check })))
+  assert.equal(f.backend.connection, undefined)
+})
+
 test('握手发送插件版本，服务端仅升级不强制客户端更新，旧服务端仍按协议连接', async t => {
   for (const declaration of [undefined, { serverVersion: nextClientVersion, minimumClientVersion: null },
     { serverVersion: nextClientVersion, minimumClientVersion: currentClientVersion }]) {
@@ -521,7 +536,7 @@ test('批次准备拒绝变化配置时恢复已认领消息，防止指令丢�
   await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'QUERY_CONFIGURATION_CHANGED' })
 })
 
-async function fixture(t, makeTransport, execute) {
+async function fixture(t, makeTransport, execute, hostCompatibility) {
   const parent = resolve(tmpdir())
   const directory = await mkdtemp(join(parent, 'dsh-bridge-backend-'))
   t.after(async () => {
@@ -574,7 +589,7 @@ async function fixture(t, makeTransport, execute) {
     } }] },
     messages: [{ id: 'user-1', role: 'user', source: { kind: 'human' }, content: [{ type: 'text', text: '测试' }] }],
   }
-  const backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers, createTransport: makeTransport })
+  const backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers, createTransport: makeTransport, hostCompatibility })
   return { backend, agent, decision, records, phaseAbort, ctx, helpers, selection }
 }
 
