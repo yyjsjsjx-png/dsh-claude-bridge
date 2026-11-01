@@ -16,6 +16,7 @@ import { createClaudeCatalogAdapter } from './catalog-adapter.mjs';
 import { createSessionStatusProjection } from '../src/session-status.mjs';
 import { createRunProgressProjection } from '../src/run-progress.mjs';
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
+import { createResponseTimingProjection } from '../src/response-timing.mjs';
 
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
@@ -49,6 +50,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
     ctx.sessionProjections.register(createSessionStatusProjection(z));
     ctx.sessionProjections.register(createRunProgressProjection(z));
     ctx.sessionProjections.register(createResponseUsageProjection(z));
+    ctx.sessionProjections.register(createResponseTimingProjection(z));
     const backend = this.backend;
     const adapter = new ClaudeCatalogAdapter(backend, ctx);
     this.catalogAdapter = adapter;

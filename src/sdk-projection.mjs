@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { assistantIdentity } from './history-sync.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { appendHistoryRecord, HISTORY_ASSISTANT } from './history-records.mjs'
 import { contextSnapshot } from './context-usage.mjs'
 import { RESPONSE_USAGE_RECORD, RUN_USAGE_RECORD, responseUsageFromSdk } from './response-usage.mjs'
+import { createResponseTimingTracker, RESPONSE_TIMING_RECORD } from './response-timing.mjs'
+import { observeResponseTiming } from './sdk-response-timing.mjs'
 
 // DSH followers require dense revisions across the attached Agent lifecycle,
 // including a stopped query followed by a fresh projection for the next turn.
@@ -11,10 +14,13 @@ const revisions = new WeakMap()
 
 /** Project SDK text/thinking into DSH's existing live and durable renderers. */
 export class SdkProjection {
-  constructor({ agent, helpers, turn, step, model, runId, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText }) {
+  constructor({ agent, helpers, turn, step, model, runId, timingNow, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText }) {
     Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText })
     this.runId = runId ?? `turn:${turn}:step:${step}`
     this.startStep = step
+    this.timingNow = timingNow ?? (() => performance.now())
+    this.responseTiming = createResponseTimingTracker({ runId: this.runId, turn, now: this.timingNow,
+      onRecord: record => helpers.appendPluginRecord(agent.session, RESPONSE_TIMING_RECORD, record) })
     this.active = undefined
     this.blocks = new Map()
     this.committedToolIds = new Set()
@@ -75,17 +81,20 @@ export class SdkProjection {
     if (message.type === 'system' || message.type === 'bridge_context') await this.progress(message)
     if (message.type === 'stream_event') {
       const event = message.event
+      const receivedAt = this.timingNow()
       if (event?.type === 'message_start') {
         if (this.active) this.finish({ usage: this.confirmedUsage() })
         this.recordResponseUsage(this.currentResponse)
         this.messageId = event.message?.id
-        await this.modelStart(this.messageId)
+        await this.modelStart(this.messageId, message.parent_tool_use_id == null
+          ? { at: receivedAt, streamStarted: true, sdkTtftMs: message.ttft_ms } : {})
         if (this.interrupted) return
         this.streamUsage = event.message?.usage
         this.streamUsageFinal = false
         this.streamResponse = this.currentResponse
         if (this.streamResponse && !this.streamResponse.final) this.streamResponse.usage = this.streamUsage
       }
+      observeResponseTiming(this.responseTiming, message, this.streamResponse ?? this.currentResponse, receivedAt)
       if (event?.type === 'message_delta' && event.usage) {
         const response = this.streamResponse ?? this.currentResponse
         const previous = response?.usage ?? this.streamUsage
@@ -160,6 +169,15 @@ export class SdkProjection {
         const name = item.name.replace(/^mcp__dsh__/, '')
         const args = JSON.stringify(item.input ?? {})
         if (block.name !== name || block.arguments !== args) {
+          // Escaping and whitespace can differ without losing any raw output.
+          // A missing JSON tail or changed value instead needs full-message
+          // supplementation, so its receive window cannot cover all output.
+          let equivalent = false
+          if (block.name === name) {
+            try { equivalent = isDeepStrictEqual(block.arguments ? JSON.parse(block.arguments) : block.initialInput ?? {}, item.input ?? {}) }
+            catch {}
+          }
+          if (!equivalent) this.timingSupplement()
           block.name = name
           block.arguments = args
           this.active.canonicalToolInput = true
@@ -171,6 +189,7 @@ export class SdkProjection {
           if (!['text', 'thinking', 'tool_use'].includes(item.type)) continue
           if (item.type === 'tool_use') {
             if (this.committedToolIds.has(item.id)) continue
+            this.timingSupplement()
             const index = this.blocks.size
             const block = { index, type: 'tool-call', id: item.id,
               name: item.name.replace(/^mcp__dsh__/, ''), arguments: JSON.stringify(item.input ?? {}), ended: true }
@@ -184,6 +203,7 @@ export class SdkProjection {
           const text = item.text ?? item.thinking
           if (typeof text !== 'string' || !text) continue
           if (this.committedText.has(JSON.stringify([this.messageId, type, text]))) continue
+          this.timingSupplement()
           const index = this.blocks.size
           this.blocks.set(index, { index, type, text, ended: true })
           this.push({ type: 'block-start', index, blockType: type })
@@ -220,6 +240,7 @@ export class SdkProjection {
       for (const item of content) {
         if (item.type !== 'tool_use' || this.committedToolIds.has(item.id)
           || [...this.blocks.values()].some(block => block.type === 'tool-call' && block.id === item.id)) continue
+        this.timingSupplement()
         const index = this.blocks.size
         const block = { index, type: 'tool-call', id: item.id,
           name: item.name.replace(/^mcp__dsh__/, ''), arguments: JSON.stringify(item.input ?? {}), ended: true }
@@ -228,6 +249,7 @@ export class SdkProjection {
         this.push({ type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments })
         this.push({ type: 'block-end', index, block: this.finalBlock(block) })
       }
+      if (supplementedText) this.timingSupplement()
       if (supplementedText || this.finalOrder) {
         const blocks = [...this.blocks.values()]
         const order = this.finalOrder ? [...this.finalOrder, ...blocks.filter(block => !this.finalOrder.includes(block))] : blocks
@@ -253,23 +275,27 @@ export class SdkProjection {
     if (message.type === 'result') {
       this.finish({ usage: this.confirmedUsage() })
       for (const response of this.responses.values()) this.recordResponseUsage(response)
+      this.responseTiming.close()
       await this.settleUsage(message)
     }
   }
 
-  async modelStart(id) {
+  async modelStart(id, timing = {}) {
     const key = id ?? 'unidentified-response'
     if (this.startedModelIds.has(key)) {
       this.currentResponse = this.responses.get(key)
+      this.responseTiming.responseStarted({ responseId: id, step: this.currentResponse.step, ...timing })
       return
     }
     this.recordResponseUsage(this.currentResponse)
+    if (this.currentResponse?.id) this.responseTiming.responseCompleted({ responseId: this.currentResponse.id })
     this.startedModelIds.add(key)
     this.modelResponses++
     const step = await this.onModelStart?.(id)
     if (step !== undefined) this.step = step
     this.currentResponse = { id, turn: this.turn, step: this.step }
     this.responses.set(key, this.currentResponse)
+    this.responseTiming.responseStarted({ responseId: id, step: this.step, ...timing })
   }
 
   confirmedUsage() {
@@ -280,10 +306,16 @@ export class SdkProjection {
       cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens }
   }
 
+  timingSupplement() {
+    if (this.currentResponse?.id) this.responseTiming.failCapture({
+      responseId: this.currentResponse.id, reason: 'assistant-supplement' })
+  }
+
   recordResponseUsage(response) {
     if (!response?.final || typeof response.id !== 'string' || !response.id || response.id.length > 256) return
     const usage = responseUsageFromSdk(response.usage)
     if (!usage) return
+    this.responseTiming.responseUsage({ responseId: response.id, outputTokens: usage.outputTokens, final: true })
     const signature = JSON.stringify(usage)
     if (signature === response.recorded) return
     this.helpers.appendPluginRecord(this.agent.session, RESPONSE_USAGE_RECORD, { version: 1,
@@ -339,6 +371,7 @@ export class SdkProjection {
   }
 
   finish({ interrupted = false, usage } = {}) {
+    if (interrupted) this.responseTiming.interrupt()
     // Usage-only results must never settle a second empty assistant message.
     if (!this.active) return
     for (const block of this.blocks.values()) {
