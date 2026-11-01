@@ -23,7 +23,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
   const store = createStore({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
     remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
-    diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
+    diagnosticsPath: '', observabilityWarning: null, activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
     contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
@@ -57,7 +57,8 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
           host: status.host ?? null,
-          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
+          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '',
+          observabilityWarning: status.observabilityWarning ?? null, statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
             contextWindow: String(status.contextPreferences?.autoCompactWindowTokens ?? 200000), contextDirty: false } : {}) });
@@ -253,6 +254,15 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
     if (quotaRequest) return quotaRequest;
     if (previous.paused === 'offline') store.set({ ...previous, paused: undefined });
     if (reason === 'online') quotaRetryAt = 0;
+    // New servers own the account-wide sampling gate. A manual click must not
+    // turn a retained cache snapshot into another upstream quota request.
+    const nextAllowedAt = previous.sampling?.nextAllowedAt;
+    if (Number.isFinite(nextAllowedAt) && nextAllowedAt > now) {
+      if (previous.nextRefreshAt !== nextAllowedAt) {
+        store.set({ ...store.getSnapshot(), nextRefreshAt: nextAllowedAt });
+      }
+      return Promise.resolve();
+    }
     if (!manual && ['open', 'visible', 'online'].includes(reason) && previous.status === 'available'
       && previous.expiresAt > now && now - previous.observedAt < 30_000
       && previous.windows.every(row => row.resetsAt === null || row.resetsAt > now)) return Promise.resolve();
@@ -279,7 +289,9 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
       if (disposed || revision !== quotaGeneration) return;
       if (value.status === 'available') {
         quotaFailures = 0; quotaRetryAt = 0;
-        store.set({ ...value, refreshing: false, nextRefreshAt: 0 });
+        const nextAllowedAt = value.sampling?.nextAllowedAt;
+        store.set({ ...value, refreshing: false,
+          nextRefreshAt: Number.isFinite(nextAllowedAt) && nextAllowedAt > Date.now() ? nextAllowedAt : 0 });
         return;
       }
       const paused = quotaAuthCodes.has(value.code) ? 'auth'
@@ -288,6 +300,7 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
       if (paused) {
         quotaRetryAt = 0;
         store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+          ...(value.sampling ? { sampling: value.sampling } : {}),
           ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
@@ -296,7 +309,9 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
         // A reply with no usable plan windows supersedes the old counters.
         // Transient transport failures may keep a still-fresh snapshot.
         store.set({ ...(previous.status === 'available' && value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous : UNKNOWN_QUOTA),
-          code: value.code, refreshing: false, paused: undefined, nextRefreshAt: quotaRetryAt });
+          ...(value.sampling ? { sampling: value.sampling } : {}),
+          code: value.code, refreshing: false, paused: undefined,
+          nextRefreshAt: Math.max(quotaRetryAt, Number.isFinite(value.sampling?.nextAllowedAt) ? value.sampling.nextAllowedAt : 0) });
       }
     })();
     quotaRequest = request;
@@ -669,6 +684,14 @@ function compactTokens(value) {
       if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟后重置`;
       return `${new Date(row.resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 重置`;
     };
+    const samplingError = quota.sampling?.error;
+    const samplingPaused = quota.sampling?.active === false;
+    const samplingCode = typeof samplingError?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(samplingError.code) ? `（${samplingError.code}）` : '';
+    const observedAt = Number.isFinite(quota.sampling?.lastObservedAt)
+      ? quota.sampling.lastObservedAt : quota.observedAt;
+    const staleSampling = quota.sampling?.fresh === false
+      || Number.isFinite(observedAt) && currentTime >= observedAt + 120_000;
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
@@ -687,8 +710,12 @@ function compactTokens(value) {
         React.createElement('div', { className: 'dsh-claude-meter-head' },
           React.createElement('strong', null, '剩余额度'),
           React.createElement('button', { type: 'button', className: 'dsh-claude-quota-refresh',
-            'aria-label': '刷新额度', title: '刷新额度', disabled: quota.refreshing || quota.paused === 'offline',
+            'aria-label': samplingPaused ? '读取缓存额度' : '刷新额度',
+            title: samplingPaused ? '无运行任务，仅查看缓存额度' : '刷新额度',
+            disabled: quota.refreshing || quota.paused === 'offline',
             onClick: () => { void readQuota('manual'); } }, quota.refreshing ? '…' : '↻')),
+        samplingPaused && React.createElement('p', { className: 'dsh-claude-quota-reset', style: { margin: '10px 0 0' } },
+          '无运行任务，暂停查询；仅显示缓存读数。'),
         ...rows.map(row => React.createElement('div', { key: row.id, className: 'dsh-claude-quota-row' },
           React.createElement('div', { className: 'dsh-claude-quota-line' },
             React.createElement('span', null, row.scope === 'model-weekly' ? `${row.name} · 周额度` : row.name),
@@ -712,9 +739,11 @@ function compactTokens(value) {
           href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
           target: '_blank', rel: 'noopener noreferrer',
         }, '查看更新说明'),
+        samplingError && React.createElement('p', { role: 'alert', style: { margin: '10px 0 0' } },
+          `额度采样失败${samplingCode}${rows.length ? '，保留上次读数。' : '，请稍后重试。'}`),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
-          quota.refreshing ? '正在刷新…'
-            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(quota.observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`)), document.body));
+          quota.refreshing ? (samplingPaused ? '正在读取缓存…' : '正在刷新…')
+            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
   return { SessionMeter, QuotaMeter };
@@ -891,6 +920,8 @@ const SETTINGS_CSS = `
     const bridgeCompatibility = state.bridgeCompatibility;
     const catalogCode = typeof state.modelCatalog?.code === 'string'
       && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.modelCatalog.code) ? `（${state.modelCatalog.code}）` : '';
+    const observabilityCode = typeof state.observabilityWarning?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.observabilityWarning.code) ? `（${state.observabilityWarning.code}）` : '';
     const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     const hostChecks = Array.isArray(state.host?.checks) ? state.host.checks : [];
     const checkRows = [
@@ -1008,6 +1039,9 @@ const SETTINGS_CSS = `
         `远程会话插件不可用：${state.remoteCapabilities.reason}`),
       h('details', { className: 'dcb-card dcb-details' },
         h('summary', null, '兼容性与诊断'),
+        state.observabilityWarning && h('p', { role: 'alert', 'aria-label': '统计记录状态',
+          className: 'dcb-notice', 'data-tone': 'error' },
+          `统计记录异常${observabilityCode}，对话仍可继续；记录可能有缺口。`),
         bridgeCompatibility && h('p', null,
           `客户端插件 ${bridgeCompatibility.clientVersion || '未知'}；服务端 ${bridgeCompatibility.serverVersion || '未声明'}`),
         bridgeCompatibility?.status === 'legacy' && h('p', null, '服务端未声明版本要求，按旧版兼容模式连接。'),
@@ -1078,16 +1112,15 @@ function createUsageProjectionBridge({ React }) {
             if (!remote) return React.createElement(NativeUsage, props);
             const ttftSamples = measured?.ttftSteps ?? 0, tpsSamples = measured?.tpsSamples ?? 0;
             const count = measured?.responseCount ?? 0;
+            // rc.5 renders these two locale values only as <dt> children.
+            // Keep all other translation calls and ordinary sessions native.
             const translate = (key, ...args) => key === 'stats.dialog.ttft'
-              ? `首 Token 平均（TTFT，估算，${ttftSamples} 个样本）`
-              : key === 'stats.dialog.speed' ? `接收速度（TPS，${tpsSamples} 个样本）` : props.t(key, ...args);
-            const content = React.createElement(NativeUsage, { ...props, useProjection: alias, t: translate });
-            const insufficient = !ttftSamples && !tpsSamples;
-            return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 },
-              title: `TTFT：SDK 首帧时长，加上远端同机观察首帧到首个有效输出的间隔，再按样本取平均；非空正文、思考和工具参数 JSON 增量均算有效输出，排除开始帧、心跳、签名和工具名。此估算含 SDK 缓冲与调度误差，非精确上游计时；${ttftSamples}/${count} 个响应有样本。`
-                + `TPS：将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有样本。` }, content,
-            (insufficient || ttftSamples < count || tpsSamples < count) && React.createElement('span',
-              { style: { fontSize: 11, opacity: 0.7 } }, insufficient ? '计时样本不足' : '部分计时'));
+              ? React.createElement('span', { title:
+                `SDK 首帧时长，加上远端同机观察首帧到首个有效输出的间隔，再按样本取平均；非空正文、思考和工具参数 JSON 增量均算有效输出，排除开始帧、心跳、签名和工具名。此估算含 SDK 缓冲与调度误差，非精确上游计时；${ttftSamples}/${count} 个响应有计时样本，缺证据的响应不计入平均。` }, '首 Token 平均（TTFT）')
+              : key === 'stats.dialog.speed' ? React.createElement('span', { title:
+                `将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有完整接收样本。` }, '接收速度（TPS）')
+                : props.t(key, ...args);
+            return React.createElement(NativeUsage, { ...props, useProjection: alias, t: translate });
           }
           function RemoteUsage(props) {
             const remote = props.useProjection('claudeBridge') != null;
@@ -1108,9 +1141,7 @@ function createUsageProjectionBridge({ React }) {
             const incomplete = usage?.coverage === 'legacy' ? '旧记录用量不完整'
               : '当前为已报告用量；旧记录或运行中的用量可能尚未完整。';
             return React.createElement('span', { title: incomplete,
-              style: { display: 'inline-flex', alignItems: 'center', gap: 4 } }, content,
-            React.createElement('span', { style: { fontSize: 11, opacity: 0.7 } },
-              usage?.coverage === 'legacy' ? '历史不完整' : '部分用量'));
+              style: { display: 'inline-flex', alignItems: 'center' } }, content);
           }
           const component = id === 'activity' ? RemoteActivity : RemoteUsage;
           wrappers.add(component);

@@ -29,6 +29,15 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
     if (quotaRequest) return quotaRequest;
     if (previous.paused === 'offline') store.set({ ...previous, paused: undefined });
     if (reason === 'online') quotaRetryAt = 0;
+    // New servers own the account-wide sampling gate. A manual click must not
+    // turn a retained cache snapshot into another upstream quota request.
+    const nextAllowedAt = previous.sampling?.nextAllowedAt;
+    if (Number.isFinite(nextAllowedAt) && nextAllowedAt > now) {
+      if (previous.nextRefreshAt !== nextAllowedAt) {
+        store.set({ ...store.getSnapshot(), nextRefreshAt: nextAllowedAt });
+      }
+      return Promise.resolve();
+    }
     if (!manual && ['open', 'visible', 'online'].includes(reason) && previous.status === 'available'
       && previous.expiresAt > now && now - previous.observedAt < 30_000
       && previous.windows.every(row => row.resetsAt === null || row.resetsAt > now)) return Promise.resolve();
@@ -55,7 +64,9 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
       if (disposed || revision !== quotaGeneration) return;
       if (value.status === 'available') {
         quotaFailures = 0; quotaRetryAt = 0;
-        store.set({ ...value, refreshing: false, nextRefreshAt: 0 });
+        const nextAllowedAt = value.sampling?.nextAllowedAt;
+        store.set({ ...value, refreshing: false,
+          nextRefreshAt: Number.isFinite(nextAllowedAt) && nextAllowedAt > Date.now() ? nextAllowedAt : 0 });
         return;
       }
       const paused = quotaAuthCodes.has(value.code) ? 'auth'
@@ -64,6 +75,7 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
       if (paused) {
         quotaRetryAt = 0;
         store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+          ...(value.sampling ? { sampling: value.sampling } : {}),
           ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
@@ -72,7 +84,9 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
         // A reply with no usable plan windows supersedes the old counters.
         // Transient transport failures may keep a still-fresh snapshot.
         store.set({ ...(previous.status === 'available' && value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous : UNKNOWN_QUOTA),
-          code: value.code, refreshing: false, paused: undefined, nextRefreshAt: quotaRetryAt });
+          ...(value.sampling ? { sampling: value.sampling } : {}),
+          code: value.code, refreshing: false, paused: undefined,
+          nextRefreshAt: Math.max(quotaRetryAt, Number.isFinite(value.sampling?.nextAllowedAt) ? value.sampling.nextAllowedAt : 0) });
       }
     })();
     quotaRequest = request;
