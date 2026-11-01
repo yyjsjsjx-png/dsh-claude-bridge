@@ -267,6 +267,8 @@ function compactTokens(value) {
       && /^[A-Z][A-Z0-9_]{0,63}$/.test(samplingError.code) ? `（${samplingError.code}）` : '';
     const observedAt = Number.isFinite(quota.sampling?.lastObservedAt)
       ? quota.sampling.lastObservedAt : quota.observedAt;
+    const staleSampling = quota.sampling?.fresh === false
+      || Number.isFinite(observedAt) && currentTime >= observedAt + 120_000;
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
@@ -318,7 +320,7 @@ function compactTokens(value) {
           `额度采样失败${samplingCode}${rows.length ? '，保留上次读数。' : '，请稍后重试。'}`),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
           quota.refreshing ? (samplingPaused ? '正在读取缓存…' : '正在刷新…')
-            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${quota.sampling?.fresh === false ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
+            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
   return { SessionMeter, QuotaMeter };
