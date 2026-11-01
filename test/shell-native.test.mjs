@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -82,12 +82,17 @@ test('实际 rc5 Windows：PowerShell 执行、审批、超时、取消及原生
     }
 
     await t.test('实际返回中文输出及会话工作目录，审批允许后才执行', async () => {
-      const result = await execute("Write-Output 'shell-中文'; (Get-Location).Path")
+      const result = await execute("Write-Output 'shell-中文'; Write-Output ('DSH_NATIVE_CWD=' + (ConvertTo-Json -InputObject (Get-Location).Path -Compress))")
       assert.equal(result.isError, false, outputText(result))
       assert.equal(result.value.exitCode, 0)
       assert.equal(result.value.cwd, workdir)
       assert.match(outputText(result), /shell-中文/)
-      assert.ok(outputText(result).includes(workdir))
+      const cwdLine = outputText(result).match(/^DSH_NATIVE_CWD=(.+)$/m)
+      assert.ok(cwdLine, `缺少实际工作目录输出：${outputText(result)}`)
+      const actualCwd = JSON.parse(cwdLine[1])
+      // PowerShell expands Windows 8.3 aliases; compare the actual directories.
+      assert.equal(await realpath(actualCwd), await realpath(workdir),
+        `工作目录不一致：expected=${JSON.stringify(workdir)}, actual=${JSON.stringify(actualCwd)}`)
       assert.equal(approvals, 1)
     })
 
