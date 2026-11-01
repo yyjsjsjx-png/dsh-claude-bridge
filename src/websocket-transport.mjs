@@ -17,7 +17,7 @@ const decoder = new TextDecoder('utf-8', { fatal: true })
 /** Keep the original RPC peer only when both endpoints negotiate resume-v1. */
 export async function createWebSocketTransport({
   url: rawUrl, token: rawToken, deviceId: rawDeviceId, handlers = {}, onNotification, onClose, onDiagnostic,
-  onConnectionState, signal, webSocketFactory = url => new WebSocket(url), connectTimeoutMs = 10_000,
+  onConnectionState, onTraffic, signal, webSocketFactory = url => new WebSocket(url), connectTimeoutMs = 10_000,
   closeTimeoutMs = 10_000, maxLineBytes = 4 * 1024 * 1024, reconnectWindowMs = 60_000, initialConnectWindowMs = 0,
   reconnectDelays = [1000, 2000, 4000, 8000], heartbeatMs = 15_000, heartbeatTimeoutMs = 45_000,
   random = Math.random,
@@ -90,7 +90,7 @@ export async function createWebSocketTransport({
         }, () => callback(new Error('消息压缩失败')))
       }
     } })
-    peer = createRpcPeer({ input, output, handlers, onNotification, onClose, onDiagnostic, maxLineBytes })
+    peer = createRpcPeer({ input, output, handlers, onNotification, onClose, onDiagnostic, onTraffic, maxLineBytes })
     peer.closed.then(info => shutdown(info.reason))
   }
   async function deliverLine(line) {

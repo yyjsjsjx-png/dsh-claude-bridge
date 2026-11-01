@@ -57,6 +57,7 @@ export function createSshTransport({
   onNotification,
   onClose,
   onDiagnostic,
+  onTraffic,
   maxLineBytes,
   maxStderrBytes = 64 * 1024,
   stopGraceMs = 1000,
@@ -114,6 +115,7 @@ export function createSshTransport({
     onNotification,
     onClose,
     onDiagnostic,
+    onTraffic,
     ...(maxLineBytes === undefined ? {} : { maxLineBytes }),
   })
 

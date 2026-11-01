@@ -60,6 +60,7 @@ export function createRpcPeer({
   onNotification,
   onClose,
   onDiagnostic,
+  onTraffic,
   maxLineBytes = DEFAULT_MAX_LINE_BYTES,
 }) {
   if (!input || typeof input.on !== 'function' || !output || typeof output.write !== 'function') {
@@ -78,6 +79,8 @@ export function createRpcPeer({
   if (onDiagnostic !== undefined && typeof onDiagnostic !== 'function') {
     throw new TypeError('onDiagnostic 必须是函数')
   }
+  if (onTraffic !== undefined && typeof onTraffic !== 'function') throw new TypeError('onTraffic 必须是函数')
+  const traffic = (direction, message) => { try { onTraffic?.({ direction, message }) } catch {} }
 
   const prefix = randomUUID()
   const pending = new Map()
@@ -156,6 +159,7 @@ export function createRpcPeer({
       throw closedError()
     }
     try {
+      traffic('sent', message)
       output.write(frame)
     } catch {
       close('write_error')
@@ -306,6 +310,7 @@ export function createRpcPeer({
     let message
     try { message = JSON.parse(textDecoder.decode(line)) } catch { return close('protocol_error') }
     if (!isRecord(message) || message.jsonrpc !== '2.0') return close('protocol_error')
+    traffic('received', message)
     if ('method' in message) handleCall(message, line.length)
     else handleResponse(message)
   }
