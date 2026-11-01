@@ -106,6 +106,7 @@ test('响应审计不叠加整轮主代理用量，子代理和正文不入账�
   stream({ type: 'message_delta', usage: { output_tokens: 3 } })
   stream({ type: 'message_start', message: { id: 'child-response', model: 'child-model' } }, { parent_tool_use_id: 'child' })
   stream({ type: 'message_start', message: { id: 'response-b', model: 'haiku' } })
+  capture.observe({ type: 'assistant', message: { id: 'synthetic', model: '<synthetic>', content: [{ type: 'text', text: 'No response requested.' }] } })
   clock = 100
   capture.finish({ status: 'completed', metrics: { usage: { scope: 'current-turn-main-agent', input_tokens: 2,
     output_tokens: 3, cache_read_input_tokens: 10, cache_creation_input_tokens: 4 }, cost: { scope: 'session-cumulative-estimate', usd: 1 } } })
@@ -113,7 +114,14 @@ test('响应审计不叠加整轮主代理用量，子代理和正文不入账�
   for (const { kind, row } of rows) normalizeObservabilityRecord({ run: 'runs', response: 'responses', timing: 'timing' }[kind], row)
   assert.equal(rows.filter(value => value.kind === 'run').length, 1)
   assert.equal(rows.find(value => value.kind === 'run').row.usage.outputTokens, 3)
+  assert.equal(rows.find(value => value.kind === 'run').row.model, 'haiku')
   assert.equal(rows.some(value => value.row.responseId === 'child-response'), false)
   assert.equal(JSON.stringify(rows).includes('synthetic-private-marker'), false)
   assert.deepEqual(rows.filter(value => value.row.metric === 'first-output').map(value => value.row.quality), ['estimate', 'unknown'])
+
+  const partial = createRunObservations({ params: { ...base(), sessionId: 'sdk-a' }, record: (kind, row) => {
+    normalizeObservabilityRecord({ run: 'runs', timing: 'timing' }[kind], row)
+    if (kind === 'run') { assert.equal(row.status, 'completed'); assert.equal(row.usage, undefined) }
+  } })
+  partial.finish({ status: 'completed', metrics: { usage: { scope: 'current-turn-main-agent', input_tokens: 1, output_tokens: 2 } } })
 })

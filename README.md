@@ -8,6 +8,8 @@
 
 第一次使用请从 [首次使用与自部署指南](docs/getting-started.md) 开始；服务器安装与配置见 [远程服务部署](docs/remote-service.md)。公开源码和安装包不包含任何账号、服务器地址或口令。
 
+参与开发见 [Issue 并行开发与交付](docs/development.md)；候选统计能力与精度边界见 [用量、额度与耗时账本](docs/observability.md)。候选合并不等于正式发布或两端升级。
+
 ## 使用边界与合规
 
 - 本项目是个人实验工具，与 Anthropic 无隶属、合作或背书关系。Claude、Claude Code 为 Anthropic 的商标，此处仅用于说明服务器上运行的是官方程序。

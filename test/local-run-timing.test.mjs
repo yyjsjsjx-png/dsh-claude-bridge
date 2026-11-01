@@ -20,6 +20,8 @@ test('本机计时在RPC通知排队前观察有效思考，排除头帧与重�
   clock = 20; frame({ type: 'content_block_delta', delta: { type: 'signature_delta', signature: 'not-content' } })
   clock = 90; frame({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'synthetic-private-marker' } })
   clock = 100; frame({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'later' } })
+  input.write(JSON.stringify({ jsonrpc: '2.0', method: 'sdk.message', params: { runId: 'run-a', message: { type: 'assistant',
+    message: { id: 'synthetic', model: '<synthetic>', content: [{ type: 'text', text: 'No response requested.' }] } } } }) + '\n')
   assert.equal(rows.length, 1)
   assert.equal(rows[0].durationMs, 80)
   assert.equal(rows[0].quality, 'precise')
@@ -28,6 +30,7 @@ test('本机计时在RPC通知排队前观察有效思考，排除头帧与重�
   await pending
   release(); await peer.drainNotifications(); peer.close()
   assert.equal(rows.filter(row => row.metric === 'first-output').length, 1)
+  assert.equal(rows.at(-1).model, 'unknown')
 })
 
 test('额度共享缓存区分新鲜度与保留期，不改变读数时间或保留已重置窗口', () => {
