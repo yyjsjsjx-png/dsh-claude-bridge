@@ -13,6 +13,7 @@ import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { validateContextPreferences } from '../src/context-preferences.mjs'
 import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
 import { createFirstOutputObserver } from './first-output.mjs'
+import { createPromptInput } from './prompt-input.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
 const defaultBridgeRelease = { serverVersion: bridgeManifest.version,
@@ -251,6 +252,21 @@ function resultMetrics(result, runId, contextSummary) {
   return Object.keys(metrics).length > 2 ? metrics : undefined
 }
 
+// A queued user input may be folded into the running SDK turn or start the
+// next one. Main usage is per SDK turn; modelUsage and cost remain cumulative.
+function combineTurnResults(previous, last) {
+  if (!previous.length) return last
+  const turns = [...previous, last]
+  const keys = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']
+  const complete = turns.every(result => result.usage && keys.every(key =>
+    (result.usage[key] === undefined && key.startsWith('cache_'))
+      || Number.isSafeInteger(result.usage[key]) && result.usage[key] >= 0))
+  const { usage: _usage, ...result } = last
+  if (complete) result.usage = Object.fromEntries(keys.map(key => [key,
+    turns.reduce((total, turn) => total + (turn.usage[key] ?? 0), 0)]))
+  return result
+}
+
 function failureDetail(result, assistantError, authFlowFailed = false) {
   const known = {
     error_max_turns: ['MAX_TURNS_REACHED', '本轮达到最大调用次数'],
@@ -331,7 +347,7 @@ export function parseServiceBudget(value) {
 }
 
 /** Create handlers for one private stdio worker. Dependencies are injected for offline tests. */
-export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now() }) {
+export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, inputConfirmationTimeoutMs = 30_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now() }) {
   if (!sdk || typeof sdk.query !== 'function' || typeof sdk.tool !== 'function'
     || typeof sdk.createSdkMcpServer !== 'function' || typeof sdk.getSessionInfo !== 'function') {
     throw new TypeError('SDK 接口不完整')
@@ -349,6 +365,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   if (!Number.isSafeInteger(toolEventTimeoutMs) || toolEventTimeoutMs < 1 || toolEventTimeoutMs > 60_000) {
     throw new TypeError('工具事件等待时间无效')
   }
+  if (!Number.isSafeInteger(inputConfirmationTimeoutMs) || inputConfirmationTimeoutMs < 1 || inputConfirmationTimeoutMs > 120_000) throw new TypeError('用户输入确认等待时间无效')
 
   const activeSessions = new Set()
   const activeRuns = new Map()
@@ -434,6 +451,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         toolContextViaPostHook: true,
         toolConclusionViaPostHook: true,
         stepPreparationViaBatchHook: true,
+        userInputViaStream: true,
         maxPromptBytes: MAX_PROMPT_BYTES,
         ...(maxBudgetUsd === undefined ? {} : { maxBudgetUsd }),
       },
@@ -805,17 +823,51 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             throw run.problem
           }
           const valid = response && typeof response === 'object' && !Array.isArray(response)
-            && Object.keys(response).every((key) => key === 'additionalContexts' || key === 'continue')
+            && Object.keys(response).every((key) => ['additionalContexts', 'userMessages', 'continue'].includes(key))
             && (response.continue === undefined || typeof response.continue === 'boolean')
             && (response.additionalContexts === undefined || (Array.isArray(response.additionalContexts)
               && response.additionalContexts.length <= 64 && response.additionalContexts.every((item) => typeof item === 'string')
               && Buffer.byteLength(JSON.stringify(response.additionalContexts), 'utf8') <= MAX_INSTRUCTION_BYTES))
-          if (!valid || (response.continue === false && response.additionalContexts?.length)) {
+            && (response.userMessages === undefined || (Array.isArray(response.userMessages)
+              && response.userMessages.length <= 64 && response.userMessages.every(item =>
+                item && typeof item === 'object' && !Array.isArray(item)
+                && Object.keys(item).every(key => key === 'id' || key === 'content')
+                && typeof item.id === 'string' && SESSION_ID.test(item.id)
+                && Array.isArray(item.content) && item.content.length > 0 && item.content.length <= 64
+                && item.content.every(block => block && typeof block === 'object' && !Array.isArray(block)
+                  && Object.keys(block).every(key => key === 'type' || key === 'text')
+                  && block.type === 'text' && typeof block.text === 'string')
+                && item.content.some(block => block.text.trim()))
+              && Buffer.byteLength(JSON.stringify(response.userMessages), 'utf8') <= MAX_PROMPT_BYTES))
+          if (!valid || (response.continue === false && (response.additionalContexts?.length || response.userMessages?.length))) {
             run.problem = new WorkerError('STEP_PREPARE_INVALID', '本机 DSH 下一步上下文不受支持', { toolMayHaveExecuted: true })
             controller.abort()
             throw run.problem
           }
           if (response.continue === false) appliedConclusion = true
+          if (response.userMessages?.length) {
+            const messages = response.userMessages.map(item => ({ type: 'user', uuid: item.id.toLowerCase(),
+              session_id: sessionId, message: { role: 'user', content: item.content },
+              parent_tool_use_id: null, priority: 'now' }))
+            if (new Set([...submittedUserInputs, ...messages.map(message => message.uuid)]).size > 64) {
+              run.problem = new WorkerError('USER_INPUT_LIMIT', '本轮插话数量超过 SDK 可确认范围，已停止；请核实后再继续。', { toolMayHaveExecuted: true })
+              controller.abort(); throw run.problem
+            }
+            for (const message of messages) if (!submittedUserInputs.has(message.uuid)) {
+              pendingUserInputs.add(message.uuid); submittedUserInputs.add(message.uuid)
+            }
+            try {
+              await promptInput.send(messages)
+            } catch {
+              if (!run.problem) run.problem = controller.signal.aborted
+                ? new WorkerError('CANCELLED', '请求已取消')
+                : new WorkerError('USER_INPUT_UNCONFIRMED', '运行中插话未能确认送入 SDK，已停止；请核实后再继续。', { toolMayHaveExecuted: true })
+              controller.abort()
+              throw run.problem
+            }
+            throwIfAborted(signal)
+            diagnose('input', 'submitted')
+          }
           for (const id of batchIds) if (completedToolIds.has(id)) batchedToolIds.add(id)
           diagnose('step', response.continue === false ? 'stopped' : 'prepared')
           contextSampler?.request()
@@ -962,27 +1014,20 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           })()),
         }
         // Streaming input supports images and interactive SDK callbacks.
-        let releasePrompt
-        const promptOpen = new Promise((resolve) => { releasePrompt = resolve })
-        let beginPrompt
-        const promptReady = new Promise((resolve) => { beginPrompt = resolve })
-        const releaseInput = () => { beginPrompt(); releasePrompt() }
+        const pendingUserInputs = new Set(), submittedUserInputs = new Set(), turnResults = [], seenResults = new Set()
+        let confirmationTimer
+        const promptInput = createPromptInput({ type: 'user', ...(SESSION_ID.test(runId) ? { uuid: runId } : {}),
+          message: { role: 'user', content: prompt }, parent_tool_use_id: null },
+        () => new WorkerError('USER_INPUT_UNCONFIRMED', 'SDK 用户输入流已关闭，插话未确认送达。', { toolMayHaveExecuted: true }))
+        const releaseInput = () => { clearTimeout(confirmationTimer); promptInput.close() }
         controller.signal.addEventListener('abort', releaseInput, { once: true })
-        async function* promptStream() {
-          // Verify hooks before any user prompt can start an inference request.
-          await promptReady
-          if (controller.signal.aborted) return
-          yield { type: 'user', ...(SESSION_ID.test(runId) ? { uuid: runId } : {}),
-            message: { role: 'user', content: prompt }, parent_tool_use_id: null }
-          await promptOpen
-        }
         let result
         let contextSummary
         let compactMetadata
         let assistantError
         let toolsetVerified = false
         let firstModelEvent = false, firstToken = false, firstText = false
-        const sdkQuery = sdk.query({ prompt: promptStream(), options: sdkOptions })
+        const sdkQuery = sdk.query({ prompt: promptInput[Symbol.asyncIterator](), options: sdkOptions })
         const firstOutput = createFirstOutputObserver({ isActive: () => !controller.signal.aborted })
         contextSampler = createContextSampler({ query: sdkQuery, signal: controller.signal, diagnose,
           publish: message => { if (!compact) context.peer.notify('sdk.message', { runId, message }) } })
@@ -993,7 +1038,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           }
           diagnose('sdk', 'hooks-verified')
           timing('hooks_verified')
-          beginPrompt()
+          // Verify hooks before any user prompt can start inference.
+          promptInput.start()
           for await (const incoming of sdkQuery) {
           const responseObservedAt = responseTimingNow()
           let message = incoming
@@ -1001,6 +1047,29 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           if (message?.session_id !== undefined && message.session_id !== sessionId) {
             throw new WorkerError('SESSION_ID_MISMATCH', 'SDK 返回的会话标识不匹配')
           }
+          if ((message?.type === 'stream_event' && message.event?.type === 'message_start'
+            || message?.type === 'assistant') && message.parent_tool_use_id == null) clearTimeout(confirmationTimer)
+          if (message?.type === 'result' && typeof message.uuid === 'string') {
+            if (seenResults.has(message.uuid)) continue
+            seenResults.add(message.uuid)
+          }
+          if (message?.type === 'result' && message.subtype === 'success' && message.is_error !== true && submittedUserInputs.size
+            && message.parent_tool_use_id == null) {
+            // Echoed user messages only prove receipt, not consumption. Use the
+            // SDK result's consumed UUIDs; never retry an unconfirmed input.
+            const consumed = [...(Array.isArray(message.user_message_uuids) ? message.user_message_uuids : []), message.user_message_uuid]
+            for (const id of consumed) if (typeof id === 'string') pendingUserInputs.delete(id.toLowerCase())
+            if (pendingUserInputs.size) {
+              turnResults.push(message)
+              clearTimeout(confirmationTimer)
+              confirmationTimer = setTimeout(() => {
+                if (!run.problem) run.problem = new WorkerError('USER_INPUT_UNCONFIRMED', 'SDK 未确认消费运行中插话，已停止；请核实后再继续。', { toolMayHaveExecuted: true })
+                controller.abort()
+              }, inputConfirmationTimeoutMs)
+              continue
+            }
+          }
+          if (message?.type === 'result') message = combineTurnResults(turnResults, message)
           if (message?.type === 'system' && message.subtype === 'init') {
             verifyToolset(message, sessionId, qualifiedNames)
             toolsetVerified = true
@@ -1092,7 +1161,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             }
             if (message.subtype === 'success' && message.is_error !== true) contextSummary = await contextSampler.finish()
             else contextSampler.stop()
-            releasePrompt()
+            releaseInput()
           }
           }
         } catch (error) {
@@ -1107,6 +1176,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         }
         if (run.problem) throw run.problem
         if (controller.signal.aborted) throw new WorkerError('CANCELLED', '请求已取消')
+        if (pendingUserInputs.size && (!result && turnResults.length || result?.subtype === 'success' && result.is_error !== true)) throw new WorkerError('USER_INPUT_UNCONFIRMED', 'SDK 未确认消费运行中插话，已停止；请核实后再继续。', { toolMayHaveExecuted: true })
         if (!result) throw new WorkerError('SDK_RESULT_MISSING', 'SDK 未返回最终结果')
         if (result.subtype === 'success' && !toolsetVerified) {
           throw new WorkerError('SDK_TOOLSET_UNVERIFIED', 'SDK 未提供可验证的工具清单')

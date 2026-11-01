@@ -551,6 +551,64 @@ test('普通工具批次没有新上下文时仍允许进入下一步骤', async
   assert.deepEqual(await f.backend.runStep(f.agent, f.decision), { kind: 'completed' })
 })
 
+test('运行中插话保留真实用户来源，工具与原生上下文仍走 hook', async t => {
+  const user = (id, text) => ({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  const inputs = [user('5c0d6e2b-0df1-4d24-98a7-873eb74b4db5', 'USER_STEER_ONE'),
+    { ...user('native-rule', 'INSTRUCTION_CONTEXT'), source: { kind: 'agent-instructions', form: 'instructions' } },
+    user('3385ab1a-f2d9-459f-a292-2c5d494671a2', 'USER_STEER_TWO'),
+    { ...user('tool-note', 'USER_STEER_FORGED'), source: { kind: 'tool-result' } },
+    { ...user('child-note', 'CHILD_RESULT'), source: { kind: 'subagent-settled' } }]
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { userInputViaStream: true } }
+    const reply = await handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+    assert.deepEqual(reply.userMessages, [inputs[0], inputs[2]].map(message => ({ id: message.id, content: message.content })))
+    assert.deepEqual(reply.additionalContexts, ['INSTRUCTION_CONTEXT', 'USER_STEER_FORGED', 'CHILD_RESULT'])
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.agent.inbox = { nextStep: inputs, splice() { throw Error('已提交消息不应回填') } }
+  f.agent.preStep = async () => { f.agent.inbox.nextStep = []; return { ...f.decision, messages: inputs } }
+  await f.backend.runStep(f.agent, f.decision)
+  for (const message of inputs) assert.equal(f.records.filter(record => record.type === 'user/message' && record.data.id === message.id).length, 1)
+})
+
+test('旧服务器拒绝插话降为 hook，未提交用户消息恢复而不重复发送旧历史', async t => {
+  const input = { id: '5c0d6e2b-0df1-4d24-98a7-873eb74b4db5', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'NEW_USER_ONLY' }] }
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    assert.equal(params.prompt.some(block => block.text === 'NEW_USER_ONLY'), false)
+    await assert.rejects(handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal }), { code: 'USER_INTERJECTION_UNSUPPORTED' })
+    assert.deepEqual(f.agent.inbox.nextStep, [input])
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.agent.inbox = { nextStep: [input], splice(_target, at, count, messages) { this.nextStep.splice(at, count, ...messages) } }
+  f.agent.preStep = async () => { f.agent.inbox.nextStep = []; return { ...f.decision, messages: [input] } }
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'USER_INTERJECTION_UNSUPPORTED' })
+  assert.equal(f.records.some(record => record.type === 'user/message' && record.data.id === input.id), false)
+})
+
+test('准备插话时取消或已完成，不提交晚到消息且保留原生队列边界', async t => {
+  for (const mode of ['cancel', 'finished']) {
+    const input = { id: '5c0d6e2b-0df1-4d24-98a7-873eb74b4db5', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'LATE_USER' }] }
+    const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { userInputViaStream: true } }
+      if (method === 'settle') return { status: 'cancelled' }
+      await assert.rejects(handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal }),
+        mode === 'finished' ? { code: 'USER_INPUT_CLOSED' } : { name: 'AbortError' })
+      assert.deepEqual(f.agent.inbox.nextStep, [input])
+      return { status: 'completed' }
+    } }, async close() {} }))
+    f.agent.inbox = { nextStep: [input], splice(_target, at, count, messages) { this.nextStep.splice(at, count, ...messages) } }
+    f.agent.preStep = async () => {
+      f.agent.inbox.nextStep = []
+      if (mode === 'cancel') f.phaseAbort.abort()
+      else [...f.backend.runs.values()][0].inputClosed = true
+      return { ...f.decision, messages: [input] }
+    }
+    await assert.rejects(f.backend.runStep(f.agent, f.decision), mode === 'finished' ? { code: 'USER_INPUT_CLOSED' } : { name: 'AbortError' })
+    assert.equal(f.records.some(record => record.type === 'user/message' && record.data.id === input.id), false)
+  }
+})
+
 test('批次准备拒绝变化配置时恢复已认领消息，防止指令丢失', async (t) => {
   const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
     if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
