@@ -1059,6 +1059,36 @@ function createUsageProjectionBridge({ React }) {
           dispose?.(); dispose = undefined;
           if (!next) return;
           const NativeUsage = next.component;
+          function RemoteActivity(props) {
+            const remote = props.useProjection('claudeBridge') != null;
+            const measured = props.useProjection('claudeBridgeResponseStats');
+            const original = props.useProjection('sessionStats');
+            const stats = {
+              turns: original?.turns ?? 0, steps: original?.steps ?? 0,
+              llmMs: original?.llmMs ?? 0, toolMs: original?.toolMs ?? 0,
+              ttftMs: measured?.ttftMs ?? 0, ttftSteps: measured?.ttftSteps ?? 0,
+              decodeMs: measured?.decodeMs ?? 0, decodeTokens: measured?.decodeTokens ?? 0,
+            };
+            const alias = (key, selector, equal) => {
+              // Always invoke the native hook; session switching keeps hook order stable.
+              const value = props.useProjection(key, selector, equal);
+              return !remote || key !== 'sessionStats' ? value
+                : typeof selector === 'function' ? selector(stats) : stats;
+            };
+            if (!remote) return React.createElement(NativeUsage, props);
+            const ttftSamples = measured?.ttftSteps ?? 0, tpsSamples = measured?.tpsSamples ?? 0;
+            const count = measured?.responseCount ?? 0;
+            const translate = (key, ...args) => key === 'stats.dialog.ttft'
+              ? `首响应平均（TTFT，${ttftSamples} 个样本）`
+              : key === 'stats.dialog.speed' ? `接收速度（TPS，${tpsSamples} 个样本）` : props.t(key, ...args);
+            const content = React.createElement(NativeUsage, { ...props, useProjection: alias, t: translate });
+            const insufficient = !ttftSamples && !tpsSamples;
+            return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 },
+              title: `TTFT：各响应 message_start 携带的 SDK ttft_ms 的平均值，不含此前重试和退避；${ttftSamples}/${count} 个响应有样本。`
+                + `TPS：将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有样本。` }, content,
+            (insufficient || ttftSamples < count || tpsSamples < count) && React.createElement('span',
+              { style: { fontSize: 11, opacity: 0.7 } }, insufficient ? '计时样本不足' : '部分计时'));
+          }
           function RemoteUsage(props) {
             const remote = props.useProjection('claudeBridge') != null;
             const usage = props.useProjection('claudeBridgeUsage');
@@ -1082,16 +1112,18 @@ function createUsageProjectionBridge({ React }) {
             React.createElement('span', { style: { fontSize: 11, opacity: 0.7 } },
               usage?.coverage === 'legacy' ? '历史不完整' : '部分用量'));
           }
-          wrappers.add(RemoteUsage);
+          const component = id === 'activity' ? RemoteActivity : RemoteUsage;
+          wrappers.add(component);
           dispose = ctx.slots.register({ name: slot, ...next.options,
-            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject: next.inject }, RemoteUsage);
+            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject: next.inject }, component);
         } finally { reconciling = false; }
     };
     const unsubscribe = ctx.slots.subscribe(slot, reconcile);
     reconcile();
     return () => { unsubscribe(); dispose?.(); };
     };
-    const cleanup = [mount('conversation.composer.dock', 'id', 'usage'), mount('conversation.chat.node', 'key', 'turn-tail')];
+    const cleanup = [mount('conversation.composer.dock', 'id', 'usage'), mount('conversation.chat.node', 'key', 'turn-tail'),
+      mount('conversation.composer.dock', 'id', 'activity')];
     return () => { closed = true; for (const dispose of cleanup) dispose(); wrappers.clear(); };
   };
 }
