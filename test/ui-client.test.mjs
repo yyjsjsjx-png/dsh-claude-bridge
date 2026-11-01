@@ -70,12 +70,13 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   let contextSaves = 0;
   let bridgeCompatibility = { status: 'compatible', clientVersion: '0.2.3-rc.1',
     serverVersion: '9.0.0', minimumClientVersion: '0.2.0', message: '客户端符合服务端版本要求。' };
+  let host = { version: '0.2.1-rc.5', baselineVersion: '0.2.1-rc.5', status: 'compatible' };
   const ctx = {
     workspaces: {}, uiWorkspace: {},
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured, url: 'wss://example.test/',
         connected: false, authentication: 'unknown', diagnosticsPath: 'local-diagnostics',
-        contextPreferences, autoCompactWindowSupported: true, bridgeCompatibility,
+        contextPreferences, autoCompactWindowSupported: true, bridgeCompatibility, host,
         disabledFeatures: [{ name: '规划模式', status: 'disabled', reason: '测试原因' }],
         remotePreset: { mode: 'basic', reasons: ['标准预设无法适配'], disabledComponents: [] },
         remoteCapabilities: { status: 'unavailable', shell: 'pwsh', reason: '基础执行失败' },
@@ -117,6 +118,32 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.equal(settings.hooks.settings.getSnapshot().bridgeCompatibility.status, 'compatible');
   assert.match(textOf(render()), /客户端插件 0\.2\.3-rc\.1；服务端 9\.0\.0/);
   assert.equal(versionAlert(render()), undefined);
+  assert.match(textOf(render()), /本次启动尚未取得自动检查结果/);
+  host = { ...host, checks: [
+    { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
+    { id: 'session-protocol', evidence: 'synthetic', status: 'passed' },
+    { id: 'session-restore', evidence: 'synthetic', status: 'passed' },
+    { id: 'desktop-acceptance', evidence: 'desktop', status: 'not-run' },
+    { id: 'remote-sdk', evidence: 'real-sdk', status: 'not-run' },
+  ] };
+  await settings.refreshStatus();
+  assert.equal(settings.hooks.settings.getSnapshot().host.checks.length, 5);
+  const checkText = textOf(render());
+  assert.match(checkText, /DSH 0\.2\.1-rc\.5；已验证基线：0\.2\.1-rc\.5/);
+  assert.match(checkText, /Host 接口（接口检查）：通过/);
+  assert.match(checkText, /会话协议（内存探针）：通过/);
+  assert.match(checkText, /严格会话恢复（内存探针）：通过/);
+  assert.match(checkText, /当前桌面行为（桌面实测）：本次未执行/);
+  assert.match(checkText, /真实远程 SDK（真实 SDK 验收）：本次未执行/);
+  assert.match(checkText, /桌面行为和真实远程 SDK 未自动验收/);
+  host = { ...host, checks: host.checks.map(check => check.id === 'remote-sdk'
+    ? { ...check, evidence: 'synthetic', status: 'passed' } : check) };
+  await settings.refreshStatus();
+  assert.match(textOf(render()), /真实远程 SDK（真实 SDK 验收）：未取得/);
+  host = undefined;
+  await settings.refreshStatus();
+  assert.equal(settings.hooks.settings.getSnapshot().host, null);
+  assert.match(textOf(render()), /本次启动尚未取得自动检查结果/);
   bridgeCompatibility = { ...bridgeCompatibility, status: 'update-required', minimumClientVersion: '0.2.4',
     message: '请更新客户端插件。' };
   await settings.refreshStatus();

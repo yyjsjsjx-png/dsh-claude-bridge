@@ -2,7 +2,7 @@
 export function createSettingsController({ rpc, createStore, textError, createModelController, onConnectionChange }) {
   const store = createStore({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
-    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null,
+    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
@@ -35,6 +35,7 @@ export function createSettingsController({ rpc, createStore, textError, createMo
           remotePreset: status.remotePreset ?? null, remoteCapabilities: status.remoteCapabilities ?? null,
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
+          host: status.host ?? null,
           usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',

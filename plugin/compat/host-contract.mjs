@@ -1,3 +1,5 @@
+import { assertSessionRestore } from './session-restore-probe.mjs';
+
 /** Required host capabilities, independent of DSH's release number or source hash. */
 export const HOST_FUNCTIONS = Object.freeze({
   '@deepseek-ai/cordis': ['Service', 'Context'],
@@ -11,6 +13,8 @@ export const HOST_FUNCTIONS = Object.freeze({
     'ToolCallRecovery', 'canonicalHeader', 'headerEquals', 'interruptedTurnClosers',
     'isReplacementSurfaceEvent', 'appendPluginRecord'],
   '@deepseek-ai/dsh-session-persistence': ['SessionPersistenceNotFoundError'],
+  '@deepseek-ai/dsh-session-format-catalog': [],
+  '@deepseek-ai/dsh-session-format-v3-to-v4': [],
   '@deepseek-ai/dsh-agent': ['agentEvents', 'assembleContextFor'],
   '@deepseek-ai/dsh-util-values': ['assertNever', 'deepFreeze'],
   '@deepseek-ai/dsh-scope': ['createScope', 'scopeOf'],
@@ -74,6 +78,16 @@ export function assertHostModule(name, module, version) {
     requireValue(module.SessionPreparation.create, '缺少 SessionPreparation.create()', version, 'function');
     requireValue(module.SESSION_FORMAT_VERSION, '缺少 SESSION_FORMAT_VERSION', version);
   }
+  if (name === '@deepseek-ai/dsh-session-format-catalog') {
+    requireValue(module?.sessionFormatCatalog?.createRestore,
+      '缺少 sessionFormatCatalog.createRestore()', version, 'function');
+  }
+  if (name === '@deepseek-ai/dsh-session-format-v3-to-v4') {
+    for (const method of ['encodeHeader', 'encodeEvent']) {
+      requireValue(module?.releasedV4SessionFormatCodec?.[method],
+        `缺少 releasedV4SessionFormatCodec.${method}()`, version, 'function');
+    }
+  }
   if (name === '@deepseek-ai/dsh-tools') {
     for (const key of ['TOOL_ABORTED_BEFORE_DISPATCH', 'TOOL_RUNTIME_SCHEDULER']) {
       requireValue(module[key], `缺少 ${name}.${key}`, version);
@@ -132,4 +146,13 @@ export function assertHostContract(modules, version) {
   } catch (error) {
     throw new DshCompatibilityError(version, '原生会话或消息协议已改变', { cause: error });
   }
+  try { assertSessionRestore(modules); }
+  catch (error) {
+    throw new DshCompatibilityError(version, '原生会话严格恢复检查失败', { cause: error });
+  }
+  return [
+    { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
+    { id: 'session-protocol', evidence: 'synthetic', status: 'passed' },
+    { id: 'session-restore', evidence: 'synthetic', status: 'passed' },
+  ];
 }

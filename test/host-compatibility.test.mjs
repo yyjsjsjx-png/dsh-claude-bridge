@@ -27,6 +27,26 @@ test('源模式 RPC 参数保持兼容，新增可选参数可用，重命名参
     error => error.code === 'DSH_API_INCOMPATIBLE' && /RPC 参数已改变/u.test(error.message));
 });
 
+test('严格恢复依赖精确检查 catalog 与 codec 的实际调用接口', () => {
+  const catalogName = '@deepseek-ai/dsh-session-format-catalog';
+  const codecName = '@deepseek-ai/dsh-session-format-v3-to-v4';
+  assert.doesNotThrow(() => assertHostModule(catalogName, { sessionFormatCatalog: { createRestore() {} } }, '0.3.0'));
+  assert.doesNotThrow(() => assertHostModule(codecName,
+    { releasedV4SessionFormatCodec: { encodeHeader() {}, encodeEvent() {} } }, '0.3.0'));
+  for (const [name, module, missing] of [
+    [catalogName, {}, 'sessionFormatCatalog.createRestore'],
+    [catalogName, { sessionFormatCatalog: { createRestore: null } }, 'sessionFormatCatalog.createRestore'],
+    [codecName, {}, 'releasedV4SessionFormatCodec.encodeHeader'],
+    [codecName, { releasedV4SessionFormatCodec: { encodeHeader() {} } }, 'releasedV4SessionFormatCodec.encodeEvent'],
+  ]) {
+    assert.throws(() => assertHostModule(name, module, '0.3.0'), error => {
+      assert.equal(error.code, 'DSH_API_INCOMPATIBLE');
+      assert.ok(error.message.includes(missing));
+      return true;
+    });
+  }
+});
+
 test('升级后的安装版可解析新 ESM 条件导出和变更的标准预设，不再校验旧摘要', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-compat-'));
   const previous = process.env.DSH_CLAUDE_BRIDGE_RESOURCES;

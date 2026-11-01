@@ -3,6 +3,24 @@ import assert from 'node:assert/strict';
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES);
 
+test('实际 rc5 服务：状态返回同一份 Host 检查，不把启动探针当作实测验收', { skip: !available }, async () => {
+  const { ClaudeBridgeService } = await import('../plugin/index.mjs');
+  const { assertDshCompatibility } = await import('../plugin/compat/resolve-dsh-module.mjs');
+  let ownerChecks = 0;
+  const service = { assertOwner() { ownerChecks++; }, ctx: {},
+    backend: { async status() { return { configured: false, connected: false }; } } };
+  const status = await ClaudeBridgeService.prototype.status.call(service);
+  assert.equal(ownerChecks, 1);
+  assert.equal(status.host, await assertDshCompatibility());
+  assert.equal(status.host.checks.length, 5);
+  assert.deepEqual(status.host.checks.filter(check => check.status === 'not-run'), [
+    { id: 'desktop-acceptance', evidence: 'desktop', status: 'not-run' },
+    { id: 'remote-sdk', evidence: 'real-sdk', status: 'not-run' },
+  ]);
+  assert.deepEqual(status.desktopCompatibility.verifiedVersions, ['0.2.1-rc.5']);
+  assert.equal(status.connected, false);
+});
+
 test('实际 rc5 服务：清除连接仅限 owner 并刷新模型注册', { skip: !available }, async () => {
   const { ClaudeBridgeService } = await import('../plugin/index.mjs');
   let cleared = 0, replaced = 0;

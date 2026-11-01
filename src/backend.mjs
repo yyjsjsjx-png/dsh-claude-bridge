@@ -47,7 +47,7 @@ function selectionFor(ctx, agent) {
 
 /** Host-side coordinator. It never imports or starts a local Claude SDK. */
 export class BridgeBackend {
-  constructor(ctx, config = {}, { helpers, createTransport } = {}) {
+  constructor(ctx, config = {}, { helpers, createTransport, hostCompatibility } = {}) {
     this.ctx = ctx
     this.config = config
     this.helpers = helpers
@@ -55,6 +55,9 @@ export class BridgeBackend {
     this.directory = config.stateDirectory ?? join(helpers.resolveDshHome(), 'claude-bridge')
     this.state = new BridgeState(this.directory)
     this.diagnostics = createDiagnostics({ directory: join(this.directory, 'diagnostics') })
+    for (const check of hostCompatibility?.checks ?? []) {
+      this.diagnostics.event('host.compatibility', { stage: check.id, evidence: check.evidence, status: check.status })
+    }
     this.runs = new Map()
     this.syncing = new Map()
     this.retiredRuns = new Set()
