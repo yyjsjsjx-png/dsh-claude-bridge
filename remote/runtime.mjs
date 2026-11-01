@@ -12,6 +12,7 @@ import { createDiagnostics } from '../src/diagnostics.mjs'
 import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { validateContextPreferences } from '../src/context-preferences.mjs'
 import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
+import { createFirstOutputObserver } from './first-output.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
 const defaultBridgeRelease = { serverVersion: bridgeManifest.version,
@@ -330,7 +331,7 @@ export function parseServiceBudget(value) {
 }
 
 /** Create handlers for one private stdio worker. Dependencies are injected for offline tests. */
-export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, bridgeRelease = defaultBridgeRelease }) {
+export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now() }) {
   if (!sdk || typeof sdk.query !== 'function' || typeof sdk.tool !== 'function'
     || typeof sdk.createSdkMcpServer !== 'function' || typeof sdk.getSessionInfo !== 'function') {
     throw new TypeError('SDK 接口不完整')
@@ -982,6 +983,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         let toolsetVerified = false
         let firstModelEvent = false, firstToken = false, firstText = false
         const sdkQuery = sdk.query({ prompt: promptStream(), options: sdkOptions })
+        const firstOutput = createFirstOutputObserver({ isActive: () => !controller.signal.aborted })
         contextSampler = createContextSampler({ query: sdkQuery, signal: controller.signal, diagnose,
           publish: message => { if (!compact) context.peer.notify('sdk.message', { runId, message }) } })
         try {
@@ -992,7 +994,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           diagnose('sdk', 'hooks-verified')
           timing('hooks_verified')
           beginPrompt()
-          for await (const message of sdkQuery) {
+          for await (const incoming of sdkQuery) {
+          const responseObservedAt = responseTimingNow()
+          let message = incoming
           throwIfAborted(controller.signal)
           if (message?.session_id !== undefined && message.session_id !== sessionId) {
             throw new WorkerError('SESSION_ID_MISMATCH', 'SDK 返回的会话标识不匹配')
@@ -1006,6 +1010,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           if (!toolsetVerified && (message?.type === 'assistant' || message?.type === 'stream_event')) {
             throw new WorkerError('SDK_TOOLSET_UNVERIFIED', 'SDK 未提供可验证的工具清单')
           }
+          if (!compact) message = firstOutput.observe(message, responseObservedAt)
           if (!compact && (message?.type === 'stream_event'
             || (message?.type === 'assistant' && !isNoResponsePlaceholder(message.message)))) {
             if (!firstModelEvent) { firstModelEvent = true; timing('first_model_event') }

@@ -10,6 +10,7 @@ import { strictSession } from './fixtures/native-persistence.mjs'
 import { SdkProjection } from '../src/sdk-projection.mjs'
 import { HISTORY_ASSISTANT } from '../src/history-records.mjs'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
+import { RESPONSE_TIMING_RECORD, createResponseTimingProjection } from '../src/response-timing.mjs'
 
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
 // The ordinary Node test suite skips these cases if its ASAR reader is absent.
@@ -69,20 +70,45 @@ test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订�
   agent.scope = createScope(ctx, agent)
   agent.ctx = agent.scope.ctx
   t.after(() => agent.scope.dispose())
-  const projection = new SdkProjection({ agent, helpers: f.helpers, turn: 1, step: 1, model: 'fixture' })
+  const helpers = { ...f.helpers, appendPluginRecord(target, type, data) {
+    const seq = sessionModule.appendPluginRecord(target, type, data)
+    ctx.emit('session/event', target, target.eventAt(seq))
+    return seq
+  } }
+  const projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'fixture' })
   const stream = event => projection.accept({ type: 'stream_event', event })
+  let cursor = opening.cursor
+  let revision = opening.assistantStream.revision
+  let metadataEvents = 0
   const nextFrame = async () => {
-    const result = await followed.next()
-    assert.equal(result.value.type, 'assistant-stream')
-    const decision = client.acceptFrame(result.value.frame)
-    assert.notEqual(decision?.type, 'rebaseline')
-    return { frame: result.value.frame, decision }
+    for (;;) {
+      const result = await followed.next()
+      assert.equal(result.done, false)
+      if (result.value.type === 'event') {
+        const event = result.value.event
+        assert.equal(event.seq, cursor + 1)
+        assert.equal(event.type, RESPONSE_TIMING_RECORD)
+        assert.equal(event.ignorable, true)
+        cursor = event.seq
+        const decision = client.acceptDurable(result.value)
+        assert.notEqual(decision?.type, 'rebaseline')
+        metadataEvents++
+        continue
+      }
+      assert.equal(result.value.type, 'assistant-stream')
+      assert.equal(result.value.frame.revision, ++revision)
+      if (result.value.frame.type === 'start') assert.equal(result.value.frame.startedAfterSeq, cursor)
+      const decision = client.acceptFrame(result.value.frame)
+      assert.notEqual(decision?.type, 'rebaseline')
+      return { frame: result.value.frame, decision }
+    }
   }
   await stream({ type: 'message_start', message: { id: 'native-follow-api' } })
   await stream({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
   const first = await nextFrame()
   assert.equal(first.frame.type, 'start')
-  assert.equal(first.frame.startedAfterSeq, opening.cursor)
+  assert.equal(first.frame.startedAfterSeq, cursor)
+  assert.equal(metadataEvents, 1)
   await nextFrame()
   for (const text of ['合成第一段', '合成第二段']) {
     await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })
@@ -107,13 +133,14 @@ test('实际 rc5 helper：工具使用最终 SDK 参数登记，Unicode 流式�
   await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 12 } } })
   await projection.accept({ type: 'stream_event', event: { type: 'message_stop' } })
   assert.equal(projection.committedToolCalls.has('toolu_unicode'), false)
-  assert.equal(records.length, 0)
+  assert.equal(records.filter(record => record.type === 'assistant/message').length, 0)
   await projection.accept({ type: 'assistant', message: { id: 'canonical-tool', content: [
     { type: 'tool_use', id: 'toolu_unicode', name: 'mcp__dsh__local_command', input: canonical },
   ] } })
   assert.deepEqual(JSON.parse(projection.committedToolCalls.get('toolu_unicode').arguments), canonical)
-  assert.deepEqual(JSON.parse(records[0].data.message.content[0].arguments), canonical)
-  assert.deepEqual(records[0].data.stream, [])
+  const committed = records.find(record => record.type === 'assistant/message')
+  assert.deepEqual(JSON.parse(committed.data.message.content[0].arguments), canonical)
+  assert.deepEqual(committed.data.stream, [])
 })
 
 async function fixture() {
@@ -191,7 +218,7 @@ test('实际 rc5 helper：thinking 分块的完整消息不结算流，同 ID �
   await stream({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking } })
   await stream({ type: 'content_block_stop', index: 0 })
   await projection.accept({ type: 'assistant', message: { id, content: [{ type: 'thinking', thinking }] } })
-  assert.equal(records.length, 0)
+  assert.equal(records.filter(record => record.type === 'assistant/message').length, 0)
   await stream({ type: 'content_block_start', index: 1, content_block: { type: 'text' } })
   const textFrames = () => frames.filter(value => value.frame.type === 'chunk'
     && value.frame.chunk.type === 'text-delta').map(value => value.frame.chunk.text)
@@ -199,7 +226,7 @@ test('实际 rc5 helper：thinking 分块的完整消息不结算流，同 ID �
     await stream({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text } })
     // Assert delivery before either the full text message or query result exists.
     assert.deepEqual(textFrames(), parts.slice(0, index + 1))
-    assert.equal(records.length, 0)
+    assert.equal(records.filter(record => record.type === 'assistant/message').length, 0)
   }
   await stream({ type: 'content_block_stop', index: 1 })
   await projection.accept({ type: 'assistant', message: { id, content: [
@@ -401,10 +428,11 @@ test('实际 rc5 helper：同一步多个工具片段结算为累计快照，后
       { type: 'text', text }, { type: 'tool_use', id, name: 'mcp__dsh__local_smoke', input: {} },
     ] } })
   }
-  const before = records.length
+  const assistantRecords = () => records.filter(record => ['assistant/message', HISTORY_ASSISTANT].includes(record.type))
+  const before = structuredClone(assistantRecords())
   await projection.accept({ type: 'result', usage: { output_tokens: 3 } })
-  assert.equal(records.length, before)
-  assert.deepEqual(records.at(-1).data.message.content.map(block => block.text ?? block.id), ['工具前文本', 'one', '第二段说明', 'two'])
+  assert.deepEqual(assistantRecords(), before)
+  assert.deepEqual(assistantRecords().at(-1).data.message.content.map(block => block.text ?? block.id), ['工具前文本', 'one', '第二段说明', 'two'])
 })
 
 test('实际原生客户端：同一响应的多个工具片段不重开流、不触发历史重建', { skip: !available }, async () => {
@@ -557,4 +585,100 @@ test('进度仅转发固定压缩和上下文字段，停止后不接纳迟到�
   projection.interrupt()
   await projection.accept({ type: 'system', subtype: 'status', status: null })
   assert.equal(progress.length, 4)
+})
+
+test('实际rc5：工具规范化与晚到usage不丢逐响应计时，未结束整轮即可刷新', { skip: !available }, async () => {
+  const f = await fixture()
+  let clock = 0, step = 0, frame = 0
+  const projection = new SdkProjection({ agent: f.agent, helpers: f.helpers, turn: 1, step: 1,
+    runId: 'timing-tool-round', model: 'haiku', timingNow: () => clock, onModelStart: () => ++step })
+  const stream = (event, ttft_ms, bridge_first_output) => projection.accept({ type: 'stream_event', uuid: `frame-${++frame}`,
+    parent_tool_use_id: null, event, ...(ttft_ms !== undefined ? { ttft_ms } : {}),
+    ...(bridge_first_output ? { bridge_first_output } : {}) })
+  const { z } = await import(resolveDshModule('zod'))
+  const definition = createResponseTimingProjection(z)
+  const view = () => {
+    const state = f.records.reduce(definition.apply, definition.init({ agentPreset: 'claude-sdk-remote' }))
+    definition.stateSchema.parse(state)
+    return definition.wire.viewSchema.parse(definition.wire.view(state))
+  }
+  await stream({ type: 'message_start', message: { id: 'timed-tool', usage: { input_tokens: 2 } } }, 400)
+  assert.equal(view().ttftSteps, 0) // An SDK header is not the first output token.
+  clock = 1000
+  await stream({ type: 'content_block_start', index: 0,
+    content_block: { type: 'tool_use', id: 'timed-call', name: 'mcp__dsh__local_command', input: {} } })
+  clock = 2000
+  await stream({ type: 'content_block_delta', index: 0,
+    delta: { type: 'input_json_delta', partial_json: String.raw`{"command":"\u4e2d"}` } }, undefined,
+  { version: 1, responseId: 'timed-tool', ms: 450, kind: 'tool-input', source: 'sdk-first-output-estimate' })
+  assert.equal(view().ttftSteps, 1)
+  assert.equal(view().ttftMs, 450)
+  await stream({ type: 'content_block_stop', index: 0 })
+  await projection.accept({ type: 'assistant', message: { id: 'timed-tool', content: [
+    { type: 'tool_use', id: 'timed-call', name: 'mcp__dsh__local_command', input: { command: '中' } },
+  ] } })
+  assert.deepEqual(f.records.find(e => e.type === 'assistant/message').data.stream, [])
+  clock = 10000 // Local tool or callback waiting is outside the receive-rate window.
+  await stream({ type: 'message_delta', usage: { output_tokens: 200 } })
+  await stream({ type: 'message_stop' })
+  assert.equal(view().decodeTokens, 200)
+  assert.equal(view().decodeMs, 2000)
+  assert.equal(view().tpsSamples, 1)
+  assert.equal(f.records.some(e => e.type === 'turn/end'), false)
+  clock = 12000
+  await stream({ type: 'message_start', message: { id: 'timed-final', usage: { input_tokens: 2 } } }, 600)
+  await stream({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
+  clock = 13000
+  await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '第一段' } }, undefined,
+    { version: 1, responseId: 'timed-final', ms: 650, kind: 'text', source: 'sdk-first-output-estimate' })
+  clock = 15000
+  await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '第二段' } })
+  await stream({ type: 'content_block_stop', index: 0 })
+  clock = 16000
+  await stream({ type: 'message_delta', usage: { output_tokens: 300 } })
+  await stream({ type: 'message_stop' })
+  assert.equal(view().ttftMs / view().ttftSteps, 550)
+  assert.equal(view().tpsSamples, 2)
+  assert.equal(view().decodeTokens, 500)
+  assert.equal(view().decodeMs, 5000)
+  await projection.accept({ type: 'result', usage: { input_tokens: 4, output_tokens: 500 } })
+  const result = view()
+  const records = f.records.filter(e => e.type === RESPONSE_TIMING_RECORD).length
+  await stream({ type: 'message_delta', usage: { output_tokens: 9000 } })
+  assert.deepEqual(view(), result)
+  assert.equal(f.records.filter(e => e.type === RESPONSE_TIMING_RECORD).length, records)
+})
+
+test('实际rc5：权威工具消息补齐残缺或改变的原始参数时，保留工具且接收速度未知', { skip: !available }, async () => {
+  const { z } = await import(resolveDshModule('zod'))
+  const definition = createResponseTimingProjection(z)
+  for (const partial_json of ['{"command":', '{"command":"partial"}']) {
+    const f = await fixture()
+    let clock = 0, frame = 0
+    const projection = new SdkProjection({ agent: f.agent, helpers: f.helpers, turn: 1, step: 1,
+      runId: 'incomplete-tool-input', model: 'haiku', timingNow: () => clock })
+    const stream = (event, ttft_ms, bridge_first_output) => projection.accept({ type: 'stream_event', uuid: `raw-${++frame}`,
+      event, ...(ttft_ms === undefined ? {} : { ttft_ms }), ...(bridge_first_output ? { bridge_first_output } : {}) })
+    await stream({ type: 'message_start', message: { id: 'incomplete-tool', usage: { input_tokens: 2 } } }, 400)
+    clock = 1000
+    await stream({ type: 'content_block_start', index: 0,
+      content_block: { type: 'tool_use', id: 'input-call', name: 'mcp__dsh__local_command', input: {} } })
+    clock = 2000
+    await stream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json } }, undefined,
+      { version: 1, responseId: 'incomplete-tool', ms: 450, kind: 'tool-input', source: 'sdk-first-output-estimate' })
+    await stream({ type: 'content_block_stop', index: 0 })
+    await projection.accept({ type: 'assistant', message: { id: 'incomplete-tool', content: [
+      { type: 'tool_use', id: 'input-call', name: 'mcp__dsh__local_command', input: { command: 'complete' } },
+    ] } })
+    await stream({ type: 'message_delta', usage: { output_tokens: 200 } })
+    await stream({ type: 'message_stop' })
+    const state = f.records.reduce(definition.apply, definition.init({ agentPreset: 'claude-sdk-remote' }))
+    definition.stateSchema.parse(state)
+    const view = definition.wire.viewSchema.parse(definition.wire.view(state))
+    assert.equal(view.ttftSteps, 1)
+    assert.equal(view.tpsSamples, 0)
+    assert.equal(view.incompleteCaptures, 1)
+    assert.equal(f.records.filter(e => e.type === 'assistant/message').length, 1)
+    assert.deepEqual(JSON.parse(projection.committedToolCalls.get('input-call').arguments), { command: 'complete' })
+  }
 })

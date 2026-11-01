@@ -5,6 +5,7 @@ import { join, dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
+
 import { createAuthReader } from '../remote/auth.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
 
@@ -12,6 +13,38 @@ const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
 const OTHER_DEVICE = 'a4270ab7-90c7-440c-8fdc-5601b47dd29b'
 
+test('远端在首有效思考帧附数值TTFT估算，保留官方头字段并隔离子代理', async t => {
+  let clock = 0
+  const f = await fixture(t, async function* ({ prompt }) {
+    await prompt.next()
+    clock = 100
+    yield { type: 'stream_event', parent_tool_use_id: null, ttft_ms: 30,
+      event: { type: 'message_start', message: { id: 'observed-main' } } }
+    clock = 110
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '' } } }
+    clock = 120
+    yield { type: 'stream_event', parent_tool_use_id: 'child-call', ttft_ms: 9999,
+      event: { type: 'message_start', message: { id: 'observed-child' } } }
+    clock = 130
+    yield { type: 'stream_event', parent_tool_use_id: 'child-call',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'synthetic child' } } }
+    clock = 140
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'signature_delta', signature: 'synthetic' } } }
+    clock = 160
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'synthetic' } } }
+    clock = 200
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'synthetic' } } }
+    yield { type: 'result', subtype: 'success', session_id: SESSION, usage: { input_tokens: 2, output_tokens: 3 } }
+  }, { responseTimingNow: () => clock })
+  assert.equal((await f.worker.handlers.query(f.params, f.context)).status, 'completed')
+  const messages = f.state.notifications.filter(n => n.method === 'sdk.message').map(n => n.params.message)
+  const measured = messages.filter(m => m.bridge_first_output)
+  assert.equal(measured.length, 1)
+  assert.deepEqual(measured[0].bridge_first_output, { version: 1, responseId: 'observed-main',
+    ms: 90, kind: 'thinking', source: 'sdk-first-output-estimate' })
+  assert.equal(messages.find(m => m.event?.message?.id === 'observed-main').ttft_ms, 30)
+  assert.equal(messages.filter(m => m.parent_tool_use_id != null).some(m => m.bridge_first_output), false)
+})
 test('版本协商默认报告服务端版本，无最低要求时允许旧客户端且不启动 SDK', async t => {
   const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
   const manifest = JSON.parse(await readFile(new URL('../remote/package.json', import.meta.url), 'utf8'))
