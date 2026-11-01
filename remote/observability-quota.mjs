@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { normalizeObservedQuota, quotaFailureCode } from '../src/observability-schema.mjs'
 
-/** One account-wide coordinator in the parent server. No idle polling or SDK dependency. */
+/** One account-wide sampler, gated by actual active runs. No SDK dependency. */
 export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, onDiagnostic = () => {},
   now = Date.now, cooldownMs = 300_000, freshnessMs = 120_000, timeoutMs = 15_000 } = {}) {
-  let snapshot = null, error = null, nextAllowedAt = 0, inFlight, closed = false, failures = 0
+  const active = new Set(), skipped = Symbol('inactive')
+  let snapshot = null, error = null, nextAllowedAt = 0, inFlight, pollTimer, closed = false, failures = 0
   const report = (code, gap = false) => {
     try { Promise.resolve(onDiagnostic({ code, gap })).catch(() => {}) } catch {}
   }
@@ -21,7 +22,17 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
       fresh: Boolean(snapshot && at < snapshot.expiresAt && at < snapshot.observedAt + freshnessMs
         && snapshot.windows.every(row => row.resetsAt === null || at < row.resetsAt)),
       lastObservedAt: snapshot?.observedAt ?? null, error: error ? { ...error } : null,
-      nextAllowedAt, inFlight: Boolean(inFlight) }
+      nextAllowedAt, inFlight: Boolean(inFlight), active: active.size > 0, activeCount: active.size }
+  }
+  const stopTimer = () => { clearTimeout(pollTimer); pollTimer = undefined }
+  function schedule() {
+    stopTimer()
+    if (closed || !active.size || inFlight) return
+    pollTimer = setTimeout(() => {
+      pollTimer = undefined
+      if (!closed && active.size && !inFlight) start('activity')
+    }, Math.max(0, nextAllowedAt - now()))
+    pollTimer.unref?.()
   }
   const complete = (read, reply) => {
     if (read.reported || closed) return
@@ -49,7 +60,9 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
     read.resolve(peek())
   }
   function start(reason) {
-    const read = { id: randomUUID(), reason, controller: new AbortController(), reported: false, startedAt: now() }
+    stopTimer()
+    const read = { id: randomUUID(), reason, controller: new AbortController(), reported: false,
+      started: false, startedAt: now(), previousAllowedAt: nextAllowedAt }
     read.outcome = new Promise(resolve => { read.resolve = resolve })
     inFlight = read
     nextAllowedAt = now() + cooldownMs
@@ -61,10 +74,17 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
     const settled = reply => {
       clearTimeout(read.timer)
       if (inFlight === read) inFlight = undefined
-      complete(read, reply)
+      if (reply === skipped) {
+        if (!read.started) nextAllowedAt = read.previousAllowedAt
+        if (!read.reported) { read.reported = true; read.resolve(peek()) }
+      } else complete(read, reply)
+      schedule()
     }
-    Promise.resolve().then(() => closed || read.controller.signal.aborted
-      ? { status: 'unavailable', code: 'QUOTA_CLOSED' } : fetchUsage({ signal: read.controller.signal })).then(settled,
+    Promise.resolve().then(() => {
+      if (closed || !active.size || read.controller.signal.aborted) return skipped
+      read.started = true
+      return fetchUsage({ signal: read.controller.signal })
+    }).then(settled,
       problem => settled({ status: 'unavailable', code: quotaFailureCode(problem?.code),
         retryAfterMs: problem?.retryAfterMs }))
     return read
@@ -94,19 +114,30 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
       }
       if (closed) return Promise.resolve({ ...peek(), error: { code: 'QUOTA_CLOSED', observedAt: now() } })
       if (signal?.aborted) return Promise.resolve({ ...peek(), error: { code: 'CANCELLED', observedAt: now() } })
+      if (!active.size) return Promise.resolve(peek())
       if (inFlight) return wait(inFlight, signal)
       if (now() < nextAllowedAt) return Promise.resolve(peek())
       return wait(start(reason), signal)
     },
-    noteActivity() {
-      if (closed || inFlight || now() < nextAllowedAt) return false
-      start('activity')
+    setActive(key, value) {
+      if (closed || typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:@+\[\]-]{0,255}$/.test(key)
+        || typeof value !== 'boolean' || value && !active.has(key) && active.size >= 4096) return false
+      if (value) active.add(key)
+      else active.delete(key)
+      if (!active.size) stopTimer()
+      else if (!inFlight && now() >= nextAllowedAt) start('run-start')
+      else schedule()
       return true
     },
     close() {
       if (closed) return Promise.resolve(peek())
+      stopTimer(); active.clear()
       if (inFlight) {
-        complete(inFlight, { status: 'unavailable', code: 'QUOTA_CLOSED' })
+        if (inFlight.started) complete(inFlight, { status: 'unavailable', code: 'QUOTA_CLOSED' })
+        else {
+          inFlight.reported = true
+          inFlight.resolve({ ...peek(), error: { code: 'QUOTA_CLOSED', observedAt: now() } })
+        }
         inFlight.controller.abort()
         clearTimeout(inFlight.timer)
       }
