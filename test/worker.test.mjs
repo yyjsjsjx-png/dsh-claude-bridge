@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join, dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { createHash } from 'node:crypto'
 import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
 import { createAuthReader } from '../remote/auth.mjs'
 
@@ -576,6 +577,99 @@ test('明确配置预算后SDK在正文后返回预算错误仍如实报告，�
   assert.equal(result.code, 'BUDGET_EXHAUSTED')
   assert.equal(f.state.queries[0].options.maxBudgetUsd, 1)
   assert.ok(f.state.notifications.some(item => item.method === 'sdk.message' && item.params.message.type === 'assistant'))
+})
+
+test('同一 SDK 会话下一轮可增删工具并更新 Schema，保留提示基线且拒绝旧清单', async t => {
+  const f = await fixture(t, async function* ({ prompt, options }, state) {
+    await prompt.next()
+    const tools = options.mcpServers.dsh.instance.tools
+    const pre = options.hooks.PreToolUse[0].hooks[0]
+    if (state.queries.length === 1) {
+      assert.deepEqual(tools.map(tool => tool.name), ['local_command', 'obsolete_tool'])
+      const input = { command: 'synthetic-old' }
+      assert.deepEqual(await pre({ hook_event_name: 'PreToolUse', tool_name: 'mcp__dsh__local_command',
+        tool_input: input, tool_use_id: 'toolu_original' }), {})
+      yield assistantTool('toolu_original', input)
+      await tools[0].handler(input)
+      await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch',
+        tool_calls: [{ tool_use_id: 'toolu_original' }] })
+    } else {
+      assert.deepEqual(tools.map(tool => tool.name), ['local_command', 'new_tool'])
+      assert.deepEqual(tools[0].shape, { script: { type: 'string' } })
+      assert.equal(tools[0].description, '更新后的合成工具')
+      const removed = await pre({ hook_event_name: 'PreToolUse', tool_name: 'mcp__dsh__obsolete_tool',
+        tool_input: { value: 'stale' }, tool_use_id: 'toolu_removed' })
+      assert.equal(removed.hookSpecificOutput.permissionDecision, 'deny')
+      assert.equal((await options.canUseTool('mcp__dsh__obsolete_tool', { value: 'stale' },
+        { toolUseID: 'toolu_removed' })).behavior, 'deny')
+      const staleSchema = await pre({ hook_event_name: 'PreToolUse', tool_name: 'mcp__dsh__local_command',
+        tool_input: { command: 'stale-argument' }, tool_use_id: 'toolu_stale_schema' })
+      assert.equal(staleSchema.hookSpecificOutput.permissionDecision, 'deny')
+      const changed = { script: 'synthetic-updated' }
+      assert.deepEqual(await pre({ hook_event_name: 'PreToolUse', tool_name: 'mcp__dsh__local_command',
+        tool_input: changed, tool_use_id: 'toolu_changed' }), {})
+      yield assistantTool('toolu_changed', changed)
+      await tools[0].handler(changed)
+      const added = { value: 'synthetic-new' }
+      assert.deepEqual(await pre({ hook_event_name: 'PreToolUse', tool_name: 'mcp__dsh__new_tool',
+        tool_input: added, tool_use_id: 'toolu_added' }), {})
+      yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_added',
+        name: 'mcp__dsh__new_tool', input: added }] } }
+      await tools[1].handler(added)
+      await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch',
+        tool_calls: [{ tool_use_id: 'toolu_changed' }, { tool_use_id: 'toolu_added' }] })
+    }
+    state.exists = true
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  f.params.tools = [...f.params.tools, { name: 'obsolete_tool', description: '将被移除的合成工具',
+    inputSchema: { type: 'object', additionalProperties: false,
+      properties: { value: { type: 'string' } }, required: ['value'] } }]
+  const capability = await f.worker.handlers.initialize({ protocolVersion: 1 })
+  assert.equal(capability.capabilities.localMcpTools, true)
+  assert.equal(capability.capabilities.nativeFileAndShellTools, false)
+  assert.deepEqual(await f.worker.handlers.query(f.params, f.context), { sessionId: SESSION, status: 'completed' })
+  const metadataPath = join(f.root, 'sessions', 'devices', DEVICE, SESSION, 'bridge-session.json')
+  const originalMetadata = await readFile(metadataPath)
+  const nextTools = [
+    { name: 'local_command', description: '更新后的合成工具', inputSchema: {
+      type: 'object', additionalProperties: false, properties: { script: { type: 'string' } }, required: ['script'],
+    } },
+    { name: 'new_tool', description: '新增的合成工具', inputSchema: {
+      type: 'object', additionalProperties: false, properties: { value: { type: 'string' } }, required: ['value'],
+    } },
+  ]
+  assert.deepEqual(await f.worker.handlers.query({ ...f.params, runId: 'run-new-toolset', resume: true, tools: nextTools },
+    f.context), { sessionId: SESSION, status: 'completed' })
+  assert.equal(f.state.queries.length, 2)
+  const [first, resumed] = f.state.queries.map(query => query.options)
+  assert.equal(first.sessionId, SESSION)
+  assert.equal(resumed.resume, SESSION)
+  assert.equal(Object.hasOwn(resumed, 'sessionId'), false)
+  assert.equal(first.systemPrompt, resumed.systemPrompt)
+  assert.equal(JSON.parse(originalMetadata).systemPromptSha256,
+    createHash('sha256').update(first.systemPrompt, 'utf8').digest('hex'))
+  assert.deepEqual(await readFile(metadataPath), originalMetadata)
+  assert.notEqual(first.mcpServers.dsh.instance, resumed.mcpServers.dsh.instance)
+  assert.deepEqual(first.allowedTools, ['mcp__dsh__local_command', 'mcp__dsh__obsolete_tool'])
+  assert.deepEqual(resumed.allowedTools, ['mcp__dsh__local_command', 'mcp__dsh__new_tool'])
+  for (const options of [first, resumed]) {
+    assert.deepEqual(options.tools, [])
+    assert.deepEqual(options.settingSources, [])
+    assert.equal(options.strictMcpConfig, true)
+    assert.equal(options.persistSession, true)
+    assert.equal(typeof options.hooks.PreToolUse[0].hooks[0], 'function')
+    assert.equal(typeof options.hooks.PostToolBatch[0].hooks[0], 'function')
+  }
+  assert.deepEqual(f.state.notifications.filter(item => item.method === 'sdk.message'
+    && item.params.message.subtype === 'init').map(item => item.params.message.tools),
+  [first.allowedTools, resumed.allowedTools])
+  const executed = f.state.requests.filter(item => item.method === 'tool.execute')
+  assert.deepEqual(executed.map(item => [item.params.name, item.params.arguments]), [
+    ['local_command', { command: 'synthetic-old' }],
+    ['local_command', { script: 'synthetic-updated' }],
+    ['new_tool', { value: 'synthetic-new' }],
+  ])
 })
 
 test('恢复会话必须匹配系统提示基线；旧基线缺失不猜测', async (t) => {

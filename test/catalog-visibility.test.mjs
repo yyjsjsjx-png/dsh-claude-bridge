@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES);
 
@@ -57,6 +60,8 @@ test('新建目录只显示勾选项，活动会话模型保留在原生列表',
   const adapter = new ClaudeCatalogAdapter({
     catalog: async () => ({ status: 'ok', models }),
     visibleCatalog: async () => ({ status: 'ok', models: models.slice(0, 1) }),
+    displayCatalog: async ({ visible }) => ({ status: 'ok', models: visible ? models.slice(0, 1) : models }),
+    refreshDisplayCatalog() {},
   }, { sessions: { list: () => active }, sessionProjections: { stateOf: () => ({
     pending: null, lastUsed: { provider: 'claude-sdk-remote', model: 'hidden' },
   }) } });
@@ -72,4 +77,68 @@ test('新建目录只显示勾选项，活动会话模型保留在原生列表',
   assert.equal((await adapter.resolveModel('claude-sdk-remote', 'account-default')).id, 'account-default');
   active.length = 0;
   assert.deepEqual((await adapter.listModels('claude-sdk-remote')).map(model => model.id), ['haiku']);
+});
+
+test('实际原生模型聚合与旧远程选型在目录 pending 或离线时仍返回普通模型', { skip: !available, timeout: 10000 }, async t => {
+  const { resolveDshModule } = await import('../plugin/compat/resolve-dsh-module.mjs');
+  const [{ Context }, { LlmRuntime, LlmAdapter }, { SessionController }, { ClaudeCatalogAdapter }, { BridgeBackend }] = await Promise.all([
+    import(resolveDshModule('@deepseek-ai/cordis')), import(resolveDshModule('@deepseek-ai/dsh-llm')),
+    import(resolveDshModule('@deepseek-ai/dsh-api-session-controller')), import('../plugin/index.mjs'), import('../src/backend.mjs'),
+  ]);
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-native-catalog-'));
+  const ctx = new Context();
+  let release, started, catalogs = 0, offline = true, changed = 0;
+  const waiting = new Promise(resolve => { started = resolve; });
+  const models = [{ value: 'haiku', displayName: 'Haiku', resolvedModel: 'claude-haiku-5-5', supportedEffortLevels: ['low', 'high'] }];
+  const backend = new BridgeBackend({}, { stateDirectory: directory }, { helpers: {},
+    createTransport: async () => ({ peer: { async request(method) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true };
+      assert.equal(method, 'catalog'); catalogs++;
+      if (offline) { started(); return new Promise((_, reject) => { release = () => reject(Object.assign(new Error('synthetic offline'), { code: 'REMOTE_OFFLINE' })); }); }
+      return { status: 'ok', models };
+    } }, async close() {} }),
+  });
+  t.after(async () => {
+    backend.onDisplayCatalogChanged = undefined;
+    await backend.dispose();
+    await ctx.fiber.dispose();
+    await rm(directory, { recursive: true, force: true });
+  });
+  await backend.state.ready;
+  await ctx.plugin(LlmRuntime);
+  class OrdinaryAdapter extends LlmAdapter {
+    listModels(provider) { return Promise.resolve([{ provider, id: 'ordinary-model', name: 'Ordinary' }]); }
+    resolveModel(provider, id) { return Promise.resolve({ provider, id, name: 'Ordinary' }); }
+  }
+  ctx.llm.registerAdapter(['ordinary'], new OrdinaryAdapter());
+  const provider = 'claude-sdk-remote';
+  const oldSession = { header: { agentPreset: provider }, requestHeader: () => ({ config: { provider, model: 'old-model' } }) };
+  const adapter = new ClaudeCatalogAdapter(backend, { sessions: { list: () => [oldSession] },
+    sessionProjections: { stateOf: () => undefined } });
+  const registration = ctx.llm.registerAdapter([provider], adapter);
+  backend.onDisplayCatalogChanged = () => { changed++; registration.replace([provider]); };
+  const controller = Object.create(SessionController.prototype);
+  Object.defineProperty(controller, 'ctx', { value: { llm: ctx.llm,
+    agentDefaultModel: { currentSelection: () => ({ provider, model: 'old-model' }) } } });
+  const first = await controller.modelCatalog();
+  await waiting; // The remote RPC is still pending; release has not been called.
+  assert.equal(first.groups.find(group => group.id === 'ordinary').models[0].id, 'ordinary-model');
+  assert.ok(first.groups.find(group => group.id === provider).models.some(model => model.id === 'old-model'));
+  const selected = await ctx.llm.resolveModelInfo(provider, 'old-model');
+  assert.equal(selected.id, 'old-model');
+  assert.equal(selected.reasoning, undefined); assert.equal(selected.inputModalities, undefined);
+  release();
+  await backend.displayCatalogRefreshPending;
+  const failed = await controller.modelCatalog();
+  assert.equal(failed.groups.find(group => group.id === 'ordinary').models[0].id, 'ordinary-model');
+  assert.equal((await ctx.llm.resolveModelInfo(provider, 'old-model')).id, 'old-model');
+  assert.equal(catalogs, 1); assert.equal(changed, 0);
+  offline = false; backend.displayCatalogRefreshAfter = 0;
+  backend.refreshDisplayCatalog();
+  await backend.displayCatalogRefreshPending;
+  const refreshed = await controller.modelCatalog();
+  assert.ok(refreshed.groups.find(group => group.id === provider).models.some(model => model.id === 'haiku'));
+  assert.deepEqual((await ctx.llm.resolveModelInfo(provider, 'haiku')).reasoning.efforts.map(item => item.id), ['low', 'high']);
+  assert.equal(catalogs, 2); assert.equal(changed, 1);
+  t.diagnostic('使用安装版 LlmRuntime 注册、resolveModelInfo 及 SessionController.modelCatalog；远端 RPC 为受控 pending/offline，无 GUI 或 SDK 请求。');
 });

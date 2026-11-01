@@ -90,3 +90,24 @@ test('远程预设关闭计划与分叉，保留独立子代理并继承父模�
   assert.notEqual(preset.plugins[0], standard.plugins[0]);
   assert.throws(() => createRemoteClaudePreset({ plugins: [{ id: 'bad' }] }), TypeError);
 });
+
+test('远程预设仅按原生 time-context 包名禁用，改名 id 仍关闭且不改变标准预设', () => {
+  const standard = { plugins: [
+    { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'fixture' } },
+    { id: 'planning', name: 'cordis:group', group: true, config: [] },
+    { id: 'compaction', name: 'cordis:group', group: true, config: [] },
+    { id: 'delegation', name: 'cordis:group', group: true, config: [
+      { id: 'tool-subagent', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'spawn' } },
+      { id: 'tool-subagent-fork', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'fork', toolName: 'subagent_fork' } },
+    ] },
+    { id: 'clock-renamed', name: '@deepseek-ai/dsh-time-context', config: { refreshIntervalMs: 5000 } },
+    { id: 'time-context', name: 'custom-component', config: { preserved: true } },
+  ] };
+  const before = structuredClone(standard);
+  const preset = createRemoteClaudePreset(standard);
+  assert.deepEqual(preset.plugins.find(row => row.id === 'clock-renamed'), {
+    ...standard.plugins[4], disabled: true,
+  });
+  assert.deepEqual(preset.plugins.find(row => row.id === 'time-context'), standard.plugins[5]);
+  assert.deepEqual(standard, before);
+});

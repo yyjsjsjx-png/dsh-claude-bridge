@@ -4,7 +4,7 @@ export function createSettingsController({ rpc, createStore, textError, createMo
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
     remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
-    models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
+    models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
     contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
   const updateSettings = patch => store.set({ ...store.getSnapshot(), ...patch });
@@ -32,6 +32,7 @@ export function createSettingsController({ rpc, createStore, textError, createMo
           connected: status.connected === true, authentication: status.authentication ?? 'unknown',
           compatibility: status.compatibility ?? [], disabledFeatures: status.disabledFeatures ?? [],
           convertedFeatures: status.convertedFeatures ?? [], activeRuns: status.activeRuns ?? 0,
+          modelCatalog: status.modelCatalog ?? null,
           remotePreset: status.remotePreset ?? null, remoteCapabilities: status.remoteCapabilities ?? null,
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
@@ -63,7 +64,7 @@ export function createSettingsController({ rpc, createStore, textError, createMo
     statusRequest = undefined;
     models.invalidate();
     onConnectionChange();
-    updateSettings({ busy: true, modelsLoading: false, error: '', message: '' });
+    updateSettings({ busy: true, modelsLoading: false, modelCatalog: null, error: '', message: '' });
     try {
       const response = await request();
       if (!response.ok) throw new Error(response.error.message);

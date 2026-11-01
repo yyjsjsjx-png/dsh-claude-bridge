@@ -151,7 +151,10 @@ export function makeGuardedSessionController(Base, RemoteError) {
       }
       if (initialModel !== undefined) {
         try {
-          await this.selectModel({ sessionId: created.sessionId, ...initialModel });
+          await this.selectModel({ sessionId: created.sessionId, ...initialModel,
+            // Creation carries an explicit choice, including model default.
+            // This own undefined value stays inside the Host, outside RPC codecs.
+            ...(initialModel.provider === CLAUDE_PROVIDER ? { reasoningEffort: initialModel.reasoningEffort } : {}) });
         } catch (error) {
           // The upstream has already published this identity; never imply it
           // was rolled back, or silently use a different model.
@@ -167,9 +170,15 @@ export function makeGuardedSessionController(Base, RemoteError) {
       const preset = presetForAgent(this.bridgeContext, RemoteError, agent);
       try { assertModelForPreset(preset, request); }
       catch (error) { policyFailure(RemoteError, error, request.sessionId); }
+      const backend = preset === CLAUDE_PRESET ? this.bridgeContext.get?.('claudeBridge')?.backend : undefined;
+      if (typeof backend?.applyModelEffortPreference === 'function') {
+        const state = this.bridgeContext.sessionProjections.stateOf(agent.session, 'modelSelection');
+        const current = state?.pending ?? state?.lastUsed ?? agent.session.requestHeader?.()?.config;
+        request = { ...request, ...await backend.applyModelEffortPreference(request, current) };
+      }
       const selected = await super.selectModel(request);
       if (preset === CLAUDE_PRESET) {
-        try { await this.bridgeContext.get?.('claudeBridge')?.backend?.rememberCreationSelection(selected.selected); }
+        try { await backend?.rememberCreationSelection(selected.selected); }
         catch { this.bridgeContext.logger?.warn('上次模型选择保存失败，下次新建时请重新选择。'); }
       }
       return selected;

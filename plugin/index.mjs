@@ -40,113 +40,14 @@ import { remotePresetFeatures } from './preset.mjs';
 import { remotePresetStatus } from './preset-loading.mjs';
 import { resolveDshModule, assertDshCompatibility } from './compat/resolve-dsh-module.mjs';
 import { createWorkflowDepthGuard } from './workflow-depth-guard.mjs';
-import { imageCapability } from '../src/model-capabilities.mjs';
+import { createClaudeCatalogAdapter } from './catalog-adapter.mjs';
 import { createSessionStatusProjection } from '../src/session-status.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
 const hostCompatibility = await assertDshCompatibility();
-const ACCOUNT_DEFAULT = 'account-default';
-const DEFAULT_MODEL = Object.freeze({
-    provider: CLAUDE_PROVIDER,
-    id: ACCOUNT_DEFAULT,
-    name: '远程模型（账号默认）',
-    description: '由远程账号选择默认模型。',
-});
-const NO_CONFIGURATION = new Set(['SETTINGS_MISSING', 'TOKEN_MISSING', 'BRIDGE_NOT_CONFIGURED']);
 /** Catalog only: all model calls belong to ClaudeLoopAgent, never LlmRuntime. */
-export class ClaudeCatalogAdapter extends LlmAdapter {
-    constructor(backend, ctx) {
-        super();
-        this.backend = backend;
-        this.ctx = ctx;
-    }
-    providerInfo(provider) {
-        return { id: provider, name: '远程模型' };
-    }
-    async models(visible = false) {
-        const method = visible ? this.backend.visibleCatalog : this.backend.catalog;
-        if (typeof method !== 'function')
-            throw new Error('远程模型目录服务尚未就绪。');
-        let reply;
-        try {
-            reply = await method.call(this.backend);
-        }
-        catch (error) {
-            if (NO_CONFIGURATION.has(error?.code))
-                return [];
-            throw error;
-        }
-        const models = Array.isArray(reply) ? reply : reply?.status === 'ok' ? reply.models : undefined;
-        if (!Array.isArray(models))
-            throw new Error('远程模型目录响应无效。');
-        const seen = new Set([ACCOUNT_DEFAULT]);
-        return models.map((model) => {
-            if (!model || typeof model.value !== 'string' || !model.value
-                || typeof model.displayName !== 'string' || !model.displayName
-                || (model.description !== undefined && typeof model.description !== 'string')
-                || seen.has(model.value))
-                throw new Error('远程模型目录包含无效或重复项目。');
-            seen.add(model.value);
-            const efforts = model.supportedEffortLevels;
-            if (efforts !== undefined && (!Array.isArray(efforts)
-                || efforts.some(level => typeof level !== 'string' || !level)
-                || new Set(efforts).size !== efforts.length)) {
-                throw new Error('远程模型的推理强度目录无效。');
-            }
-            return {
-                provider: CLAUDE_PROVIDER,
-                id: model.value,
-                name: model.displayName,
-                ...(imageCapability(model).supported === true ? { inputModalities: ['text', 'image'] } : {}),
-                ...(model.description === undefined ? {} : { description: model.description }),
-                ...(efforts === undefined || efforts.length === 0 ? {} : {
-                    reasoning: { efforts: efforts.map(id => ({ id, name: id })) },
-                }),
-            };
-        });
-    }
-    async listModels(provider) {
-        if (provider !== CLAUDE_PROVIDER)
-            throw new Error('远程模型提供方无效。');
-        const models = await this.models(true);
-        const visible = new Set(models.map(model => model.id));
-        const active = new Set();
-        for (const session of this.ctx?.sessions?.list?.() ?? []) {
-            if (session?.header?.agentPreset !== CLAUDE_PRESET)
-                continue;
-            const projected = this.ctx.sessionProjections.stateOf(session, 'modelSelection');
-            const selected = projected?.pending ?? projected?.lastUsed ?? session.requestHeader?.()?.config;
-            if (selected?.provider === CLAUDE_PROVIDER && typeof selected.model === 'string' && selected.model) {
-                active.add(selected.model);
-            }
-        }
-        const hiddenActive = [...active].filter(id => !visible.has(id));
-        if (hiddenActive.length) {
-            const full = await this.models();
-            const byId = new Map([[ACCOUNT_DEFAULT, DEFAULT_MODEL], ...full.map(model => [model.id, model])]);
-            for (const id of hiddenActive) {
-                const model = byId.get(id);
-                if (model)
-                    models.push({ ...model, name: `${model.name}（已有会话使用中）` });
-            }
-        }
-        return models.map(({ reasoning: _reasoning, ...model }) => model);
-    }
-    async resolveModel(provider, model) {
-        if (provider !== CLAUDE_PROVIDER)
-            throw new Error('远程模型提供方无效。');
-        if (model === ACCOUNT_DEFAULT)
-            return { ...DEFAULT_MODEL };
-        const found = (await this.models()).find(item => item.id === model);
-        if (!found)
-            throw new Error('该远程模型不在当前账号的官方目录中。');
-        return found;
-    }
-    async *stream() {
-        throw new Error('远程会话只能由专属会话引擎执行。');
-    }
-}
+export const ClaudeCatalogAdapter = createClaudeCatalogAdapter(LlmAdapter);
 /** This plugin deliberately registers no credentials or network endpoint. */
 let ClaudeBridgeService = (() => {
     let _classSuper = TypertRemoteService;
@@ -214,7 +115,16 @@ let ClaudeBridgeService = (() => {
                 }));
                 const unregister = ctx.llm.registerAdapter([CLAUDE_PROVIDER], adapter);
                 this.catalogRegistration = unregister;
+                backend.onDisplayCatalogChanged = () => {
+                    try {
+                        unregister.replace([CLAUDE_PROVIDER]);
+                    }
+                    catch {
+                        ctx.logger.warn('远程模型目录刷新失败。');
+                    }
+                };
                 return async () => {
+                    backend.onDisplayCatalogChanged = undefined;
                     this.catalogRegistration = undefined;
                     unregister();
                     removeWorkflowGuard();
@@ -244,7 +154,7 @@ let ClaudeBridgeService = (() => {
                 const previous = ctx.sessionProjections.stateOf(session, 'claudeBridge');
                 if (['running', 'compacting', 'stopping'].includes(previous?.phase)
                     && ![...backend.runs.values()].some(run => run.agent.session === session)) {
-                    backend.sessionStatus({ session }, { phase: 'unknown', context: { status: 'unknown' }, toolMayHaveExecuted: true });
+                    backend.sessionStatus({ session }, { phase: 'unknown', toolMayHaveExecuted: true });
                 }
             };
             ctx.on('session/created', reconcileStatus);
@@ -317,7 +227,8 @@ let ClaudeBridgeService = (() => {
         }
         async visibleModels() {
             this.assertOwner();
-            return { models: await this.catalogAdapter.models(true), selection: await this.backend.creationSelection() };
+            return { models: await this.catalogAdapter.models(true), selection: await this.backend.creationSelection(),
+                modelEfforts: await this.backend.modelEffortPreferences() };
         }
         async saveModelPreferences(value) {
             this.assertOwner();

@@ -168,6 +168,8 @@ const SETTINGS_CSS = `
       ? state.models.filter(model => state.selectedModelIds.includes(model.value)).length : 0;
     const authTone = state.authentication === 'logged-in' ? 'ok' : state.authentication === 'login-required' ? 'error' : 'warn';
     const bridgeCompatibility = state.bridgeCompatibility;
+    const catalogCode = typeof state.modelCatalog?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.modelCatalog.code) ? `（${state.modelCatalog.code}）` : '';
     const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     const hostChecks = Array.isArray(state.host?.checks) ? state.host.checks : [];
     const checkRows = [
@@ -228,6 +230,8 @@ const SETTINGS_CSS = `
         h('p', { className: 'dcb-card-desc' }, '选择模型列表中显示的模型；隐藏不会停止已有会话，正在使用的模型会暂时保留在原生列表中。'),
         !state.configured && h('p', { className: 'dcb-hint' }, '请先保存连接设置，再读取账号模型。'),
         state.modelsLoading && h('p', { className: 'dcb-hint' }, '正在读取模型…'),
+        state.modelCatalog?.status === 'failed' && h('p', { role: 'alert', 'aria-label': '模型目录刷新状态',
+          className: 'dcb-notice', 'data-tone': 'error' }, `远程模型目录刷新失败${catalogCode}，请稍后重试；不影响其他模型使用。`),
         state.modelError && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.modelError),
         state.modelsLoaded && h('div', null,
           h('div', { className: 'dcb-models' },
