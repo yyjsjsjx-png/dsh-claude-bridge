@@ -17,13 +17,16 @@ test('all request reasons share cooldown while cache freshness keeps original ob
     fetchUsage: async () => { calls++; return snapshot(now) }, onObservation: row => observations.push(row) })
   assert.equal(coordinator.peek().snapshot, null)
   assert.equal(calls, 0)
+  assert.equal((await coordinator.request()).active, false)
+  assert.equal(calls, 0)
+  coordinator.setActive('device-a:run-a', true)
   assert.equal((await coordinator.request()).fresh, true)
   now += 120_001
   const stale = await coordinator.request({ reason: 'run-start' })
   assert.equal(stale.fresh, false)
   assert.equal(stale.lastObservedAt, start)
   assert.equal(stale.snapshot.observedAt, start)
-  assert.equal(coordinator.noteActivity(), false)
+  assert.equal(coordinator.setActive('device-b:run-b', true), true)
   assert.equal(calls, 1)
   assert.equal(observations.length, 1)
   assert.doesNotThrow(() => normalizeObservabilityRecord('quota', observations[0]))
@@ -40,6 +43,7 @@ test('singleflight caller cancellation does not cancel another device waiter', a
   const coordinator = createQuotaCoordinator({ now: () => start,
     fetchUsage: ({ signal }) => { calls++; sharedSignal = signal; return raw.promise },
     onObservation: row => observations.push(row) })
+  coordinator.setActive('device-a:run-a', true)
   const first = coordinator.request({ signal: abort.signal })
   const second = coordinator.request({ reason: 'run-start' })
   await Promise.resolve()
@@ -59,6 +63,7 @@ test('failed reads back off and retryAfter applies to manual requests', async ()
   const coordinator = createQuotaCoordinator({ now: () => now,
     fetchUsage: async () => { calls++; return { status: 'unavailable', code: 'RATE_LIMITED', retryAfterMs: 700_000 } },
     onObservation: row => observations.push(row) })
+  coordinator.setActive('device-a:run-a', true)
   let result = await coordinator.request()
   assert.equal(result.error.code, 'RATE_LIMITED')
   assert.equal(result.nextAllowedAt, start + 700_000)
@@ -79,6 +84,7 @@ test('timeout holds actual flight gate, ignores late result, and exposes fixed g
   const coordinator = createQuotaCoordinator({ now: () => now, timeoutMs: 10,
     fetchUsage: () => { calls++; return raw.promise }, onObservation: row => observations.push(row),
     onDiagnostic: row => diagnostics.push(row) })
+  coordinator.setActive('device-a:run-a', true)
   const result = await coordinator.request()
   assert.equal(result.error.code, 'QUOTA_TIMEOUT')
   assert.equal(result.inFlight, true)
@@ -99,6 +105,7 @@ test('cached raw-reader replay is not a successful new observation and close pre
   const observations = []
   const coordinator = createQuotaCoordinator({ now: () => now, fetchUsage: async () => snapshot(),
     onObservation: row => observations.push(row) })
+  coordinator.setActive('device-a:run-a', true)
   await coordinator.request()
   now += 300_000
   const replay = await coordinator.request()
@@ -110,9 +117,60 @@ test('cached raw-reader replay is not a successful new observation and close pre
   let calls = 0
   const closed = createQuotaCoordinator({ now: () => now,
     fetchUsage: async () => { calls++; return snapshot(now) }, onObservation: () => false })
+  closed.setActive('device-a:run-a', true)
   const request = closed.request()
   await closed.close()
   assert.equal((await request).error.code, 'QUOTA_CLOSED')
   await delay(0)
   assert.equal(calls, 0)
+})
+
+test('two active runs share one account timer and the last inactive run stops polling', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: start })
+  let calls = 0
+  const observations = []
+  const coordinator = createQuotaCoordinator({ fetchUsage: async () => { calls++; return snapshot(Date.now()) },
+    onObservation: row => observations.push(row) })
+  t.after(() => coordinator.close())
+  const tick = async ms => { t.mock.timers.tick(ms); for (let n = 0; n < 6; n++) await Promise.resolve() }
+  await coordinator.request()
+  await tick(900_000)
+  assert.equal(calls, 0)
+  coordinator.setActive('device-a:run-a', true)
+  coordinator.setActive('device-b:run-b', true)
+  await tick(0)
+  assert.equal(calls, 1)
+  assert.equal(coordinator.peek().activeCount, 2)
+  await tick(299_999)
+  assert.equal(calls, 1)
+  await tick(1)
+  assert.equal(calls, 2)
+  coordinator.setActive('device-a:run-a', false)
+  await tick(300_000)
+  assert.equal(calls, 3)
+  coordinator.setActive('device-b:run-b', false)
+  assert.equal(coordinator.peek().active, false)
+  await tick(900_000)
+  const idle = await coordinator.request()
+  assert.equal(calls, 3)
+  assert.equal(observations.length, 3)
+  assert.equal(idle.active, false)
+  assert.equal(idle.fresh, false)
+})
+
+test('a run ending before detached sampling starts makes no read or observation', async () => {
+  let calls = 0
+  const observations = []
+  const coordinator = createQuotaCoordinator({ now: () => start,
+    fetchUsage: async () => { calls++; return snapshot() }, onObservation: row => observations.push(row) })
+  coordinator.setActive('device-a:run-a', true)
+  coordinator.setActive('device-a:run-a', false)
+  await delay(0)
+  assert.equal(calls, 0)
+  assert.equal(observations.length, 0)
+  assert.equal((await coordinator.request()).active, false)
+  coordinator.setActive('device-a:run-b', true)
+  await coordinator.request()
+  assert.equal(calls, 1)
+  await coordinator.close()
 })
