@@ -234,7 +234,8 @@ test('清除按钮清空凭据草稿和连接缓存，迟到的状态、模型�
     useState: () => [tokenDraft, value => { tokenDraft = value; }], useEffect() {} };
   const client = entry.factory(name => name === 'react' ? react : name === 'zod' ? { z: {} } : {});
   const status = () => ({ ok: true, value: { configured, url: configured ? 'wss://example.test/' : '',
-    connected: configured, authentication: configured ? 'logged-in' : 'unknown' } });
+    connected: configured, authentication: configured ? 'logged-in' : 'unknown',
+    modelCatalog: configured ? { status: 'failed', code: 'MODEL_CATALOG_UNAVAILABLE' } : undefined } });
   const pending = (name, value) => blocked ? new Promise(resolve => replies.set(name, () => resolve(value))) : Promise.resolve(value);
   const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
     remote: { $mount: async ({ descriptors }) => {
@@ -250,6 +251,7 @@ test('清除按钮清空凭据草稿和连接缓存，迟到的状态、模型�
   await client.apply(ctx);
   const slot = slots.get('dsh-claude-bridge'), settings = slot.options.inject();
   await settings.refreshStatus(); await settings.loadModels();
+  assert.equal(settings.hooks.settings.getSnapshot().modelCatalog.status, 'failed');
   blocked = true;
   const previousStatus = settings.refreshStatus(), previousModels = settings.loadModels();
   const quota = slots.get('dsh-claude-quota').options.inject('s');
@@ -268,6 +270,7 @@ test('清除按钮清空凭据草稿和连接缓存，迟到的状态、模型�
   assert.equal(state.configured, false); assert.equal(state.connected, false);
   assert.equal(state.url, ''); assert.equal(state.authentication, 'unknown');
   assert.deepEqual(Array.from(state.models), []); assert.equal(state.modelsLoaded, false);
+  assert.equal(state.modelCatalog, null);
   assert.equal(quota.hooks.quota.getSnapshot().status, 'unavailable');
   assert.match(state.message, /已清除/u);
 });
@@ -343,6 +346,18 @@ test('设置页打开及可见时刷新统计，合并请求并保留地址草�
   listeners.get('online')();
   await settings.refreshStatus();
   assert.match(textOf(render()), /正在执行 1 轮/u);
+  latest = { ...latest, configured: true, modelCatalog: { status: 'failed', code: 'MODEL_CATALOG_UNAVAILABLE' } };
+  await settings.refreshStatus();
+  assert.equal(settings.hooks.settings.getSnapshot().modelCatalog.status, 'failed');
+  const catalogAlert = () => nodesOf(render()).find(node => node.props?.role === 'alert'
+    && node.props['aria-label'] === '模型目录刷新状态');
+  assert.match(textOf(catalogAlert()), /远程模型目录刷新失败（MODEL_CATALOG_UNAVAILABLE）/u);
+  assert.match(textOf(catalogAlert()), /稍后重试；不影响其他模型使用/u);
+  assert.doesNotMatch(textOf(catalogAlert()), /缓存/u);
+  latest = { ...latest, modelCatalog: { status: 'ready' } };
+  await settings.refreshStatus();
+  assert.equal(settings.hooks.settings.getSnapshot().modelCatalog.status, 'ready');
+  assert.equal(catalogAlert(), undefined);
   for (const dispose of cleanup) dispose();
   assert.equal(timers.size, 0);
   assert.equal(listeners.size, 0);
@@ -353,9 +368,14 @@ test('上下文底栏只显示百分比，浮层展示同源用量与精简分�
   let entry;
   vm.runInNewContext(source, { document: { body: {} },
     window: { __ModuleLoader__: { load: value => { entry = value; } } } });
-  let open = false;
+  const states = [];
+  let cursor = 0;
   const react = { createElement: (type, props, ...children) => ({ type, props, children }),
-    useState: () => [open, value => { open = value; }], useRef: () => ({ current: null }), useEffect() {} };
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in states)) states[index] = initial;
+      return [states[index], value => { states[index] = value; }];
+    }, useRef: () => ({ current: null }), useEffect() {} };
   const client = entry.factory(name => {
     if (name === 'react') return react;
     if (name === 'react-dom') return { createPortal: child => ({ type: 'portal', children: [child] }) };
@@ -400,22 +420,40 @@ test('上下文底栏只显示百分比，浮层展示同源用量与精简分�
     : Array.isArray(node) ? node.map(textOf).join(' ') : node.type === 'style' ? '' : textOf(node.children);
   const nodesOf = node => node == null || typeof node !== 'object' ? []
     : Array.isArray(node) ? node.flatMap(nodesOf) : [node, ...nodesOf(node.children)];
-  const render = () => meter.component({ useBridgeStatus: select => select(state) });
+  const render = () => { cursor = 0; return meter.component({ useBridgeStatus: select => select(state) }); };
   assert.equal(textOf(render()).trim(), '≈12%');
+  state = { ...state, recovery: { status: 'syncing' } };
+  assert.equal(textOf(render()).trim(), '≈12%');
+  state = { ...state, recovery: { status: 'ready', interrupted: true, added: 2, unresolvedTools: 0 } };
+  assert.equal(textOf(render()).trim(), '≈12%');
+  state = { ...state, phase: 'failed', recovery: { status: 'unavailable', code: 'HISTORY_READ_FAILED' } };
+  assert.match(textOf(render()), /运行失败.*同步待重试/u);
+  state = { ...state, recovery: { status: 'syncing', code: 'HISTORY_READ_FAILED' } };
+  assert.match(textOf(render()), /运行失败.*同步待重试/u);
+  state = { ...state, recovery: { status: 'waiting', code: 'HISTORY_READ_FAILED' } };
+  assert.match(textOf(render()), /运行失败.*同步待重试/u);
+  state = { ...state, recovery: { status: 'ready' } };
+  assert.match(textOf(render()), /运行失败/u);
+  assert.doesNotMatch(textOf(render()), /同步待重试/u);
+  state = { ...state, phase: 'completed', connection: 'disconnected' };
   assert.equal(nodesOf(render()).some(node => node.props?.role === 'dialog'), false);
   nodesOf(render()).find(node => node.type === 'button').props.onClick();
   const expanded = render();
   const text = textOf(expanded);
   assert.match(text, /上下文已用 ≈12% ~120 \/ 1K/);
   assert.match(text, /对话消息 ~100/);
+  assert.match(text, /上次快照：.*非实时/u);
+  assert.match(text, /离线可查看已保存快照；执行仍需连接服务器/u);
   assert.equal(nodesOf(expanded).find(node => node.props?.role === 'dialog').props.className, 'dsh-claude-meter-panel');
   assert.doesNotMatch(text, /unavailable_tool|SDK 近似快照|剩余空间|压缩预留|原始窗口/);
+  state = { ...state, phase: 'unknown', toolMayHaveExecuted: true };
+  assert.match(textOf(render()), /状态待核实.*工具结果待核实.*≈12%/u);
   state = { ...state, phase: 'stopping', context: { status: 'unknown' }, toolMayHaveExecuted: true };
   assert.match(textOf(render()), /正在停止/);
   assert.match(textOf(render()), /未知/);
   assert.match(textOf(render()), /工具结果待核实/);
   state = { ...state, phase: 'completed', context: { ...state.context,
-    status: 'known', totalTokens: 2149, maxTokens: 1_000_000, percentage: 0.2149, categories: [] } };
+    status: 'known', totalTokens: 2149, maxTokens: 1_000_000, percentage: 0.2149, observedAt: 1000, categories: [] } };
   assert.match(textOf(render()), /≈0.2% ~2.1K \/ 1M/);
   state = null;
   assert.equal(render(), null);
@@ -677,4 +715,90 @@ test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行�
   for (const effect of effects.splice(0)) effect();
   assert.equal(reads, 3);
   assert.equal(timers.size, 0);
+});
+
+test('后台同步仅 RPC 失败也显示错误，重试等待不清除，成功和换会话正确隔离', async () => {
+  const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
+  let entry, nextTimer = 0, cursor = 0;
+  const timers = new Map(), listeners = new Map(), hooks = [], effects = [];
+  const page = { hidden: false, body: {}, addEventListener: (name, fn) => listeners.set(name, fn),
+    removeEventListener: name => listeners.delete(name) };
+  vm.runInNewContext(source, { document: page, navigator: { onLine: true },
+    setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+    clearTimeout: id => timers.delete(id), window: { __ModuleLoader__: { load: value => { entry = value; } },
+      addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name) } });
+  const react = { createElement: (type, props, ...children) => ({ type, props, children }),
+    useState(initial) {
+      const index = cursor++;
+      hooks[index] ??= { value: initial };
+      return [hooks[index].value, value => { hooks[index].value = value; }];
+    }, useRef(initial) {
+      const index = cursor++;
+      hooks[index] ??= { current: initial };
+      return hooks[index];
+    }, useEffect(effect, deps) {
+      const index = cursor++, previous = hooks[index];
+      if (!previous || deps.some((value, i) => !Object.is(value, previous.deps[i]))) {
+        const hook = hooks[index] = { deps, cleanup: previous?.cleanup };
+        effects.push(() => { hook.cleanup?.(); hook.cleanup = effect(); });
+      }
+    } };
+  const client = entry.factory(name => name === 'react' ? react : name === 'react-dom'
+    ? { createPortal: value => value } : name === '@deepseek-ai/dsh-client-ui-primitives'
+      ? { useAnchoredPosition: () => ({}), useDismissOnOutsidePointer() {} } : { z: {} });
+  const slots = new Map(), calls = [];
+  let reply = { ok: false }, throwRpc = false;
+  const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
+    remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
+      status: async () => ({ ok: true, value: { configured: false } }),
+      syncSession: async sessionId => { calls.push(sessionId);
+        if (throwRpc) throw new Error('合成 RPC 连接中断');
+        return await reply; },
+    } }, slots: { inject: (_name, register) => register(), register(options, component) {
+      slots.set(options.id, { options, component }); return () => {};
+    } }, inject: (_services, callback) => callback(ctx), effect() {} };
+  await client.apply(ctx);
+  const meter = slots.get('dsh-claude-context');
+  const first = meter.options.inject('first-session').syncSession;
+  const second = meter.options.inject('second-session').syncSession;
+  // The Host projection deliberately remains ready for every RPC failure.
+  const state = { phase: 'completed', recovery: { status: 'ready' }, context: { status: 'unknown' } };
+  const render = syncSession => { cursor = 0; return meter.component({
+    useBridgeStatus: select => select(state), syncSession }); };
+  const textOf = node => node == null || typeof node === 'boolean' ? ''
+    : typeof node === 'string' || typeof node === 'number' ? String(node)
+      : Array.isArray(node) ? node.map(textOf).join(' ') : node.type === 'style' ? '' : textOf(node.children);
+  const flush = async () => { for (const effect of effects.splice(0)) effect();
+    for (let i = 0; i < 12; i++) await Promise.resolve(); };
+  render(first); await flush();
+  assert.match(textOf(render(first)), /同步待重试/u);
+  let release;
+  reply = new Promise(resolve => { release = resolve; });
+  const retry = listeners.get('online')();
+  assert.match(textOf(render(first)), /同步待重试/u);
+  release({ ok: true, value: { status: 'waiting' } });
+  await retry;
+  assert.match(textOf(render(first)), /同步待重试/u);
+  reply = { ok: true, value: { status: 'active' } };
+  await listeners.get('online')();
+  assert.match(textOf(render(first)), /同步待重试/u);
+  reply = { ok: true, value: { status: 'ready' } };
+  await listeners.get('online')();
+  assert.doesNotMatch(textOf(render(first)), /同步待重试/u);
+  throwRpc = true;
+  await listeners.get('online')();
+  assert.match(textOf(render(first)), /同步待重试/u);
+  throwRpc = false;
+  reply = new Promise(resolve => { release = resolve; });
+  const late = listeners.get('online')();
+  assert.doesNotMatch(textOf(render(second)), /同步待重试/u);
+  reply = { ok: true, value: { status: 'empty' } };
+  await flush();
+  release({ ok: false });
+  await late;
+  assert.doesNotMatch(textOf(render(second)), /同步待重试/u);
+  assert.equal(calls.at(-1), 'second-session');
+  for (const hook of hooks) hook?.cleanup?.();
+  assert.equal(timers.size, 0);
+  assert.equal(listeners.size, 0);
 });

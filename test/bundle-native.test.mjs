@@ -170,6 +170,10 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
     const standardConfig = patches.flatMap(row => row.insert ?? []).find(row => row.id === 'preset-standard').config
     standardConfig.plugins.push({ id: 'future-tool', name: 'future-tool' })
     assert.ok(createRemoteClaudePreset(standardConfig).plugins.some(row => row.id === 'future-tool'))
+    const futureContent = content.replace(/^(\s*)- id: tool-plugin-market/m,
+      '$1- id: future-tool\n$1  name: future-tool\n$1- id: tool-plugin-market')
+    assert.notEqual(futureContent, content)
+    await writeFile(join(base, '@deepseek-ai/dsh-web-app/presets/standard.patch.yml'), futureContent)
     const { default: PresetService } = await import('../plugin/preset-service.mjs')
     let registeredPreset
     const presetScope = new PresetService({ extend: () => ({ agentPresets: {
@@ -177,6 +181,8 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
     } }) })
     const registration = presetScope[Service.init]()
     assert.equal((await registration.next()).done, false)
+    assert.equal(registeredPreset.plugins[0].config.mode, 'full')
+    assert.equal(registeredPreset.plugins[0].config.plugins.some(row => row.id === 'future-tool'), true)
     await registration.return()
 
     // A removed required export is a breaking change even with the same version number.
@@ -186,11 +192,15 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
       error.code === 'DSH_API_INCOMPATIBLE' && /createScope/u.test(error.message))
 
     await writeFile(join(base, '@deepseek-ai/dsh-web-app/presets/standard.patch.yml'), '- insert: []\n')
-    const fallback = presetScope[Service.init]()
-    assert.equal((await fallback.next()).done, false)
-    assert.equal(registeredPreset.plugins[0].config.mode, 'basic')
+    // An invalid declaration falls back to the equal owned full composition.
+    const independent = presetScope[Service.init]()
+    assert.equal((await independent.next()).done, false)
+    assert.equal(registeredPreset.plugins[0].config.mode, 'full')
+    assert.deepEqual(registeredPreset.plugins[0].config.reasons, [])
+    assert.equal(registeredPreset.plugins[0].config.noticeReasons.length, 1)
     assert.ok(registeredPreset.plugins[0].config.plugins.some(row => row.id === 'tool-pwsh'))
-    await fallback.return()
+    assert.equal(registeredPreset.plugins[0].config.plugins.some(row => row.id === 'future-tool'), false)
+    await independent.return()
   } finally {
     process.env.DSH_CLAUDE_BRIDGE_RESOURCES = originalResources
     assert.equal(dirname(directory), resolve(tmpdir()))

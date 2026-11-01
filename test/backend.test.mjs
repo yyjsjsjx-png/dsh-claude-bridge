@@ -10,6 +10,7 @@ import { assistantIdentity, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
 import { HISTORY_ASSISTANT, HISTORY_TOOL_RESULT } from '../src/history-records.mjs'
 import { createHash } from 'node:crypto'
 import { requiredShellName } from '../src/remote-capabilities.mjs'
+import { prepareRequestMessages } from '../src/request-preparation.mjs'
 
 const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
@@ -522,7 +523,8 @@ test('批次准备拒绝变化配置时恢复已认领消息，防止指令丢�
     if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
     assert.equal(method, 'query')
     await assert.rejects(handlers.handlers['step.prepare']({ runId: params.runId },
-      { signal: new AbortController().signal }), { code: 'QUERY_CONFIGURATION_CHANGED' })
+      { signal: new AbortController().signal }), error => error.code === 'QUERY_CONFIGURATION_CHANGED'
+        && /工具集合已更新.*保留当前对话/.test(error.message) && !/新建会话/.test(error.message))
     assert.deepEqual(f.agent.inbox.nextStep.map(message => message.id), ['pending-note', 'nested-note'])
     return { status: 'completed' }
   } }, async close() {} }))
@@ -826,6 +828,32 @@ test('动态运行上下文使用本轮刷新值并替换旧快照一次', async
   assert.equal(request.prompt.filter((block) => block.text === '新上下文').length, 1)
   assert.equal(request.prompt.some((block) => block.text === '旧上下文'), false)
   assert.equal(f.records.filter((record) => record.type === 'user/message' && record.data.id === 'fresh').length, 1)
+})
+
+test('原生指令预算省略或截断头在首次和续步均阻止，用户消息与文件正文引用不误报', () => {
+  const ordinary = 'Workspace instruction budget 65536 bytes: omitted AGENTS.md'
+  const truncated = 'Workspace instruction budget 65536 bytes: truncated AGENTS.md from 70000 to 65000 bytes'
+  const compact = 'Workspace instructions were omitted or truncated to fit the configured byte budget.'
+  const source = { kind: 'agent-instructions', form: 'instructions', changes: [] }
+  const prepare = (text, continuation, from = source) => {
+    const message = { id: 'synthetic-instruction', role: 'user', source: from, content: [{ type: 'text', text }] }
+    return prepareRequestMessages({ assembly: {}, messages: [message], context: {},
+      refreshContext: value => value, renderContextSections: () => [],
+      joinContextSections: () => '', projectContext: () => undefined, continuation })
+  }
+  for (const continuation of [false, true]) {
+    for (const header of [ordinary, truncated, compact]) {
+      for (const text of [header, `<system-reminder>\n${header}\n\nInstructions from: AGENTS.md\n</system-reminder>`]) {
+        assert.throws(() => prepare(text, continuation), error => error.code === 'INSTRUCTION_BUDGET_EXCEEDED'
+          && error.message.includes(continuation ? '已停止后续推理' : '已停止本轮推理'))
+      }
+    }
+    assert.equal(prepare(ordinary, continuation, { kind: 'user' }).length, 1)
+    assert.equal(prepare(compact, continuation, { kind: 'user' }).length, 1)
+    assert.equal(prepare(ordinary, continuation, { kind: 'agent-instructions', form: 'reference' }).length, 1)
+    const quoted = `<system-reminder>\nThe following workspace instructions may be relevant to your work.\n\nInstructions from: AGENTS.md\n\n${ordinary}\n${truncated}\n${compact}\n</system-reminder>`
+    assert.equal(prepare(quoted, continuation).length, 1)
+  }
 })
 
 test('工具附加文本与结束标记以独立字段传给远端 hook', async (t) => {

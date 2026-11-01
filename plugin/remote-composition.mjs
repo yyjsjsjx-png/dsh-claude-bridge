@@ -37,7 +37,12 @@ export async function apply(ctx, config) {
   composition = await loadRemoteComposition({ ...config,
     createTree: () => new RemoteTree(ctx.extend({ baseUrl: config.baseUrl })),
     prepareRows: rows => prepareProfileEntries(ctx, rows, config.baseUrl),
-    report: status => { currentStatus = status; publishRemotePresetStatus(ctx, status); },
+    report: status => {
+      currentStatus = status;
+      // Declaration-source notices are visible to the user. Only actual
+      // capability changes below contribute to the model's system prompt.
+      publishRemotePresetStatus(ctx, { ...status, reasons: [...status.reasons, ...(config.noticeReasons ?? [])] });
+    },
   });
   if (disposed) { await composition.dispose(); return; }
   // Publish the successful inner tree to native composition inspection. Failed

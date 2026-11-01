@@ -1,4 +1,5 @@
 import { CLAUDE_PRESET } from './policy.mjs';
+import { createLegacyV024RemoteClaudePreset } from './presets/legacy-v024.mjs';
 
 /** Explicit limits that are independent of a particular request's tool list. */
 export const REMOTE_PRESET_LIMITATIONS = Object.freeze([
@@ -7,6 +8,7 @@ export const REMOTE_PRESET_LIMITATIONS = Object.freeze([
   Object.freeze({ name: '子任务独立选型', status: 'disabled', reason: '子任务默认沿用父会话模型。' }),
   Object.freeze({ name: 'DSH 原生压缩', status: 'disabled', reason: '远程 Agent SDK 负责自身会话的上下文和压缩。' }),
   Object.freeze({ name: '会话分叉', status: 'disabled', reason: '请通过新建会话开始其他任务。' }),
+  Object.freeze({ name: '自动时间与时区上下文', status: 'disabled', reason: '远程预设不自动发送当前时间、浏览器时区或距上条消息的时间。' }),
 ]);
 export const REMOTE_PRESET_CONVERSIONS = Object.freeze([
   Object.freeze({ name: '/compact', status: 'converted', reason: '由远程 Agent SDK 压缩上下文，保留对话历史。' }),
@@ -20,6 +22,11 @@ function remoteCommands() {
     { id: 'claude-sdk-compact', name: new URL('./compact-command.mjs', import.meta.url).href },
     { id: 'claude-sdk-recovery', name: new URL('./recovery-command.mjs', import.meta.url).href },
   ];
+}
+
+/** Owned complete fallback when the installed standard cannot be adapted. */
+export function createOwnedRemoteClaudePreset() {
+  return createLegacyV024RemoteClaudePreset({ personaPrefix: REMOTE_PERSONA_PREFIX, commands: remoteCommands() });
 }
 
 /** UI descriptions must follow the effective preset, including basic fallback. */
@@ -57,11 +64,11 @@ export function createBasicRemoteClaudePreset(platform = process.platform) {
 }
 
 /** Keep all loading and degradation inside this remote preset's scope. */
-export function containRemotePreset(preset, { baseUrl, mode = 'full', reasons = [], platform = process.platform } = {}) {
+export function containRemotePreset(preset, { baseUrl, mode = 'full', reasons = [], noticeReasons = [], platform = process.platform } = {}) {
   return { ...preset, plugins: [{
     id: 'claude-remote-composition', name: new URL('./remote-composition.mjs', import.meta.url).href,
     config: { plugins: preset.plugins, basicPlugins: createBasicRemoteClaudePreset(platform).plugins,
-      baseUrl, mode, reasons, shell: platform === 'win32' ? 'pwsh' : 'bash' },
+      baseUrl, mode, reasons, noticeReasons, shell: platform === 'win32' ? 'pwsh' : 'bash' },
   }] };
 }
 
@@ -110,6 +117,7 @@ export function createRemoteClaudePreset(standard) {
       // Keep Loader-owned expression values intact; JSON cloning loses !!js.
       if (entry.id === 'persona') return { ...entry, config: { ...entry.config, prefix: REMOTE_PERSONA_PREFIX } };
       if (entry.id === 'planning') return { ...entry, disabled: true };
+      if (entry.name === '@deepseek-ai/dsh-time-context') return { ...entry, disabled: true };
       if (entry.id !== 'delegation') return { ...entry };
       return {
         ...entry,

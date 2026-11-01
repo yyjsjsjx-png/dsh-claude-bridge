@@ -2,7 +2,7 @@
 export function createPickerController({ rpc, workspaces, sessions, uiWorkspace, createStore, textError }) {
   const REMOTE_CREATE_PREFIX = 'claude-sdk-remote+model-v1:';
   const EMPTY = Object.freeze({ open: false, loading: false, busy: false,
-    workspaceId: undefined, models: [], model: '', effort: '', error: '' });
+    workspaceId: undefined, models: [], modelEfforts: {}, model: '', effort: '', error: '' });
   const store = createStore(EMPTY);
   let generation = 0;
   let disposed = false;
@@ -30,15 +30,25 @@ export function createPickerController({ rpc, workspaces, sessions, uiWorkspace,
       if (!Array.isArray(response.value?.models)) throw new Error('远程模型目录格式无效。');
       const saved = response.value.selection;
       const model = response.value.models.find(item => item.id === saved?.model);
-      const effort = model?.reasoning?.efforts?.some(item => item.id === saved?.reasoningEffort) ? saved.reasoningEffort : '';
-      update({ loading: false, models: response.value.models, model: model?.id ?? '', effort,
+      const modelEfforts = response.value.modelEfforts && typeof response.value.modelEfforts === 'object'
+        && !Array.isArray(response.value.modelEfforts) ? response.value.modelEfforts : {};
+      const remembered = model && Object.hasOwn(modelEfforts, model.id) ? modelEfforts[model.id] : saved?.reasoningEffort;
+      const effort = model?.reasoning?.efforts?.some(item => item.id === remembered) ? remembered : '';
+      update({ loading: false, models: response.value.models, modelEfforts, model: model?.id ?? '', effort,
         error: response.value.models.length ? '' : '没有勾选可显示的模型，请在远程会话设置中选择。' });
     } catch (error) {
       if (!disposed && revision === generation) update({ loading: false, error: textError(error) });
     }
   }
 
-  function selectModel(model) { if (!disposed) update({ model, effort: '', error: '' }); }
+  function selectModel(model) {
+    if (disposed) return;
+    const state = store.getSnapshot();
+    const remembered = Object.hasOwn(state.modelEfforts, model) ? state.modelEfforts[model] : undefined;
+    const available = state.models.find(item => item.id === model);
+    const effort = available?.reasoning?.efforts?.some(item => item.id === remembered) ? remembered : '';
+    update({ model, effort, error: '' });
+  }
   function selectEffort(effort) { if (!disposed) update({ effort, error: '' }); }
 
   async function create() {

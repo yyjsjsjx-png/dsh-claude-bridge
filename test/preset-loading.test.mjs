@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadRemoteComposition } from '../plugin/preset-loading.mjs';
-import { createBasicRemoteClaudePreset, containRemotePreset, remotePresetFeatures } from '../plugin/preset.mjs';
+import { createBasicRemoteClaudePreset, createOwnedRemoteClaudePreset, containRemotePreset, remotePresetFeatures } from '../plugin/preset.mjs';
 
 const base = createBasicRemoteClaudePreset('win32').plugins;
 
@@ -55,6 +55,42 @@ test('基础预设独立维护 Windows shell，关闭后台提升并保留指令
   assert.equal(contained.plugins.length, 1);
   assert.equal(contained.plugins[0].config.shell, 'bash');
   assert.equal(basic.plugins.length, 5);
+  const fallback = containRemotePreset(basic, { noticeReasons: ['声明来源已回退。'] });
+  assert.deepEqual(fallback.plugins[0].config.noticeReasons, ['声明来源已回退。']);
+  assert.deepEqual(fallback.plugins[0].config.reasons, []);
+});
+
+test('自有完整预设保留 v024 声明顺序和默认配置，仅显式关闭自动时间上下文', () => {
+  const preset = createOwnedRemoteClaudePreset();
+  assert.equal(preset.id, 'claude-sdk-remote');
+  assert.deepEqual(preset.plugins.map(row => row.id), [
+    'persona', 'agent-instructions', 'time-context', 'tool-bash', 'tool-pwsh', 'tool-fs',
+    'tool-fs-search', 'tool-jobs', 'tool-schedule', 'skill-filesystem', 'tool-skill',
+    'command-goal', 'tool-goal', 'planning', 'delegation', 'tool-ask-user', 'tool-todo',
+    'tool-web', 'present', 'tool-plugin-manager', 'tool-plugin-market',
+    'claude-sdk-compact', 'claude-sdk-recovery',
+  ]);
+  const row = id => preset.plugins.find(item => item.id === id);
+  assert.deepEqual(row('tool-bash').disabled, { __jsExpr: "process.platform === 'win32'" });
+  assert.deepEqual(row('tool-pwsh').disabled, { __jsExpr: "process.platform !== 'win32'" });
+  assert.equal(Object.hasOwn(row('tool-pwsh'), 'config'), false);
+  assert.equal(Object.hasOwn(row('tool-bash'), 'config'), false);
+  assert.deepEqual(row('agent-instructions').config, { maxBytes: 65536 });
+  assert.equal(row('time-context').disabled, true);
+  assert.deepEqual(row('tool-fs-search').config, { sampleOverCapGlobResults: false });
+  assert.deepEqual(row('tool-todo').config, { allowParallelInProgress: true });
+  assert.deepEqual(row('tool-web').config, { fetch: true, searchTimeoutMs: 60000 });
+  assert.equal(row('planning').disabled, true);
+  assert.equal(row('tool-plugin-manager').disabled, true);
+  assert.equal(row('tool-plugin-market').disabled, true);
+  assert.deepEqual(row('delegation').isolate, { workflowEngine: true });
+  const spawn = row('delegation').config.find(item => item.id === 'tool-subagent');
+  assert.deepEqual(spawn.config, { provider: 'spawn', toolName: 'subagent', modelSelectionSettings: false });
+  assert.equal(row('delegation').config.find(item => item.id === 'tool-subagent-fork').disabled, true);
+  const next = createOwnedRemoteClaudePreset();
+  assert.notEqual(row('tool-pwsh').disabled, next.plugins.find(item => item.id === 'tool-pwsh').disabled);
+  assert.notEqual(spawn.config, next.plugins.find(item => item.id === 'delegation').config
+    .find(item => item.id === 'tool-subagent').config);
 });
 
 test('基础或降级预设不向界面宣称未开启的 Workflow 和压缩命令已转换', () => {
@@ -64,6 +100,8 @@ test('基础或降级预设不向界面宣称未开启的 Workflow 和压缩命�
   assert.deepEqual(status.convertedFeatures.map(item => item.name), ['身份提示']);
   assert.ok(status.disabledFeatures.some(item => item.name === '/compact'));
   assert.ok(status.disabledFeatures.some(item => item.name === '子代理与后台任务'));
+  assert.ok(status.disabledFeatures.some(item => item.name === '自动时间与时区上下文'
+    && item.status === 'disabled' && item.reason.includes('浏览器时区')));
 });
 
 test('可选组件导入、激活或依赖失败只关闭该组件，先等待清理', async () => {

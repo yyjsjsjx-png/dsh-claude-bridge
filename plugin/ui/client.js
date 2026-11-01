@@ -24,7 +24,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
     remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
-    models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
+    models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
     contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
   const updateSettings = patch => store.set({ ...store.getSnapshot(), ...patch });
@@ -52,6 +52,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
           connected: status.connected === true, authentication: status.authentication ?? 'unknown',
           compatibility: status.compatibility ?? [], disabledFeatures: status.disabledFeatures ?? [],
           convertedFeatures: status.convertedFeatures ?? [], activeRuns: status.activeRuns ?? 0,
+          modelCatalog: status.modelCatalog ?? null,
           remotePreset: status.remotePreset ?? null, remoteCapabilities: status.remoteCapabilities ?? null,
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
@@ -83,7 +84,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
     statusRequest = undefined;
     models.invalidate();
     onConnectionChange();
-    updateSettings({ busy: true, modelsLoading: false, error: '', message: '' });
+    updateSettings({ busy: true, modelsLoading: false, modelCatalog: null, error: '', message: '' });
     try {
       const response = await request();
       if (!response.ok) throw new Error(response.error.message);
@@ -322,7 +323,7 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
 function createPickerController({ rpc, workspaces, sessions, uiWorkspace, createStore, textError }) {
   const REMOTE_CREATE_PREFIX = 'claude-sdk-remote+model-v1:';
   const EMPTY = Object.freeze({ open: false, loading: false, busy: false,
-    workspaceId: undefined, models: [], model: '', effort: '', error: '' });
+    workspaceId: undefined, models: [], modelEfforts: {}, model: '', effort: '', error: '' });
   const store = createStore(EMPTY);
   let generation = 0;
   let disposed = false;
@@ -350,15 +351,25 @@ function createPickerController({ rpc, workspaces, sessions, uiWorkspace, create
       if (!Array.isArray(response.value?.models)) throw new Error('远程模型目录格式无效。');
       const saved = response.value.selection;
       const model = response.value.models.find(item => item.id === saved?.model);
-      const effort = model?.reasoning?.efforts?.some(item => item.id === saved?.reasoningEffort) ? saved.reasoningEffort : '';
-      update({ loading: false, models: response.value.models, model: model?.id ?? '', effort,
+      const modelEfforts = response.value.modelEfforts && typeof response.value.modelEfforts === 'object'
+        && !Array.isArray(response.value.modelEfforts) ? response.value.modelEfforts : {};
+      const remembered = model && Object.hasOwn(modelEfforts, model.id) ? modelEfforts[model.id] : saved?.reasoningEffort;
+      const effort = model?.reasoning?.efforts?.some(item => item.id === remembered) ? remembered : '';
+      update({ loading: false, models: response.value.models, modelEfforts, model: model?.id ?? '', effort,
         error: response.value.models.length ? '' : '没有勾选可显示的模型，请在远程会话设置中选择。' });
     } catch (error) {
       if (!disposed && revision === generation) update({ loading: false, error: textError(error) });
     }
   }
 
-  function selectModel(model) { if (!disposed) update({ model, effort: '', error: '' }); }
+  function selectModel(model) {
+    if (disposed) return;
+    const state = store.getSnapshot();
+    const remembered = Object.hasOwn(state.modelEfforts, model) ? state.modelEfforts[model] : undefined;
+    const available = state.models.find(item => item.id === model);
+    const effort = available?.reasoning?.efforts?.some(item => item.id === remembered) ? remembered : '';
+    update({ model, effort, error: '' });
+  }
   function selectEffort(effort) { if (!disposed) update({ effort, error: '' }); }
 
   async function create() {
@@ -447,6 +458,25 @@ function compactTokens(value) {
 
   function SessionMeter({ useBridgeStatus, syncSession }) {
     const state = useBridgeStatus(value => value);
+    const [open, setOpen] = React.useState(false);
+    const [syncFailure, setSyncFailure] = React.useState(null);
+    const bindingRef = React.useRef(null);
+    if (!bindingRef.current || bindingRef.current.syncSession !== syncSession) bindingRef.current = { syncSession };
+    const binding = bindingRef.current;
+    const synchronize = async () => {
+      if (!syncSession) return;
+      let result;
+      try { result = await syncSession(); } catch { result = { status: 'unavailable' }; }
+      if (bindingRef.current === binding) {
+        if (result?.status === 'unavailable') setSyncFailure(binding);
+        else if (['ready', 'empty', 'not-remote'].includes(result?.status)) setSyncFailure(null);
+      }
+      return result;
+    };
+    React.useEffect(() => {
+      bindingRef.current = binding;
+      return () => { if (bindingRef.current === binding) bindingRef.current = null; };
+    }, [syncSession]);
     React.useEffect(() => {
       if (state == null || !syncSession || ['running', 'compacting', 'stopping'].includes(state.phase)) return;
       let cancelled = false, timer, failures = 0, inFlight = false;
@@ -455,7 +485,7 @@ function compactTokens(value) {
         if (cancelled || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
         inFlight = true;
         let result;
-        try { result = await syncSession(); } catch { result = { status: 'unavailable' }; }
+        try { result = await synchronize(); }
         finally { inFlight = false; }
         if (!cancelled) {
           const retry = ['waiting', 'unavailable', 'active'].includes(result?.status);
@@ -469,7 +499,6 @@ function compactTokens(value) {
       return () => { cancelled = true; clearTimeout(timer); window.removeEventListener('online', sync);
         document.removeEventListener('visibilitychange', sync); };
     }, [syncSession, state == null, state?.phase, state?.connection]);
-    const [open, setOpen] = React.useState(false);
     const rootRef = React.useRef(null);
     const panelRef = React.useRef(null);
     const position = useAnchoredPosition({ open: open && state != null,
@@ -488,8 +517,9 @@ function compactTokens(value) {
     const phases = { stopping: '正在停止…', stopped: '已停止', unknown: '状态待核实',
       failed: '运行失败', compacting: '正在压缩…' };
     const recovery = state.recovery;
-    const recoveryText = { syncing: '同步记录…', waiting: '等待云端收尾…', unavailable: '同步待重试' }[recovery?.status]
-      ?? (recovery?.status === 'ready' && recovery.interrupted ? '已恢复，可继续' : null);
+    const recoveryFailed = syncFailure === binding || recovery?.status === 'unavailable' || Boolean(recovery?.code);
+    const recoveryText = recoveryFailed ? '同步待重试'
+      : recovery?.status === 'waiting' ? '等待云端收尾…' : null;
     const reading = !known ? '未知' : snapshot.percentage > 0 && snapshot.percentage < 0.1 ? '<0.1%'
       : `≈${Math.round(snapshot.percentage * (snapshot.percentage < 1 ? 10 : 1)) / (snapshot.percentage < 1 ? 10 : 1)}%`;
     const percent = known ? Math.min(100, snapshot.percentage) : 0;
@@ -504,18 +534,19 @@ function compactTokens(value) {
       : [{ name: '已用', color: 'var(--dsw-static-blue-450, #4e8cff)', width: percent }];
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
-      !recoveryText && phases[state.phase] && React.createElement('span', { role: 'status' }, phases[state.phase]),
+      phases[state.phase] && React.createElement('span', { role: 'status' }, phases[state.phase]),
       recoveryText && React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
-        'aria-label': '同步云端记录', title: recovery.status === 'ready'
-          ? `已补齐 ${recovery.added} 条消息。${recovery.unresolvedTools ? `${recovery.unresolvedTools} 个工具结果仍待核实；继续对话时会告知 Claude。` : '可以直接在输入框继续对话。'}`
-          : '自动同步原生 Claude 会话；点击可立即重试。', onClick: () => { void syncSession?.().catch(() => {}); } }, recoveryText),
+        'aria-label': '同步云端记录', title: recoveryFailed
+          ? `上次同步失败${recovery?.code ? `（${recovery.code}）` : ''}，成功前保留提示；点击可立即重试。`
+          : '云端原运行仍在收尾，尚未确认同步完成；点击可立即重试。',
+        onClick: () => { void synchronize(); } }, recoveryText),
       state.connection === 'reconnecting' && React.createElement('span', { role: 'status',
         title: '短暂断线，正在恢复原连接；不会重新发送整轮请求。' }, '连接恢复中…'),
       state.toolMayHaveExecuted && React.createElement('span', { role: 'status',
         title: '工具可能已执行，停止不代表撤销。' }, '工具结果待核实'),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
         'aria-label': `上下文已用 ${reading}`, 'aria-haspopup': 'dialog', 'aria-expanded': open,
-        title: state.phase === 'running' ? 'SDK 上一轮近似快照，完成本轮后更新' : 'SDK 上下文近似值',
+        title: known ? 'SDK 上次有效近似快照，非实时；点击查看采样时间。' : '完成一轮对话后更新上下文快照。',
         onClick: () => setOpen(!open) },
         React.createElement('svg', { viewBox: '0 0 14 14', width: 14, height: 14, 'aria-hidden': true },
           React.createElement('circle', { cx: 7, cy: 7, r: 5.5, fill: 'none', strokeWidth: 2,
@@ -532,6 +563,9 @@ function compactTokens(value) {
           known && React.createElement('span', { className: 'dsh-claude-meter-count' },
             `~${compactTokens(snapshot.totalTokens)} / ${compactTokens(snapshot.maxTokens)}`)),
         known ? React.createElement(React.Fragment, null,
+          React.createElement('p', { style: { margin: '8px 0 0' } },
+            `上次快照：${new Date(snapshot.observedAt).toLocaleString('zh-CN', { hour12: false })} · 非实时`),
+          React.createElement('p', { style: { margin: '4px 0 0' } }, '离线可查看已保存快照；执行仍需连接服务器。'),
           React.createElement('div', { className: 'dsh-claude-meter-bar', role: 'meter',
             'aria-label': '上下文占用', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
             ...segments.filter(segment => segment.width > 0).map(segment => React.createElement('span', {
@@ -848,6 +882,8 @@ const SETTINGS_CSS = `
       ? state.models.filter(model => state.selectedModelIds.includes(model.value)).length : 0;
     const authTone = state.authentication === 'logged-in' ? 'ok' : state.authentication === 'login-required' ? 'error' : 'warn';
     const bridgeCompatibility = state.bridgeCompatibility;
+    const catalogCode = typeof state.modelCatalog?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.modelCatalog.code) ? `（${state.modelCatalog.code}）` : '';
     const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     const hostChecks = Array.isArray(state.host?.checks) ? state.host.checks : [];
     const checkRows = [
@@ -908,6 +944,8 @@ const SETTINGS_CSS = `
         h('p', { className: 'dcb-card-desc' }, '选择模型列表中显示的模型；隐藏不会停止已有会话，正在使用的模型会暂时保留在原生列表中。'),
         !state.configured && h('p', { className: 'dcb-hint' }, '请先保存连接设置，再读取账号模型。'),
         state.modelsLoading && h('p', { className: 'dcb-hint' }, '正在读取模型…'),
+        state.modelCatalog?.status === 'failed' && h('p', { role: 'alert', 'aria-label': '模型目录刷新状态',
+          className: 'dcb-notice', 'data-tone': 'error' }, `远程模型目录刷新失败${catalogCode}，请稍后重试；不影响其他模型使用。`),
         state.modelError && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.modelError),
         state.modelsLoaded && h('div', null,
           h('div', { className: 'dcb-models' },

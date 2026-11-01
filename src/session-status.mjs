@@ -8,6 +8,22 @@ export function initialSessionStatus(model = null) {
     compatibility: null, toolMayHaveExecuted: false, updatedAt: Date.now() }
 }
 
+/** Keep a session's last observation without presenting it as a fresh reading. */
+export function reconcileSessionStatus(previous, next) {
+  let value = next
+  if (previous?.model === next.model && previous?.context?.status === 'known'
+    && next.context.status === 'unknown') {
+    value = { ...value, context: previous.context }
+  }
+  // Starting a retry does not establish that the last failure was resolved.
+  // A ready snapshot replaces recovery wholesale and clears the old code.
+  if (['syncing', 'waiting'].includes(next.recovery?.status)
+    && !next.recovery.code && previous?.recovery?.code) {
+    value = { ...value, recovery: { ...next.recovery, code: previous.recovery.code } }
+  }
+  return value
+}
+
 /** A log-only, replayable whole snapshot; it never changes model-facing history. */
 export function createSessionStatusProjection(z) {
   const tokens = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
@@ -38,7 +54,9 @@ export function createSessionStatusProjection(z) {
     init: header => header.agentPreset === CLAUDE_PRESET ? initialSessionStatus() : null,
     apply: (state, event) => {
       if (state === null) return state
-      if (event.type === SESSION_STATUS_RECORD && event.ignorable === true) return schema.parse(event.data)
+      if (event.type === SESSION_STATUS_RECORD && event.ignorable === true) {
+        return reconcileSessionStatus(state, schema.parse(event.data))
+      }
       if (event.type === 'model/selection' && event.data.provider === CLAUDE_PROVIDER
         && event.data.model !== state.model) {
         return { ...state, model: event.data.model, context: { status: 'unknown' }, compatibility: null, updatedAt: event.time }

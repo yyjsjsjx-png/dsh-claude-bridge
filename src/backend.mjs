@@ -11,9 +11,10 @@ import { createConnectionSettings } from './connection-settings.mjs'
 import { toMcpToolDefinitions, toSdkPrompt, toMcpContent } from './dsh-content.mjs'
 import { SdkProjection, dshUsage } from './sdk-projection.mjs'
 import { CLAUDE_PROVIDER, CLAUDE_PRESET } from '../plugin/policy.mjs'
-import { defaultVisibleIds, validateVisibleIds, validateCreationSelection } from './model-preferences.mjs'
+import { defaultVisibleIds, validateVisibleIds, validateCreationSelection,
+  readModelEffortPreferences, applyModelEffortPreference } from './model-preferences.mjs'
 import { imageCapability } from './model-capabilities.mjs'
-import { contextSnapshot, initialSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
+import { contextSnapshot, initialSessionStatus, reconcileSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
@@ -24,6 +25,7 @@ import { requiredShellName, assertRemoteShell,
   shellInfrastructureFailure } from './remote-capabilities.mjs'
 import { prepareRequestAssembly, prepareRequestMessages } from './request-preparation.mjs'
 import { evaluateBridgeCompatibility, bridgeCompatibilityAllowed } from './bridge-compatibility.mjs'
+import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } from './catalog-display.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const uncheckedBridgeCompatibility = () => ({ status: 'unchecked', clientVersion,
@@ -113,6 +115,11 @@ export class BridgeBackend {
     this.authentication = 'unknown'
     this.catalogCache = undefined
     this.catalogPending = undefined
+    this.catalogPendingRefresh = undefined
+    this.displayIdentityPending = undefined
+    this.displayCatalogRefreshPending = undefined
+    this.displayCatalogRefreshAfter = 0
+    this.displayCatalogStatus = undefined
     this.planUsageCache = undefined
     this.planUsagePending = undefined
     let closeError
@@ -121,6 +128,7 @@ export class BridgeBackend {
       connecting?.catch(() => {}),
     ])
     try {
+      await this.state.update(state => { delete state.displayCatalog })
       const accepted = await operation(await this.settings())
       await closing
       if (closeError) throw failure('CONNECTION_CLOSE_FAILED', '连接设置已更新，但旧连接未能确认关闭，请重载插件。')
@@ -144,6 +152,7 @@ export class BridgeBackend {
       remoteCapabilities: this.remoteCapabilities, bridgeCompatibility: this.bridgeCompatibility,
       diagnosticsPath: this.diagnostics.path, activeRuns: this.runs.size,
       authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary(),
+      modelCatalog: this.displayCatalogStatus ?? { status: 'idle' },
       contextPreferences: this.contextPreferences(),
       autoCompactWindowSupported: this.initialized ? this.initialized.capabilities?.autoCompactWindow === true : null }
   }
@@ -280,8 +289,15 @@ export class BridgeBackend {
   }
 
   async catalog({ refresh = false } = {}) {
+    if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
     if (!refresh && this.catalogCache && Date.now() - this.catalogCache.time < 30000) return structuredClone(this.catalogCache.reply)
-    if (this.catalogPending) return this.catalogPending
+    if (this.catalogPending) {
+      if (!refresh || this.catalogPendingRefresh) return this.catalogPending
+      const revision = this.connectionRevision
+      await this.catalogPending.catch(() => {})
+      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      return this.catalog({ refresh: true })
+    }
     const revision = this.connectionRevision
     const pending = (async () => {
       const transport = await this.connect()
@@ -289,13 +305,101 @@ export class BridgeBackend {
       // Only the explicit refresh action forces a fresh CLI auth check.
       if (refresh) await this.refreshAuthentication()
       const reply = await transport.peer.request('catalog', { refresh }, { timeoutMs: 45000 })
-      if (revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (reply.status !== 'ok') throw failure(reply.code ?? 'CATALOG_UNAVAILABLE', reply.message ?? '无法获取当前账号模型目录。')
       this.catalogCache = { time: Date.now(), reply: structuredClone(reply) }
+      await this.rememberDisplayCatalog(reply.models, revision, transport)
+      if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      this.displayCatalogStatus = { status: 'ready' }
       return reply
     })()
     this.catalogPending = pending
-    try { return await pending } finally { if (this.catalogPending === pending) this.catalogPending = undefined }
+    this.catalogPendingRefresh = refresh
+    try { return await pending } finally {
+      if (this.catalogPending === pending) { this.catalogPending = undefined; this.catalogPendingRefresh = undefined }
+    }
+  }
+
+  async displayCatalogIdentity() {
+    if (this.displayIdentityPending) return this.displayIdentityPending
+    const revision = this.connectionRevision
+    const pending = (async () => {
+      await this.state.ready
+      const transport = this.createTransport ? 'custom' : this.config.transport ?? 'wss'
+      const identity = transport === 'wss'
+        ? { transport, ...(await (await this.settings()).resolve()) }
+        : { transport, deviceId: this.state.value.deviceId,
+          worker: this.config.remoteWorkerPath, node: this.config.remoteNodePath }
+      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      return catalogConnectionIdentity(identity)
+    })()
+    this.displayIdentityPending = pending
+    try { return await pending } finally {
+      if (this.displayIdentityPending === pending) this.displayIdentityPending = undefined
+    }
+  }
+
+  /** Advisory local metadata only; never hydrate the execution-freshness cache. */
+  async displayCatalog({ visible = false } = {}) {
+    await this.state.ready
+    if (this.disposed || this.connectionChanging) return { status: 'ok', models: [] }
+    const revision = this.connectionRevision
+    let identity
+    try { identity = await this.displayCatalogIdentity() } catch { return { status: 'ok', models: [] } }
+    if (revision !== this.connectionRevision || this.connectionChanging) return { status: 'ok', models: [] }
+    const cached = readDisplayCatalog(this.state.value.displayCatalog, identity)
+    let models = cached?.models ?? []
+    if (visible) {
+      const saved = this.state.value.modelPreferences
+      if (saved !== undefined && saved.version !== 1) return { status: 'ok', models: [] }
+      const enabled = new Set(saved === undefined ? defaultVisibleIds(models) : validateVisibleIds({ enabledIds: saved.enabledIds }))
+      models = models.filter(model => enabled.has(model.value))
+    }
+    return { status: 'ok', models, ...(cached ? { updatedAt: cached.updatedAt } : {}) }
+  }
+
+  async rememberDisplayCatalog(input, revision, transport) {
+    let changed = false
+    try {
+      const models = catalogDisplayModels(input)
+      const identity = await this.displayCatalogIdentity()
+      await this.state.update(state => {
+        if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) return
+        const previous = readDisplayCatalog(state.displayCatalog, identity)
+        changed = !previous || !isDeepStrictEqual(previous.models, models)
+        state.displayCatalog = { version: 1, identity, updatedAt: Date.now(), models }
+      })
+    } catch {
+      // Display metadata is optional. Run/tool journals retain their existing
+      // required persistence, and a cache failure never authorizes execution.
+      this.diagnostics.event('catalog.cache_unavailable', { code: 'DISPLAY_CACHE_UNAVAILABLE' })
+    }
+    if (changed && !this.disposed && revision === this.connectionRevision && this.connection === transport) {
+      try { this.onDisplayCatalogChanged?.() }
+      catch { this.diagnostics.event('catalog.notification_failed', { code: 'CATALOG_NOTIFICATION_FAILED' }) }
+    }
+  }
+
+  /** Detached refresh: the native global picker must not await remote I/O. */
+  refreshDisplayCatalog() {
+    if (this.disposed || this.connectionChanging || this.displayCatalogRefreshPending
+      || Date.now() < (this.displayCatalogRefreshAfter ?? 0)) return
+    const revision = this.connectionRevision
+    this.displayCatalogStatus = { status: 'refreshing' }
+    const pending = this.catalog().then(() => {
+      if (revision === this.connectionRevision && !this.disposed) this.displayCatalogStatus = { status: 'ready' }
+    }).catch(error => {
+      if (revision !== this.connectionRevision || this.disposed) return
+      const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'CATALOG_UNAVAILABLE'
+      this.displayCatalogStatus = { status: 'failed', code }
+      this.diagnostics.event('catalog.refresh_failed', { code })
+    }).finally(() => {
+      if (this.displayCatalogRefreshPending === pending) {
+        this.displayCatalogRefreshPending = undefined
+        this.displayCatalogRefreshAfter = Date.now() + 30_000
+      }
+    })
+    this.displayCatalogRefreshPending = pending
   }
 
   async planUsage(refresh = false) {
@@ -362,7 +466,27 @@ export class BridgeBackend {
 
   async rememberCreationSelection(value) {
     const selection = validateCreationSelection(value)
-    await this.state.update(state => { state.creationSelection = selection })
+    await this.state.update(state => {
+      const entries = Object.entries(readModelEffortPreferences(state)).filter(([model]) => model !== selection.model)
+      entries.push([selection.model, selection.reasoningEffort ?? null])
+      state.modelEffortPreferences = { version: 1, byModel: Object.fromEntries(entries.slice(-1024)) }
+      state.creationSelection = selection
+    })
+  }
+
+  async modelEffortPreferences() {
+    await this.state.ready
+    return readModelEffortPreferences(this.state.value, this.ctx.agentDefaultModel?.currentSelection())
+  }
+
+  async applyModelEffortPreference(value, current) {
+    const selection = validateCreationSelection(value)
+    if (Object.hasOwn(value, 'reasoningEffort')
+      || (current?.provider === selection.provider && current.model === selection.model)) return selection
+    const preferences = await this.modelEffortPreferences()
+    const remembered = Object.hasOwn(preferences, selection.model) ? preferences[selection.model] : null
+    const models = typeof remembered === 'string' ? (await this.catalog()).models : []
+    return applyModelEffortPreference(selection, current, preferences, models)
   }
 
   async notification(method, params) {
@@ -683,8 +807,10 @@ export class BridgeBackend {
     const current = this.ctx.sessionProjections.stateOf(agent.session, 'claudeBridge')
     const previous = current?.version === 1 ? current : agent._bridgeStatus ?? initialSessionStatus()
     const changedModel = patch.model !== undefined && patch.model !== previous.model
-    const next = { ...previous, ...(changedModel ? { context: { status: 'unknown' }, compatibility: null } : {}),
-      ...patch, updatedAt: Date.now() }
+    const next = reconcileSessionStatus(previous, {
+      ...previous, ...(changedModel ? { context: { status: 'unknown' }, compatibility: null } : {}),
+      ...patch, updatedAt: Date.now(),
+    })
     if (patch.runId !== undefined && ['running', 'compacting'].includes(patch.phase)) delete next.recovery
     this.helpers.appendPluginRecord(agent.session, SESSION_STATUS_RECORD, next)
     agent._bridgeStatus = next
@@ -968,8 +1094,11 @@ export class BridgeBackend {
       if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
       const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent), run.catalogModels)
       const prepared = this.prepareRequest(agent, decision, tools)
-      if (prepared.renderSystemPrompt() !== run.systemPrompt || prepared.toolSignature !== run.toolSignature) {
-        throw failure('QUERY_CONFIGURATION_CHANGED', '运行期间 DSH 提示词或工具集合发生变化；本次已停止，请新建会话应用新配置。')
+      const promptChanged = prepared.renderSystemPrompt() !== run.systemPrompt
+      if (promptChanged || prepared.toolSignature !== run.toolSignature) {
+        throw failure('QUERY_CONFIGURATION_CHANGED', promptChanged
+          ? '运行期间系统提示发生变化，本轮已在安全边界停止并保留原对话；恢复原预设配置后可继续。'
+          : '运行期间工具集合已更新，本轮已在安全边界停止并保留当前对话；继续时将重新检查最新工具。')
       }
       const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true)
       const blocks = messages.length ? await toSdkPrompt(messages, { ...run.media, signal }) : []
