@@ -13,6 +13,8 @@ node scripts/run-regression.mjs --layer native --resources '现有DSH目录\reso
 
 `--layer all` 顺序执行两层；`--preflight-only` 只检查入口环境，不运行测试，报告状态为 `preflight-passed`，不能当作测试通过。路径也可由 `DSH_CLAUDE_BRIDGE_RESOURCES` 和 `DSH_CLAUDE_BRIDGE_EXECUTABLE` 提供。程序只操作测试自己的临时数据，不安装 DSH、不启动桌面图形窗口、不改变现有插件或服务。
 
+UI 源码按状态控制器、视图和 DSH 接线维护在 `plugin/ui/client/`，运行时仍使用单个 `plugin/ui/client.js`。修改源码后运行 `npm run build:client` 并一并提交产物；`npm run check:client` 只核对源码与产物一致。构建使用现有 Node，不安装新依赖。CI 在普通层测试前执行同一产物检查。
+
 每层输出 `report.json`、TAP 原始结果及 stderr 日志。普通层执行项目既有 `npm test` 全集，明确报告通过、失败、取消、跳过与 TODO 数；其中原生用例因缺 Electron 跳过是预期边界，不算已通过原生层。原生层必须有测试且 **0 失败、0 取消、0 跳过、0 TODO**，否则退出码为非零。缺环境、版本不符或缺完整 TAP 汇总同样失败。
 
 ## 无密钥覆盖
@@ -69,7 +71,7 @@ Windows 任务仅在 GitHub runner 的临时目录下载固定[官方 rc.5 Windo
 
 CI 保存本次报告和测试日志 14 天，不上传下载的桌面程序、临时会话或任何真实账号数据。
 
-本机已完成上述实际分层回归，以及脚本语法、YAML 和失败预检。工作流尚未推送或运行；官方资产的 CI 解包和托管 runner 测试仍须首次实际运行确认，不能据此宣称 CI 已通过。
+首次托管 [CI 41298161774](https://github.com/yyjsjsjx-png/dsh-claude-bridge/actions/runs/41298161774) 已在提交 `5c2e0b5` 通过：Node 219 通过／31 跳过，Windows 原生 45 通过／0 跳过，均无失败；官方资产下载、解包及 Electron／ASAR 预检通过。后续改动以对应提交的 CI 结果为准，不将旧结果当作新提交已通过。
 
 ## 仍须单独验收的边界
 

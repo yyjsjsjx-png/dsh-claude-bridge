@@ -26,6 +26,8 @@ jobs:
         with:
           node-version: '24.22.2'
           package-manager-cache: false
+      - name: Check the committed client bundle
+        run: node scripts/build-client.mjs --check
       - name: Run existing npm test suite
         run: node scripts/run-regression.mjs --layer node --output regression-results/node
       - name: Upload Node report and explicit skip counts

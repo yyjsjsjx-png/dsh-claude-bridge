@@ -37,6 +37,7 @@
     "scripts/resolve-dsh-executable.ps1",
     "scripts/launch-isolated.mjs",
     "scripts/build-plugin.mjs",
+    "scripts/build-client.mjs",
     "scripts/connect-ssh.ps1",
     "scripts/connect-ssh.sh",
     "scripts/collect-performance.mjs",
@@ -73,6 +74,8 @@
     "dsh": "*"
   },
   "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "check:client": "node scripts/build-client.mjs --check",
     "test": "node --test test/*.test.mjs"
   },
   "icon": "./plugin/metadata/bundle/icon.svg"
