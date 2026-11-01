@@ -11,7 +11,7 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/controller-native.test.mjs', 'test/history-native.test.mjs',
   'test/preset-native.test.mjs', 'test/sdk-projection.test.mjs',
   'test/shell-native.test.mjs', 'test/workflow-depth-guard.test.mjs',
-  'test/session-status.test.mjs', 'test/compact-command.test.mjs',
+  'test/session-status.test.mjs', 'test/run-progress.test.mjs', 'test/compact-command.test.mjs',
   'test/recovery-command.test.mjs', 'test/update-plugin.test.mjs',
 ]);
 const project = dirname(dirname(fileURLToPath(import.meta.url)));

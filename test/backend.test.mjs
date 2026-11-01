@@ -339,6 +339,39 @@ test('成功结果消费 SDK context，累计 usage 不冒充当前占用，换�
   assert.equal(captured.context.totalTokens, 123)
 })
 
+test('运行中采样与自动压缩更新展示，最终summary覆盖且晚到通知不污染', async t => {
+  let runId
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    runId = params.runId
+    const notify = message => handlers.onNotification('sdk.message', { runId, message })
+    await notify({ type: 'bridge_context', observedAt: 1,
+      context: { source: 'sdk-summary-approximate', totalTokens: 365000, maxTokens: 400000 } })
+    assert.equal(f.agent._bridgeStatus.phase, 'running')
+    assert.equal(f.agent._bridgeStatus.context.totalTokens, 365000)
+    await notify({ type: 'system', subtype: 'status', status: 'compacting' })
+    assert.equal(f.agent._bridgeStatus.phase, 'compacting')
+    await notify({ type: 'system', subtype: 'compact_boundary', compact_metadata: {
+      trigger: 'auto', pre_tokens: 368207, post_tokens: 3380, duration_ms: 61876 } })
+    assert.equal(f.agent._bridgeStatus.phase, 'running')
+    await notify({ type: 'bridge_context', observedAt: 2, context: { status: 'unknown' }, code: 'CONTEXT_SUMMARY_TIMEOUT' })
+    assert.equal(f.agent._bridgeStatus.context.totalTokens, 365000)
+    await notify({ type: 'bridge_context', observedAt: 3,
+      context: { source: 'sdk-summary-approximate', totalTokens: 21000, maxTokens: 400000 } })
+    assert.equal(f.agent._bridgeStatus.context.totalTokens, 21000)
+    return { status: 'completed', metrics: { context: { source: 'sdk-summary-approximate', totalTokens: 21973, maxTokens: 400000 } } }
+  }, async drainNotifications() {} }, async close() {} }))
+  await f.backend.runStep(f.agent, f.decision)
+  assert.equal(f.agent._bridgeStatus.phase, 'completed')
+  assert.equal(f.agent._bridgeStatus.context.totalTokens, 21973)
+  const progress = f.records.filter(record => record.type === 'plugin:claude-bridge/progress')
+  assert.equal(progress.at(-1).data.compaction.durationMs, 61876)
+  assert.equal(progress.at(-1).data.contextUpdate.status, 'updated')
+  await f.backend.notification('sdk.message', { runId, message: { type: 'bridge_context', observedAt: 1000,
+    context: { source: 'sdk-summary-approximate', totalTokens: 999999, maxTokens: 1000000 } } })
+  assert.equal(f.agent._bridgeStatus.context.totalTokens, 21973)
+})
+
 test('整轮停止后冻结晚到文字，迟来的成功不能覆盖停止状态，已结束事件不污染新运行', async (t) => {
   let runId
   const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {

@@ -48,8 +48,10 @@ function compactTokens(value) {
   return value < 1000 ? String(value) : value < 1_000_000 ? `${scaled(value / 1000)}K` : `${scaled(value / 1_000_000)}M`;
 }
 
-  function SessionMeter({ useBridgeStatus, syncSession }) {
+  function SessionMeter({ useBridgeStatus, useBridgeProgress, syncSession }) {
     const state = useBridgeStatus(value => value);
+    const reported = useBridgeProgress?.(value => value);
+    const progress = reported?.model === state?.model && reported?.runId === state?.runId ? reported : null;
     const [open, setOpen] = React.useState(false);
     const [syncFailure, setSyncFailure] = React.useState(null);
     const bindingRef = React.useRef(null);
@@ -107,7 +109,7 @@ function compactTokens(value) {
     const snapshot = state.context;
     const known = snapshot?.status === 'known';
     const phases = { stopping: '正在停止…', stopped: '已停止', unknown: '状态待核实',
-      failed: '运行失败', compacting: '正在压缩…' };
+      failed: '运行失败', compacting: progress?.compaction?.trigger === 'auto' ? '正在自动压缩…' : '正在压缩…' };
     const recovery = state.recovery;
     const recoveryFailed = syncFailure === binding || recovery?.status === 'unavailable' || Boolean(recovery?.code);
     const recoveryText = recoveryFailed ? '同步待重试'
@@ -127,6 +129,8 @@ function compactTokens(value) {
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
       phases[state.phase] && React.createElement('span', { role: 'status' }, phases[state.phase]),
+      progress?.contextUpdate?.status === 'unavailable' && React.createElement('span', { role: 'status',
+        title: '上下文快照暂未更新，保留上次采样值。' }, '上下文更新失败'),
       recoveryText && React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
         'aria-label': '同步云端记录', title: recoveryFailed
           ? `上次同步失败${recovery?.code ? `（${recovery.code}）` : ''}，成功前保留提示；点击可立即重试。`
@@ -138,7 +142,7 @@ function compactTokens(value) {
         title: '工具可能已执行，停止不代表撤销。' }, '工具结果待核实'),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
         'aria-label': `上下文已用 ${reading}`, 'aria-haspopup': 'dialog', 'aria-expanded': open,
-        title: known ? 'SDK 上次有效近似快照，非实时；点击查看采样时间。' : '完成一轮对话后更新上下文快照。',
+        title: known ? 'SDK 上次有效近似快照，非实时；点击查看采样时间。' : '模型响应后尝试更新上下文快照。',
         onClick: () => setOpen(!open) },
         React.createElement('svg', { viewBox: '0 0 14 14', width: 14, height: 14, 'aria-hidden': true },
           React.createElement('circle', { cx: 7, cy: 7, r: 5.5, fill: 'none', strokeWidth: 2,
@@ -158,6 +162,9 @@ function compactTokens(value) {
           React.createElement('p', { style: { margin: '8px 0 0' } },
             `上次快照：${new Date(snapshot.observedAt).toLocaleString('zh-CN', { hour12: false })} · 非实时`),
           React.createElement('p', { style: { margin: '4px 0 0' } }, '离线可查看已保存快照；执行仍需连接服务器。'),
+          progress?.compaction?.status === 'completed' && React.createElement('p', { style: { margin: '4px 0 0' } },
+            `最近${progress.compaction.trigger === 'auto' ? '自动' : ''}压缩已完成${Number.isFinite(progress.compaction.durationMs)
+              ? `，耗时 ${(progress.compaction.durationMs / 1000).toFixed(1)} 秒` : ''}。`),
           React.createElement('div', { className: 'dsh-claude-meter-bar', role: 'meter',
             'aria-label': '上下文占用', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
             ...segments.filter(segment => segment.width > 0).map(segment => React.createElement('span', {

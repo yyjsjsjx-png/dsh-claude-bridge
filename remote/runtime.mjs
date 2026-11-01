@@ -1,7 +1,7 @@
 import { mkdir, open, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { contextCategories } from '../src/context-usage.mjs'
+import { createContextSampler, sanitizeCompactionMessage } from './context-sampler.mjs'
 import { createPlanUsageReader } from './plan-usage.mjs'
 import { acquireSessionLock } from './lock.mjs'
 import { CatalogError, createCatalogReader, validateModelSelection } from './catalog.mjs'
@@ -278,32 +278,6 @@ function failureDetail(result, assistantError, authFlowFailed = false) {
     code, message,
     ...(apiErrorStatus === undefined ? {} : { apiErrorStatus }),
     ...(startupFailureReason === undefined ? {} : { startupFailureReason }),
-  }
-}
-
-function sanitizeContextSummary(value) {
-  if (!value || typeof value !== 'object') return undefined
-  const counts = numericFields(value, ['totalTokens', 'maxTokens', 'rawMaxTokens', 'percentage'])
-  if (!counts) return undefined
-  const categories = contextCategories(value.categories)
-  return { source: 'sdk-summary-approximate', ...counts, ...(categories.length ? { categories } : {}) }
-}
-
-async function readContextSummary(query, diagnose) {
-  if (typeof query?.getContextUsage !== 'function') return undefined
-  let timer
-  try {
-    // Summary uses last usage and local estimates; it does not issue token-count API requests.
-    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(undefined), 1000); timer.unref?.() })
-    const result = await Promise.race([query.getContextUsage({ detail: 'summary' }), timeout])
-    const summary = sanitizeContextSummary(result)
-    if (!summary) diagnose('context', 'unavailable', 'CONTEXT_SUMMARY_UNAVAILABLE')
-    return summary
-  } catch {
-    diagnose('context', 'unavailable', 'CONTEXT_SUMMARY_UNAVAILABLE')
-    return undefined
-  } finally {
-    clearTimeout(timer)
   }
 }
 
@@ -702,6 +676,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       run.recoveryCwd = cwd
 
       try {
+        let contextSampler
         const trackCallback = (promise) => {
           run.callbacks.add(promise)
           promise.finally(() => run.callbacks.delete(promise)).catch(() => {})
@@ -842,6 +817,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           if (response.continue === false) appliedConclusion = true
           for (const id of batchIds) if (completedToolIds.has(id)) batchedToolIds.add(id)
           diagnose('step', response.continue === false ? 'stopped' : 'prepared')
+          contextSampler?.request()
           return {
             ...(response.continue === false ? { continue: false, stopReason: 'DSH 已结束本轮。' } : {}),
             ...(response.additionalContexts?.length ? { hookSpecificOutput: {
@@ -1006,6 +982,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         let toolsetVerified = false
         let firstModelEvent = false, firstToken = false, firstText = false
         const sdkQuery = sdk.query({ prompt: promptStream(), options: sdkOptions })
+        contextSampler = createContextSampler({ query: sdkQuery, signal: controller.signal, diagnose,
+          publish: message => { if (!compact) context.peer.notify('sdk.message', { runId, message }) } })
         try {
           const initialized = await verifyHooksApplied(sdkQuery, controller)
           if (compact && !initialized.commands?.some(command => command?.name === 'compact')) {
@@ -1052,6 +1030,12 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             compactMetadata = { status: 'compacted', preTokens: tokens }
             diagnose('compact', 'confirmed')
           }
+          if (message?.type === 'system' && message.subtype === 'status' && message.status === 'compacting') {
+            contextSampler.invalidate({ compacting: true })
+          } else if (message?.type === 'system' && (message.subtype === 'compact_boundary'
+            || message.subtype === 'status' && message.status === null)) {
+            contextSampler.invalidate()
+          }
           if (message?.type === 'stream_event' && message.event?.type === 'message_start'
             && !appliedConclusion && [...completedToolIds].some((id) => !batchedToolIds.has(id))) {
             run.problem = new WorkerError('STEP_BOUNDARY_UNCONFIRMED', 'SDK 未确认工具批次已更新本机上下文', { toolMayHaveExecuted: true })
@@ -1078,6 +1062,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             } else if (message?.type === 'result' && (message.subtype !== 'success' || message.is_error === true)) {
               const { errors: _errors, ...safeMessage } = message
               context.peer.notify('sdk.message', { runId, message: { ...safeMessage, errors: [], bridgeErrorCode: failureDetail(message, assistantError, authFlowFailed).code } })
+            } else if (message?.type === 'system' && ['status', 'compact_boundary'].includes(message.subtype)) {
+              const safeMessage = sanitizeCompactionMessage(message)
+              if (safeMessage) context.peer.notify('sdk.message', { runId, message: safeMessage })
             } else {
               context.peer.notify('sdk.message', { runId, message })
             }
@@ -1089,12 +1076,17 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             controller.abort()
             throw run.problem
           }
+          if (!compact && (message?.type === 'stream_event' && message.event?.type === 'message_stop'
+            || message?.type === 'assistant' && message.message?.stop_reason
+            || message?.type === 'system' && (message.subtype === 'compact_boundary'
+              || message.subtype === 'status' && message.status === null))) contextSampler.request()
           if (message?.type === 'result') {
             result = message
             if (!compact) for (const key of ['ttft_ms', 'ttft_stream_ms', 'time_to_request_ms', 'first_content_frame_ms', 'duration_ms', 'duration_api_ms']) {
               if (Number.isFinite(message[key]) && message[key] >= 0) timing(key, message[key], 'perf.sdk')
             }
-            if (message.subtype === 'success' && message.is_error !== true) contextSummary = await readContextSummary(sdkQuery, diagnose)
+            if (message.subtype === 'success' && message.is_error !== true) contextSummary = await contextSampler.finish()
+            else contextSampler.stop()
             releasePrompt()
           }
           }
@@ -1103,6 +1095,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           // Preserve the structured result, but never hide cancellation or a callback failure.
           if (!result || (result.subtype === 'success' && result.is_error !== true) || run.problem || controller.signal.aborted) throw error
         } finally {
+          contextSampler.stop()
           releaseInput()
           controller.signal.removeEventListener('abort', releaseInput)
           diagnose('sdk', 'iterator-exited')

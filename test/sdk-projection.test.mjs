@@ -4,9 +4,11 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import vm from 'node:vm'
+import { RESPONSE_USAGE_RECORD, RUN_USAGE_RECORD, initialResponseUsage,
+  applyResponseUsage, responseUsageView, createResponseUsageProjection } from '../src/response-usage.mjs'
+import { strictSession } from './fixtures/native-persistence.mjs'
 import { SdkProjection } from '../src/sdk-projection.mjs'
 import { HISTORY_ASSISTANT } from '../src/history-records.mjs'
-import { strictSession } from './fixtures/native-persistence.mjs'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
@@ -147,9 +149,10 @@ test('实际 rc5 helper：整轮停止保留已收到文本，冻结后续流和
   await projection.accept({ type: 'system', subtype: 'init' })
   await projection.accept({ type: 'result', usage: { input_tokens: 1, output_tokens: 2 } })
   assert.equal(frames.length, count)
-  assert.equal(records.length, 1)
-  assert.equal(records[0].data.interrupted, true)
-  assert.deepEqual(records[0].data.message.content, [{ type: 'text', text: '停止前文本' }])
+  const assistants = records.filter(record => record.type === 'assistant/message')
+  assert.equal(assistants.length, 1)
+  assert.equal(assistants[0].data.interrupted, true)
+  assert.deepEqual(assistants[0].data.message.content, [{ type: 'text', text: '停止前文本' }])
   assert.equal(reports, 1)
   assert.equal(started, 1)
 })
@@ -256,12 +259,17 @@ test('实际 rc5 helper：多个 SDK 响应分别记录步骤和真实流式用�
 
 test('实际 rc5 helper：一次流式文本和最终用量只提交一条 assistant 消息', { skip: !available }, async () => {
   const { records, projection } = await fixture()
+  await projection.accept({ type: 'stream_event', event: { type: 'message_start', message: { id: 'one-response',
+    usage: { input_tokens: 1, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 } } } })
   await projection.accept({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } })
   await projection.accept({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '你好' } } })
   await projection.accept({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
   await projection.accept({ type: 'assistant', message: { model: 'model-a', content: [{ type: 'text', text: '你好' }] } })
+  // A query aggregate is not the last response's usage. Confirm the API stream
+  // separately; a terminal result is persisted in its own numerical record.
+  await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 2 } } })
   await projection.accept({ type: 'result', subtype: 'success', usage: {
-    input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4,
+    input_tokens: 100, output_tokens: 200, cache_read_input_tokens: 300, cache_creation_input_tokens: 400,
   } })
   const messages = records.filter((record) => record.type === 'assistant/message')
   assert.equal(messages.length, 1)
@@ -459,7 +467,9 @@ test('原生持久化：同一响应多个工具片段只广告一次，累计�
     id, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
   session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
   const projection = new SdkProjection({ agent: { id, session, dispatch: { emit() {} } },
-    helpers, turn: 1, step: 1, model: 'fixture' })
+    helpers, turn: 1, step: 1, model: 'fixture', runId: 'strict-run' })
+  await projection.accept({ type: 'stream_event', event: { type: 'message_start', message: { id: 'same-api',
+    usage: { input_tokens: 2, cache_read_input_tokens: 100, cache_creation_input_tokens: 10 } } } })
   for (const callId of ['a', 'b']) {
     await projection.accept({ type: 'assistant', message: { id: 'same-api', content: [
       { type: 'text', text: `合成说明-${callId}` }, { type: 'tool_use', id: callId, name: 'mcp__dsh__local_wait', input: {} },
@@ -468,10 +478,83 @@ test('原生持久化：同一响应多个工具片段只广告一次，累计�
     session.append('tool/result', { turn: 1, step: 1,
       message: helpers.createToolResultMessage({ callId, content: [{ type: 'text', text: '合成结果' }], isError: false }) }, { surfaceOp: 'append' })
   }
+  await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 7 } } })
+  await projection.accept({ type: 'stream_event', event: { type: 'message_stop' } })
+  await projection.accept({ type: 'result', usage: { input_tokens: 2, cache_read_input_tokens: 100,
+    cache_creation_input_tokens: 10, output_tokens: 7 } })
   session.append('step/end', { turn: 1, step: 1 }); session.append('turn/end', { turn: 1 })
   await strictSession(session)
+  const { z } = await import(resolveDshModule('zod'))
+  const usageProjection = createResponseUsageProjection(z)
+  const usageState = session.snapshotEvents().reduce((state, event) => usageProjection.apply(state, event), usageProjection.init(session.header))
+  usageProjection.stateSchema.parse(usageState)
+  const projectedUsage = usageProjection.wire.viewSchema.parse(usageProjection.wire.view(usageState))
+  assert.deepEqual(projectedUsage.turns['1'], {
+    uncachedInputTokens: 2, outputTokens: 7, cacheReadTokens: 100, cacheWriteTokens: 10, coverage: 'complete',
+  })
+  assert.equal(usageProjection.init({ agentPreset: 'standard' }), null)
+  assert.equal(session.snapshotEvents().some(event => event.type === 'assistant/attempt'), false)
   assert.deepEqual(session.snapshotEvents().filter(event => event.type === 'assistant/message')
     .flatMap(event => event.data.message.content.filter(block => block.type === 'tool-call').map(block => block.id)), ['a', 'b'])
   assert.deepEqual(session.snapshotEvents().findLast(event => event.type === HISTORY_ASSISTANT)
     .data.message.content.map(block => block.text ?? block.id), ['合成说明-a', 'a', '合成说明-b', 'b'])
+})
+
+test('实际 rc5 helper：工具提交后的晚到累计 usage 独立持久化，重复分块与整轮不叠加', { skip: !available }, async () => {
+  const { records, projection } = await fixture()
+  let reports = 0, nextStep = 0
+  projection.onUsage = async () => { reports++ }
+  projection.onModelStart = async () => ++nextStep
+  const stream = event => projection.accept({ type: 'stream_event', event })
+  await stream({ type: 'message_start', message: { id: 'late-tool', usage: { input_tokens: 2,
+    cache_read_input_tokens: 100, cache_creation_input_tokens: 10 } } })
+  const assistant = { type: 'assistant', message: { id: 'late-tool', usage: { input_tokens: 2, output_tokens: 1 },
+    content: [{ type: 'tool_use', id: 'once', name: 'mcp__dsh__local_wait', input: {} }] } }
+  await projection.accept(assistant)
+  await projection.accept(assistant)
+  assert.equal(records.filter(e => e.type === 'assistant/message').length, 1)
+  assert.equal(records.some(e => e.type === RESPONSE_USAGE_RECORD), false)
+  for (const output_tokens of [7, 7, 8, 7]) await stream({ type: 'message_delta', usage: { output_tokens } })
+  await stream({ type: 'message_stop' })
+  const partial = responseUsageView(records.reduce(applyResponseUsage, initialResponseUsage()))
+  assert.deepEqual(partial.turns['1'], { uncachedInputTokens: 2, cacheReadTokens: 100, cacheWriteTokens: 10, outputTokens: 8, coverage: 'partial' })
+  assert.equal(records.filter(e => e.type === RESPONSE_USAGE_RECORD).length, 2)
+  await stream({ type: 'message_start', message: { id: 'final-answer', usage: { input_tokens: 2,
+    cache_read_input_tokens: 120, cache_creation_input_tokens: 5 } } })
+  await projection.accept({ type: 'assistant', message: { id: 'final-answer', content: [{ type: 'text', text: '合成完成' }] } })
+  await stream({ type: 'message_delta', usage: { output_tokens: 4 } })
+  await stream({ type: 'message_stop' })
+  const result = { type: 'result', usage: { input_tokens: 4, cache_read_input_tokens: 220,
+    cache_creation_input_tokens: 15, output_tokens: 12 } }
+  await projection.accept(result); await projection.accept(result)
+  assert.equal(reports, 1)
+  assert.equal(records.filter(e => e.type === RUN_USAGE_RECORD).length, 1)
+  assert.equal(records.filter(e => e.type === 'assistant/message').length, 2)
+  assert.equal(records.some(e => e.type === 'assistant/attempt'), false)
+  assert.deepEqual(responseUsageView(records.reduce(applyResponseUsage, initialResponseUsage())).turns['1'], {
+    uncachedInputTokens: 4, outputTokens: 12, cacheReadTokens: 220, cacheWriteTokens: 15, coverage: 'complete',
+  })
+})
+
+test('进度仅转发固定压缩和上下文字段，停止后不接纳迟到进度', { skip: !available }, async () => {
+  const { projection } = await fixture()
+  const progress = []
+  projection.onProgress = event => { progress.push(event) }
+  await projection.accept({ type: 'system', subtype: 'status', status: 'compacting', secret: '不转发' })
+  await projection.accept({ type: 'system', subtype: 'compact_boundary', compact_metadata: {
+    trigger: 'auto', pre_tokens: 100, post_tokens: 20, duration_ms: 8, summary: '不转发',
+  } })
+  await projection.accept({ type: 'bridge_context', context: { source: 'sdk-summary-approximate',
+    totalTokens: 20, maxTokens: 100, categories: [], arbitrary: '不转发' }, observedAt: 100 })
+  await projection.accept({ type: 'bridge_context', context: { status: 'unknown' },
+    code: 'CONTEXT_SUMMARY_TIMEOUT', observedAt: 101 })
+  assert.deepEqual(progress.slice(0, 2), [{ type: 'status', status: 'compacting' },
+    { type: 'compact-boundary', trigger: 'auto', preTokens: 100, postTokens: 20, durationMs: 8 }])
+  assert.equal(progress[2].context.totalTokens, 20)
+  assert.equal(progress[2].observedAt, 100)
+  assert.equal(progress[3].code, 'CONTEXT_SUMMARY_TIMEOUT')
+  assert.equal(JSON.stringify(progress).includes('不转发'), false)
+  projection.interrupt()
+  await projection.accept({ type: 'system', subtype: 'status', status: null })
+  assert.equal(progress.length, 4)
 })

@@ -456,8 +456,10 @@ function compactTokens(value) {
   return value < 1000 ? String(value) : value < 1_000_000 ? `${scaled(value / 1000)}K` : `${scaled(value / 1_000_000)}M`;
 }
 
-  function SessionMeter({ useBridgeStatus, syncSession }) {
+  function SessionMeter({ useBridgeStatus, useBridgeProgress, syncSession }) {
     const state = useBridgeStatus(value => value);
+    const reported = useBridgeProgress?.(value => value);
+    const progress = reported?.model === state?.model && reported?.runId === state?.runId ? reported : null;
     const [open, setOpen] = React.useState(false);
     const [syncFailure, setSyncFailure] = React.useState(null);
     const bindingRef = React.useRef(null);
@@ -515,7 +517,7 @@ function compactTokens(value) {
     const snapshot = state.context;
     const known = snapshot?.status === 'known';
     const phases = { stopping: '正在停止…', stopped: '已停止', unknown: '状态待核实',
-      failed: '运行失败', compacting: '正在压缩…' };
+      failed: '运行失败', compacting: progress?.compaction?.trigger === 'auto' ? '正在自动压缩…' : '正在压缩…' };
     const recovery = state.recovery;
     const recoveryFailed = syncFailure === binding || recovery?.status === 'unavailable' || Boolean(recovery?.code);
     const recoveryText = recoveryFailed ? '同步待重试'
@@ -535,6 +537,8 @@ function compactTokens(value) {
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
       phases[state.phase] && React.createElement('span', { role: 'status' }, phases[state.phase]),
+      progress?.contextUpdate?.status === 'unavailable' && React.createElement('span', { role: 'status',
+        title: '上下文快照暂未更新，保留上次采样值。' }, '上下文更新失败'),
       recoveryText && React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
         'aria-label': '同步云端记录', title: recoveryFailed
           ? `上次同步失败${recovery?.code ? `（${recovery.code}）` : ''}，成功前保留提示；点击可立即重试。`
@@ -546,7 +550,7 @@ function compactTokens(value) {
         title: '工具可能已执行，停止不代表撤销。' }, '工具结果待核实'),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
         'aria-label': `上下文已用 ${reading}`, 'aria-haspopup': 'dialog', 'aria-expanded': open,
-        title: known ? 'SDK 上次有效近似快照，非实时；点击查看采样时间。' : '完成一轮对话后更新上下文快照。',
+        title: known ? 'SDK 上次有效近似快照，非实时；点击查看采样时间。' : '模型响应后尝试更新上下文快照。',
         onClick: () => setOpen(!open) },
         React.createElement('svg', { viewBox: '0 0 14 14', width: 14, height: 14, 'aria-hidden': true },
           React.createElement('circle', { cx: 7, cy: 7, r: 5.5, fill: 'none', strokeWidth: 2,
@@ -566,6 +570,9 @@ function compactTokens(value) {
           React.createElement('p', { style: { margin: '8px 0 0' } },
             `上次快照：${new Date(snapshot.observedAt).toLocaleString('zh-CN', { hour12: false })} · 非实时`),
           React.createElement('p', { style: { margin: '4px 0 0' } }, '离线可查看已保存快照；执行仍需连接服务器。'),
+          progress?.compaction?.status === 'completed' && React.createElement('p', { style: { margin: '4px 0 0' } },
+            `最近${progress.compaction.trigger === 'auto' ? '自动' : ''}压缩已完成${Number.isFinite(progress.compaction.durationMs)
+              ? `，耗时 ${(progress.compaction.durationMs / 1000).toFixed(1)} 秒` : ''}。`),
           React.createElement('div', { className: 'dsh-claude-meter-bar', role: 'meter',
             'aria-label': '上下文占用', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
             ...segments.filter(segment => segment.width > 0).map(segment => React.createElement('span', {
@@ -1033,9 +1040,65 @@ const SETTINGS_CSS = `
   return { MenuItem, HeroButton, Picker, Settings };
 }
 
+function createUsageProjectionBridge({ React }) {
+  return function installUsageProjection(ctx) {
+    if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return () => {};
+    const wrappers = new Set();
+    let closed = false;
+    const mount = (slot, field, id) => {
+      let native, dispose, reconciling = false;
+      const reconcile = () => {
+        if (closed || reconciling) return;
+        // entries() is the complete candidate list, including the shadowed native entry.
+        const next = ctx.slots.entries(slot).find(entry => entry.options[field] === id
+          && entry.locale === 'chat' && !wrappers.has(entry.component));
+        if (next === native) return;
+        reconciling = true;
+        try {
+          native = next;
+          dispose?.(); dispose = undefined;
+          if (!next) return;
+          const NativeUsage = next.component;
+          function RemoteUsage(props) {
+            const remote = props.useProjection('claudeBridge') != null;
+            const usage = props.useProjection('claudeBridgeUsage');
+            if (id === 'turn-tail') {
+              const turn = usage?.turns?.[props.node?.data?.turn];
+              if (!remote || turn?.coverage !== 'complete') return React.createElement(NativeUsage, props);
+              const { uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = turn;
+              return React.createElement(NativeUsage, { ...props, node: { ...props.node, data: { ...props.node.data,
+                tokenUsage: { uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+                  totalTokens: uncachedInputTokens + outputTokens + cacheReadTokens + cacheWriteTokens } } } });
+            }
+            const alias = (key, ...args) => props.useProjection(remote && usage != null
+              && key === 'tokenUsage' ? 'claudeBridgeUsage' : key, ...args);
+            const content = React.createElement(NativeUsage, { ...props, useProjection: alias });
+            if (!remote || usage?.coverage === 'complete' || usage &&
+              usage.uncachedInputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens === 0) return content;
+            const incomplete = usage?.coverage === 'legacy' ? '旧记录用量不完整'
+              : '当前为已报告用量；旧记录或运行中的用量可能尚未完整。';
+            return React.createElement('span', { title: incomplete,
+              style: { display: 'inline-flex', alignItems: 'center', gap: 4 } }, content,
+            React.createElement('span', { style: { fontSize: 11, opacity: 0.7 } },
+              usage?.coverage === 'legacy' ? '历史不完整' : '部分用量'));
+          }
+          wrappers.add(RemoteUsage);
+          dispose = ctx.slots.register({ name: slot, ...next.options,
+            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject: next.inject }, RemoteUsage);
+        } finally { reconciling = false; }
+    };
+    const unsubscribe = ctx.slots.subscribe(slot, reconcile);
+    reconcile();
+    return () => { unsubscribe(); dispose?.(); };
+    };
+    const cleanup = [mount('conversation.composer.dock', 'id', 'usage'), mount('conversation.chat.node', 'key', 'turn-tail')];
+    return () => { closed = true; for (const dispose of cleanup) dispose(); wrappers.clear(); };
+  };
+}
+
 function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -1119,8 +1182,10 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
 };
 
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
+exports.installUsageProjection = createUsageProjectionBridge({ React });
 
 exports.apply = async function apply(ctx) {
+  ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
   ctx.inject(['uiConversation'], ctx => {
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
   });
@@ -1193,7 +1258,8 @@ exports.apply = async function apply(ctx) {
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
     name: 'conversation.composer.dock', id: 'dsh-claude-context', order: 100,
     inject: sessionId => ({ hooks: { bridgeStatus:
-      ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS },
+      ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
+      bridgeProgress: ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridgeProgress') ?? ABSENT_STATUS },
       syncSession: () => synchronize(sessionId) }),
   }, SessionMeter));
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
@@ -1225,5 +1291,5 @@ return exports;
 }
 
 return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
-  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews });
+  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge });
 } });

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
 import { createAuthReader } from '../remote/auth.mjs'
+import { setImmediate as tick } from 'node:timers/promises'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
@@ -307,10 +308,10 @@ async function fixture(t, queryImplementation, overrides = {}) {
         yield* inner
       })()
       generator.initializationResult = async () => ({ hooks_applied: state.hooksApplied ?? true, commands: state.commands ?? [] })
-      if (state.contextSummary !== undefined) {
+      if (state.contextSummary !== undefined || typeof state.contextReader === 'function') {
         generator.getContextUsage = async (options) => {
           state.contextRequest = options
-          return state.contextSummary
+          return state.contextReader ? state.contextReader(options) : state.contextSummary
         }
       }
       return generator
@@ -768,6 +769,58 @@ test('用量保留本轮与会话累计语义，上下文只请求本地估算',
   assert.equal(JSON.stringify(result.metrics).includes('不转发'), false)
 })
 
+test('运行中上下文沿原 RPC 转发，压缩前慢采样失效，最终 summary 保持权威', async t => {
+  let releaseOld, reads = 0
+  const old = new Promise(resolve => { releaseOld = resolve })
+  const f = await fixture(t, async function* (_request, state) {
+    yield { type: 'stream_event', session_id: SESSION, event: { type: 'message_stop' } }
+    yield { type: 'system', subtype: 'status', status: 'compacting', session_id: SESSION, text: '不得传输的摘要' }
+    yield { type: 'system', subtype: 'compact_boundary', session_id: SESSION, summary: '不得传输的摘要',
+      compact_metadata: { trigger: 'auto', pre_tokens: 900, post_tokens: 100, duration_ms: 20, content: '不得传输的摘要' } }
+    releaseOld({ totalTokens: 900, maxTokens: 1000 })
+    await tick()
+    assert.equal(state.notifications.filter(x => x.params.message?.type === 'bridge_context').length, 0)
+    yield { type: 'stream_event', session_id: SESSION, event: { type: 'message_stop' } }
+    await tick()
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  f.state.contextReader = () => ++reads === 1 ? old : { totalTokens: reads === 2 ? 100 : 120, maxTokens: 1000 }
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.status, 'completed')
+  assert.equal(result.metrics.context.totalTokens, 120)
+  const events = f.state.notifications.filter(x => x.method === 'sdk.message').map(x => x.params.message)
+  const samples = events.filter(x => x.type === 'bridge_context')
+  assert.equal(samples.length, 1)
+  assert.equal(samples[0].context.totalTokens, 100)
+  assert.ok(Number.isSafeInteger(samples[0].observedAt))
+  assert.equal(Object.hasOwn(samples[0], 'code'), false)
+  assert.deepEqual(events.find(x => x.subtype === 'compact_boundary').compact_metadata,
+    { trigger: 'auto', pre_tokens: 900, post_tokens: 100, duration_ms: 20 })
+  assert.equal(JSON.stringify(events).includes('不得传输'), false)
+  assert.equal(f.state.queries.length, 1)
+})
+
+test('工具批次后采样不等待控制请求，也不加入执行收尾队列', async t => {
+  let release, reads = 0
+  const pending = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, async function* ({ options }, state) {
+    const batch = options.hooks.PostToolBatch[0].hooks[0]
+    assert.deepEqual(await batch({ hook_event_name: 'PostToolBatch', tool_calls: [] }), {})
+    await tick()
+    assert.equal(reads, 1)
+    // The SDK callback completed while the optional context read is still pending.
+    release({ totalTokens: 50, maxTokens: 1000 })
+    await tick()
+    assert.equal(state.notifications.filter(x => x.params.message?.type === 'bridge_context').length, 1)
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  f.state.contextReader = () => ++reads === 1 ? pending : { totalTokens: 60, maxTokens: 1000 }
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.status, 'completed')
+  assert.equal(result.metrics.context.totalTokens, 60)
+  assert.equal(reads, 2)
+})
+
 test('登录状态只返回安全字段，未登录时禁止启动 SDK', async (t) => {
   const reader = createAuthReader({ cliPath: '/fake/claude', childEnv: {}, exec: async (_file, args) => {
     assert.deepEqual(args, ['auth', 'status', '--json'])
@@ -1099,4 +1152,100 @@ test('工具已执行但批次 hook 未确认时明确失败', async (t) => {
   const next = await f.worker.handlers.query({ ...f.params, runId: 'run-no-batch-next', resume: true }, f.context)
   assert.equal(next.code, 'STEP_BOUNDARY_UNCONFIRMED')
   assert.equal(next.toolMayHaveExecuted, true)
+})
+
+function gateCatalogInitialization(f) {
+  const requests = []
+  let changed
+  const query = f.sdk.query.bind(f.sdk)
+  f.sdk.query = request => {
+    const result = query(request)
+    if (request.options.persistSession === false) {
+      let resolve, reject
+      const initialization = new Promise((accept, fail) => { resolve = accept; reject = fail })
+      result.initializationResult = () => initialization
+      requests.push({ request, resolve, reject })
+      changed?.()
+    }
+    return result
+  }
+  return { requests, async waitFor(count) {
+    while (requests.length < count) await new Promise(resolve => { changed = resolve })
+  } }
+}
+
+test('普通目录冷读共享一次初始化，首个和后续调用者取消不影响其他等待者', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  const gate = gateCatalogInitialization(f)
+  const first = new AbortController(), second = new AbortController()
+  const reads = [f.worker.handlers.catalog({}, { signal: first.signal }),
+    f.worker.handlers.catalog({}, { signal: second.signal }), f.worker.handlers.catalog({}, f.context)]
+  await gate.waitFor(1)
+  first.abort(); second.abort()
+  assert.deepEqual((await Promise.all(reads.slice(0, 2))).map(reply => reply.code), ['CANCELLED', 'CANCELLED'])
+  assert.equal(f.state.authReads, 3)
+  assert.equal(gate.requests.length, 1)
+  assert.equal(gate.requests[0].request.options.abortController.signal.aborted, false)
+  gate.requests[0].resolve({ models: f.state.models })
+  assert.equal((await reads[2]).status, 'ok')
+  assert.equal(f.state.catalogCloses, 1)
+  assert.equal(f.state.queries.length, 0)
+})
+
+test('目录共享结果独立复制，三十秒有效期和预先取消仍生效', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  f.state.models[1].inputModalities = ['text', 'image']
+  const { createCatalogReader } = await import('../remote/catalog.mjs')
+  let time = 100
+  const reader = createCatalogReader({ ...f.config, now: () => time })
+  const [first, second] = await Promise.all([reader.read(), reader.read()])
+  first[1].inputModalities.push('changed')
+  first[1].supportedEffortLevels.push('changed')
+  assert.deepEqual(second[1].inputModalities, ['text', 'image'])
+  assert.deepEqual(second[1].supportedEffortLevels, ['low', 'high'])
+  assert.equal(f.state.catalogQueries.length, 1)
+  time = 30_099
+  assert.deepEqual((await reader.read())[1].inputModalities, ['text', 'image'])
+  assert.equal(f.state.catalogQueries.length, 1)
+  time = 30_100
+  await reader.read()
+  assert.equal(f.state.catalogQueries.length, 2)
+  const cancelled = new AbortController(); cancelled.abort()
+  await assert.rejects(reader.read({ signal: cancelled.signal }), { code: 'CANCELLED' })
+  assert.equal(f.state.catalogQueries.length, 2)
+})
+
+test('显式目录刷新独立发起，旧共享冷读晚到不覆盖刷新后的缓存', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  const gate = gateCatalogInitialization(f)
+  const { createCatalogReader } = await import('../remote/catalog.mjs')
+  const reader = createCatalogReader(f.config)
+  const old = reader.read()
+  await gate.waitFor(1)
+  const fresh = reader.read({ refresh: true })
+  await gate.waitFor(2)
+  const models = label => [{ value: label, displayName: label }]
+  gate.requests[1].resolve({ models: models('fresh') })
+  assert.equal((await fresh)[0].value, 'fresh')
+  gate.requests[0].resolve({ models: models('old') })
+  assert.equal((await old)[0].value, 'old')
+  assert.equal((await reader.read())[0].value, 'fresh')
+  assert.equal(gate.requests.length, 2)
+})
+
+test('共享目录查询失败后清除等待项，下次请求可重新读取', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  const gate = gateCatalogInitialization(f)
+  const { createCatalogReader } = await import('../remote/catalog.mjs')
+  const reader = createCatalogReader(f.config)
+  const failed = [reader.read(), reader.read()]
+  const rejected = failed.map(read => assert.rejects(read, { code: 'CATALOG_UNAVAILABLE' }))
+  await gate.waitFor(1)
+  gate.requests[0].reject(new Error('合成目录初始化失败'))
+  await Promise.all(rejected)
+  const retry = reader.read()
+  await gate.waitFor(2)
+  gate.requests[1].resolve({ models: f.state.models })
+  assert.equal((await retry)[1].value, 'model-a')
+  assert.equal(f.state.catalogCloses, 2)
 })

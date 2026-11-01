@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { assistantIdentity } from './history-sync.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { appendHistoryRecord, HISTORY_ASSISTANT } from './history-records.mjs'
+import { contextSnapshot } from './context-usage.mjs'
+import { RESPONSE_USAGE_RECORD, RUN_USAGE_RECORD, responseUsageFromSdk } from './response-usage.mjs'
 
 // DSH followers require dense revisions across the attached Agent lifecycle,
 // including a stopped query followed by a fresh projection for the next turn.
@@ -9,8 +11,10 @@ const revisions = new WeakMap()
 
 /** Project SDK text/thinking into DSH's existing live and durable renderers. */
 export class SdkProjection {
-  constructor({ agent, helpers, turn, step, model, onStarted, onUsage, onModelStart, onFirstToken, onFirstText }) {
-    Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onModelStart, onFirstToken, onFirstText })
+  constructor({ agent, helpers, turn, step, model, runId, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText }) {
+    Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText })
+    this.runId = runId ?? `turn:${turn}:step:${step}`
+    this.startStep = step
     this.active = undefined
     this.blocks = new Map()
     this.committedToolIds = new Set()
@@ -22,6 +26,8 @@ export class SdkProjection {
     this.modelResponses = 0
     this.streamUsage = undefined
     this.streamUsageFinal = false
+    this.responses = new Map()
+    this.usageReported = false
   }
 
   emit(frame) {
@@ -62,23 +68,41 @@ export class SdkProjection {
   async accept(message) {
     if (this.interrupted) {
       if (message.type === 'system' && message.subtype === 'init') await this.onStarted?.()
-      if (message.type === 'result') await this.onUsage?.(message)
+      if (message.type === 'result') await this.settleUsage(message)
       return
     }
     if (message.type === 'system' && message.subtype === 'init') await this.onStarted?.()
+    if (message.type === 'system' || message.type === 'bridge_context') await this.progress(message)
     if (message.type === 'stream_event') {
       const event = message.event
       if (event?.type === 'message_start') {
-        if (this.active) this.finish()
+        if (this.active) this.finish({ usage: this.confirmedUsage() })
+        this.recordResponseUsage(this.currentResponse)
         this.messageId = event.message?.id
         await this.modelStart(this.messageId)
         if (this.interrupted) return
         this.streamUsage = event.message?.usage
         this.streamUsageFinal = false
+        this.streamResponse = this.currentResponse
+        if (this.streamResponse && !this.streamResponse.final) this.streamResponse.usage = this.streamUsage
       }
       if (event?.type === 'message_delta' && event.usage) {
-        this.streamUsage = { ...this.streamUsage, ...event.usage }
+        const response = this.streamResponse ?? this.currentResponse
+        const previous = response?.usage ?? this.streamUsage
+        this.streamUsage = { ...previous, ...event.usage }
+        // API output usage is cumulative, not a token delta. Replayed/older
+        // samples cannot decrease the snapshot or be added a second time.
+        if (Number.isFinite(previous?.output_tokens) && Number.isFinite(this.streamUsage.output_tokens)) {
+          this.streamUsage.output_tokens = Math.max(previous.output_tokens, this.streamUsage.output_tokens)
+        }
         this.streamUsageFinal = Number.isFinite(event.usage.output_tokens)
+        if (response) {
+          response.usage = this.streamUsage
+          response.final ||= this.streamUsageFinal
+          // Tools are advertised before SDK callbacks run. Their final usage
+          // can arrive afterward, so settle numerical metadata independently.
+          if (this.committedContent.has(response.id)) this.recordResponseUsage(response)
+        }
       }
       if (event?.type === 'content_block_start' && ['text', 'thinking', 'tool_use'].includes(event.content_block?.type)) {
         const type = event.content_block.type === 'thinking' ? 'reasoning'
@@ -108,18 +132,21 @@ export class SdkProjection {
           this.push({ type: 'block-end', index: block.index, block: this.finalBlock(block) })
           block.ended = true
         }
-      } else if (event?.type === 'message_stop' && this.active && this.streamUsageFinal
-        && ![...this.blocks.values()].some(block => block.type === 'tool-call')) {
+      } else if (event?.type === 'message_stop') {
+        if (this.active && this.streamUsageFinal
+          && ![...this.blocks.values()].some(block => block.type === 'tool-call')) {
         // The complete response is durable before query-level bookkeeping or a
         // later synthetic message can arrive. Result usage is still recorded.
-        this.finish({ usage: dshUsage({ usage: this.streamUsage }) })
+          this.finish({ usage: this.confirmedUsage() })
+        }
+        this.recordResponseUsage(this.streamResponse ?? this.currentResponse)
       }
     }
     if (message.type === 'assistant') {
       if (isNoResponsePlaceholder(message.message)) return
       const content = message.message?.content
       if (!Array.isArray(content)) return
-      this.messageId = message.message?.id
+      this.messageId = message.message?.id ?? this.messageId
       await this.modelStart(this.messageId)
       if (this.interrupted) return
       if (typeof message.message.model === 'string') this.model = message.message.model
@@ -216,27 +243,88 @@ export class SdkProjection {
         remaining.splice(Math.max(0, first), 0, ...new Set(preferred))
         this.finalOrder = remaining
       }
-      // The SDK's per-message output usage is a placeholder. The authoritative
-      // current-turn main-agent usage arrives on the terminal result message.
+      // Full block messages can carry placeholder usage. API stream usage and
+      // query-level result accounting have distinct settlements below.
       // Tool calls must be committed before the local DSH tool pipeline runs.
       if (content.some(item => item.type === 'tool_use')) this.finish({
-        usage: this.streamUsageFinal ? dshUsage({ usage: this.streamUsage }) : undefined,
+        usage: this.confirmedUsage(),
       })
     }
     if (message.type === 'result') {
-      this.finish({ usage: !this.active ? undefined : this.streamUsageFinal
-        ? dshUsage({ usage: this.streamUsage }) : this.modelResponses <= 1 ? dshUsage(message) : undefined })
-      await this.onUsage?.(message)
+      this.finish({ usage: this.confirmedUsage() })
+      for (const response of this.responses.values()) this.recordResponseUsage(response)
+      await this.settleUsage(message)
     }
   }
 
   async modelStart(id) {
     const key = id ?? 'unidentified-response'
-    if (this.startedModelIds.has(key)) return
+    if (this.startedModelIds.has(key)) {
+      this.currentResponse = this.responses.get(key)
+      return
+    }
+    this.recordResponseUsage(this.currentResponse)
     this.startedModelIds.add(key)
     this.modelResponses++
     const step = await this.onModelStart?.(id)
     if (step !== undefined) this.step = step
+    this.currentResponse = { id, turn: this.turn, step: this.step }
+    this.responses.set(key, this.currentResponse)
+  }
+
+  confirmedUsage() {
+    const response = this.currentResponse
+    const usage = response?.final && responseUsageFromSdk(response.usage)
+    if (!usage) return undefined
+    return { inputTokens: usage.uncachedInputTokens, outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens }
+  }
+
+  recordResponseUsage(response) {
+    if (!response?.final || typeof response.id !== 'string' || !response.id || response.id.length > 256) return
+    const usage = responseUsageFromSdk(response.usage)
+    if (!usage) return
+    const signature = JSON.stringify(usage)
+    if (signature === response.recorded) return
+    this.helpers.appendPluginRecord(this.agent.session, RESPONSE_USAGE_RECORD, { version: 1,
+      runId: this.runId, responseId: response.id, turn: response.turn, step: response.step,
+      source: 'sdk-stream', usage })
+    response.recorded = signature
+  }
+
+  async settleUsage(message) {
+    const usage = responseUsageFromSdk(message.usage)
+    const signature = usage && JSON.stringify(usage)
+    if (signature && signature !== this.runUsageRecorded) {
+      this.helpers.appendPluginRecord(this.agent.session, RUN_USAGE_RECORD, { version: 1,
+        runId: this.runId, turn: this.turn, startStep: this.startStep, endStep: this.step,
+        source: 'sdk-result-main-agent', usage })
+      this.runUsageRecorded = signature
+    }
+    if (!this.usageReported) { this.usageReported = true; await this.onUsage?.(message) }
+  }
+
+  async progress(message) {
+    if (typeof this.onProgress !== 'function') return
+    const count = n => Number.isSafeInteger(n) && n >= 0
+    if (message.type === 'system' && message.subtype === 'status'
+      && (message.status === 'compacting' || message.status === null)) {
+      await this.onProgress({ type: 'status', status: message.status })
+    } else if (message.type === 'system' && message.subtype === 'compact_boundary') {
+      const metadata = message.compact_metadata
+      const event = { type: 'compact-boundary', trigger: ['auto', 'manual'].includes(metadata?.trigger) ? metadata.trigger : 'unknown' }
+      for (const [key, input] of [['preTokens', 'pre_tokens'], ['postTokens', 'post_tokens'], ['durationMs', 'duration_ms']]) {
+        if (count(metadata?.[input])) event[key] = metadata[input]
+      }
+      await this.onProgress(event)
+    } else if (message.type === 'bridge_context') {
+      const observedAt = count(message.observedAt) ? message.observedAt : Date.now()
+      const snapshot = contextSnapshot(message.context, observedAt)
+      const event = { type: 'context', context: snapshot.status === 'known'
+        ? { ...snapshot, source: 'sdk-summary-approximate' } : { status: 'unknown' }, observedAt }
+      if (['CONTEXT_SUMMARY_TIMEOUT', 'CONTEXT_SUMMARY_UNAVAILABLE'].includes(message.code)) event.code = message.code
+      await this.onProgress(event)
+    }
   }
 
   interrupt() {
@@ -297,6 +385,7 @@ export class SdkProjection {
       }, { surfaceOp: 'append' })
     }
     if (previousContent) appendHistoryRecord(this.agent.session, HISTORY_ASSISTANT, data, this.helpers)
+    this.recordResponseUsage(this.currentResponse)
     if (!active.silent) this.emit({ type: 'end', attemptId: active.id, index: active.index,
       outcome: { kind: 'committed', eventType: 'assistant/message', seq: committed.seq } })
     this.active = undefined

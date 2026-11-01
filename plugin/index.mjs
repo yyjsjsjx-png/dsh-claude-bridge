@@ -42,6 +42,8 @@ import { resolveDshModule, assertDshCompatibility } from './compat/resolve-dsh-m
 import { createWorkflowDepthGuard } from './workflow-depth-guard.mjs';
 import { createClaudeCatalogAdapter } from './catalog-adapter.mjs';
 import { createSessionStatusProjection } from '../src/session-status.mjs';
+import { createRunProgressProjection } from '../src/run-progress.mjs';
+import { createResponseUsageProjection } from '../src/response-usage.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
@@ -106,6 +108,8 @@ let ClaudeBridgeService = (() => {
             };
             this.backend = new BridgeBackend(ctx, config, { helpers, hostCompatibility });
             ctx.sessionProjections.register(createSessionStatusProjection(z));
+            ctx.sessionProjections.register(createRunProgressProjection(z));
+            ctx.sessionProjections.register(createResponseUsageProjection(z));
             const backend = this.backend;
             const adapter = new ClaudeCatalogAdapter(backend, ctx);
             this.catalogAdapter = adapter;

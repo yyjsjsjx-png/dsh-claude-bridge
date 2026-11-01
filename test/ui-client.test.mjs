@@ -399,11 +399,16 @@ test('上下文底栏只显示百分比，浮层展示同源用量与精简分�
     { name: 'unavailable_tool', status: 'disabled', reason: '当前会话不可用' },
   ] } };
   const face = { getSnapshot: () => state, subscribe: () => () => {} };
+  let progress = null;
+  const progressFace = { getSnapshot: () => progress, subscribe: () => () => {} };
   const ctx = {
     workspaces: {}, uiWorkspace: {},
     sessions: { binding(id) {
       assert.equal(id, 'selected-session');
-      return { session: { projections: { faceOf(key) { assert.equal(key, 'claudeBridge'); return face; } } } };
+      return { session: { projections: { faceOf(key) {
+        assert.ok(['claudeBridge', 'claudeBridgeProgress'].includes(key));
+        return key === 'claudeBridge' ? face : progressFace;
+      } } } };
     } },
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured: false } }),
@@ -420,7 +425,8 @@ test('上下文底栏只显示百分比，浮层展示同源用量与精简分�
     : Array.isArray(node) ? node.map(textOf).join(' ') : node.type === 'style' ? '' : textOf(node.children);
   const nodesOf = node => node == null || typeof node !== 'object' ? []
     : Array.isArray(node) ? node.flatMap(nodesOf) : [node, ...nodesOf(node.children)];
-  const render = () => { cursor = 0; return meter.component({ useBridgeStatus: select => select(state) }); };
+  const render = () => { cursor = 0; return meter.component({ useBridgeStatus: select => select(state),
+    useBridgeProgress: select => select(progress) }); };
   assert.equal(textOf(render()).trim(), '≈12%');
   state = { ...state, recovery: { status: 'syncing' } };
   assert.equal(textOf(render()).trim(), '≈12%');
@@ -455,6 +461,19 @@ test('上下文底栏只显示百分比，浮层展示同源用量与精简分�
   state = { ...state, phase: 'completed', context: { ...state.context,
     status: 'known', totalTokens: 2149, maxTokens: 1_000_000, percentage: 0.2149, observedAt: 1000, categories: [] } };
   assert.match(textOf(render()), /≈0.2% ~2.1K \/ 1M/);
+  state = { ...state, phase: 'compacting', runId: 'current-run' };
+  progress = { model: state.model, runId: 'current-run', compaction: { trigger: 'auto', status: 'running' } };
+  assert.match(textOf(render()), /正在自动压缩/u);
+  state = { ...state, phase: 'running' };
+  progress = { ...progress, compaction: { trigger: 'auto', status: 'completed', durationMs: 61876 },
+    contextUpdate: { status: 'unavailable', code: 'CONTEXT_SUMMARY_TIMEOUT' } };
+  assert.match(textOf(render()), /上下文更新失败/u);
+  assert.match(textOf(render()), /最近自动压缩已完成，耗时 61.9 秒/u);
+  assert.doesNotMatch(textOf(render()), /正在自动压缩/u);
+  progress = { ...progress, contextUpdate: { status: 'updated' } };
+  assert.doesNotMatch(textOf(render()), /上下文更新失败/u);
+  progress = { ...progress, runId: 'previous-run', contextUpdate: { status: 'unavailable' } };
+  assert.doesNotMatch(textOf(render()), /上下文更新失败/u);
   state = null;
   assert.equal(render(), null);
 });

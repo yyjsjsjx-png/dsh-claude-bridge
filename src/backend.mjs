@@ -26,6 +26,7 @@ import { requiredShellName, assertRemoteShell,
 import { prepareRequestAssembly, prepareRequestMessages } from './request-preparation.mjs'
 import { evaluateBridgeCompatibility, bridgeCompatibilityAllowed } from './bridge-compatibility.mjs'
 import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } from './catalog-display.mjs'
+import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const uncheckedBridgeCompatibility = () => ({ status: 'unchecked', clientVersion,
@@ -949,8 +950,14 @@ export class BridgeBackend {
       compatibility: converted.compatibility,
       historyGeneration: this.historyGeneration,
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
-    run.projection = new SdkProjection({ agent, helpers: this.helpers, turn, step, model: selected.model,
+    run.progress = createRunProgressReporter({ runId, model: selected.model,
+      isActive: () => this.runs.get(runId) === run && !signal.aborted,
+      readStatus: () => agent._bridgeStatus,
+      writeStatus: patch => this.sessionStatus(agent, patch),
+      writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
+    run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
       onStarted: () => this.state.markStarted(agent.id),
+      onProgress: event => run.progress.accept(event),
       onFirstToken: type => timing('first_token', type),
       onFirstText: () => timing('first_text'),
       onModelStart: async () => {
@@ -976,6 +983,7 @@ export class BridgeBackend {
     this.runs.set(runId, run)
     this.sessionStatus(agent, { model: selected.model, runId, phase: 'running', connection: 'connected', toolMayHaveExecuted: false,
       compatibility: { model: selected.model, version: 1, tools: converted.compatibility } })
+    run.progress.start()
     const onStop = () => {
       this.requestRunStop(run)
       this.diagnostics.event('run.stop_requested', { runId, sessionId: agent.id })
@@ -1010,6 +1018,7 @@ export class BridgeBackend {
       signal.throwIfAborted()
       if (run.preparationError) throw run.preparationError
       if (result.status !== 'completed') throw failure(result.code ?? 'SDK_QUERY_FAILED', result.message ?? '远程会话运行未完成。')
+      run.progress.close(result.metrics?.context)
       await this.state.markStarted(agent.id)
       signal.throwIfAborted()
       if (injectNotice) await this.state.markRecoveryNotice(agent.id, notice.key)
@@ -1022,6 +1031,7 @@ export class BridgeBackend {
       return { kind: 'completed' }
     } catch (error) {
       if (run.preparationError && !signal.aborted) error = run.preparationError
+      run.progress.close()
       if (['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_FLOW_FAILED'].includes(error.code)) {
         this.authentication = error.code === 'AUTH_FLOW_FAILED' ? 'verification-failed' : 'login-required'
       }

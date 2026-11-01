@@ -10,9 +10,10 @@ import { createPickerController } from '../plugin/ui/client/picker-controller.mj
 import { createMeterViews } from '../plugin/ui/client/meter-views.mjs';
 import { createFormViews } from '../plugin/ui/client/form-views.mjs';
 import { createClient } from '../plugin/ui/client/entry.mjs';
+import { createUsageProjectionBridge } from '../plugin/ui/client/usage-projection.mjs';
 
 const factories = [createStore, textError, createSettingsController, createModelController,
-  createQuotaController, createPickerController, createMeterViews, createFormViews, createClient];
+  createQuotaController, createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClient];
 const target = new URL('../plugin/ui/client.js', import.meta.url);
 const normalize = source => source.replace(/\r\n/g, '\n');
 

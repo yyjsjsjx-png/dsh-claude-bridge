@@ -61,10 +61,37 @@ function sanitizeModels(input) {
 /** Read model capabilities from the CLI initialize handshake without sending a prompt. */
 export function createCatalogReader({ sdk, sessionRoot, cliPath, childEnv, now = () => Date.now(), cacheMs = 30_000 }) {
   let cached
+  let pending
+  let generation = 0
+  const cancelled = () => new CatalogError('CANCELLED', '模型目录查询已取消')
 
   async function read({ signal, refresh = false } = {}) {
-    if (signal?.aborted) throw new CatalogError('CANCELLED', '模型目录查询已取消')
-    if (!refresh && cached && now() - cached.time < cacheMs) return cached.models.map((model) => ({ ...model, ...(model.supportedEffortLevels ? { supportedEffortLevels: [...model.supportedEffortLevels] } : {}) }))
+    if (signal?.aborted) throw cancelled()
+    if (!refresh && cached && now() - cached.time < cacheMs) return structuredClone(cached.models)
+    // Explicit refresh keeps its own query and cancellation. Ordinary cold reads
+    // share only the bounded handshake, never one caller's abort signal.
+    if (refresh) return structuredClone(await queryModels({ signal }))
+    if (!pending) {
+      const current = queryModels()
+      pending = current
+      current.finally(() => { if (pending === current) pending = undefined }).catch(() => {})
+    }
+    if (!signal) return structuredClone(await pending)
+    let onAbort
+    try {
+      const abort = new Promise((_, reject) => {
+        onAbort = () => reject(cancelled())
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) onAbort()
+      })
+      return structuredClone(await Promise.race([pending, abort]))
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  async function queryModels({ signal } = {}) {
+    const currentGeneration = ++generation
     const cwd = join(sessionRoot, '_catalog')
     await mkdir(cwd, { recursive: true, mode: 0o700 })
     const controller = new AbortController()
@@ -104,8 +131,9 @@ export function createCatalogReader({ sdk, sessionRoot, cliPath, childEnv, now =
       timer.unref?.()
       const init = await Promise.race([query.initializationResult(), aborted])
       const models = sanitizeModels(init?.models)
-      cached = { time: now(), models }
-      return models.map((model) => ({ ...model, ...(model.supportedEffortLevels ? { supportedEffortLevels: [...model.supportedEffortLevels] } : {}) }))
+      // A slower older cold read must not overwrite an explicit refresh.
+      if (currentGeneration === generation) cached = { time: now(), models }
+      return models
     } catch (error) {
       if (error instanceof CatalogError) throw error
       const detail = sdkErrorDetail(error)

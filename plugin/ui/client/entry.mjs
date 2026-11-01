@@ -1,7 +1,7 @@
 /** DSH wiring: mount RPC first, then create one controller set per child scope. */
 export function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -85,8 +85,10 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
 };
 
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
+exports.installUsageProjection = createUsageProjectionBridge({ React });
 
 exports.apply = async function apply(ctx) {
+  ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
   ctx.inject(['uiConversation'], ctx => {
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
   });
@@ -159,7 +161,8 @@ exports.apply = async function apply(ctx) {
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
     name: 'conversation.composer.dock', id: 'dsh-claude-context', order: 100,
     inject: sessionId => ({ hooks: { bridgeStatus:
-      ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS },
+      ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
+      bridgeProgress: ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridgeProgress') ?? ABSENT_STATUS },
       syncSession: () => synchronize(sessionId) }),
   }, SessionMeter));
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
