@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { createRpcPeer } from '../src/rpc.mjs'
 import { createWorkerHandlers, parseServiceBudget } from './runtime.mjs'
+import { createWorkerObservability } from './observability-worker.mjs'
 
 const execFileAsync = promisify(execFile)
 const expectedSdkVersion = '0.3.314'
@@ -64,15 +65,23 @@ async function main() {
   if (!stdout.trim().startsWith(`${expectedCliVersion} `)) throw new StartupError('CLI_VERSION_MISMATCH')
 
   stage = 'rpc'
-  const worker = createWorkerHandlers({
+  let worker, peer
+  const observability = createWorkerObservability(process, {
+    fetchQuota: context => worker?.readObservabilityQuota(context) ?? { status: 'unavailable', code: 'SDK_QUOTA_UNAVAILABLE' },
+    onWarning: warning => { try { peer?.notify('observability.warning', warning) } catch {} },
+  })
+  worker = createWorkerHandlers({
     sdk, zod, sessionRoot, configDir, cliPath, homeDir, userName,
     sdkVersion: sdkMetadata.version, cliVersion: expectedCliVersion,
     authorizedDeviceId: process.env.BRIDGE_DEVICE_ID,
     maxBudgetUsd,
+    observability,
   })
-  const peer = createRpcPeer({ input: process.stdin, output: process.stdout, handlers: worker.handlers, onClose: worker.close })
+  peer = createRpcPeer({ input: process.stdin, output: process.stdout, handlers: worker.handlers, onClose: worker.close })
   await peer.closed
   await worker.close()
+  observability?.close()
+  if (process.connected) process.disconnect()
 }
 
 // Diagnostics never include prompts, credentials, authorization URLs, or environment dumps.

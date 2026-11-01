@@ -10,7 +10,7 @@ export function createObservabilityIpc(channel, { handlers = {}, timeoutMs = 20_
   const send = value => {
     if (closed || typeof channel?.send !== 'function' || channel.connected === false) return false
     try {
-      if (Buffer.byteLength(JSON.stringify(value)) > 131072) return false
+      if (Buffer.byteLength(JSON.stringify(value)) > 2 * 1024 * 1024) return false
       channel.send(value, () => {})
       return true
     } catch { return false }
