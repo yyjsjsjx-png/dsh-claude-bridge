@@ -87,7 +87,7 @@ export class SdkProjection {
         this.recordResponseUsage(this.currentResponse)
         this.messageId = event.message?.id
         await this.modelStart(this.messageId, message.parent_tool_use_id == null
-          ? { at: receivedAt, streamStarted: true, sdkTtftMs: message.ttft_ms } : {})
+          ? { at: receivedAt, streamStarted: true } : {})
         if (this.interrupted) return
         this.streamUsage = event.message?.usage
         this.streamUsageFinal = false

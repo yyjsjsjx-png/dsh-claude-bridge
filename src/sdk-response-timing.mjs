@@ -1,7 +1,15 @@
+import { firstOutputKind } from './sdk-output-kind.mjs'
+
 /** Observe SDK content frames before canonicalization or durable message assembly. */
 export function observeResponseTiming(tracker, message, response, at) {
   if (message.parent_tool_use_id != null || !response?.id || message.type !== 'stream_event') return
   const event = message.event
+  const first = message.bridge_first_output
+  const kind = firstOutputKind(event)
+  if (kind && first?.version === 1 && first.responseId === response.id && first.source === 'sdk-first-output-estimate'
+    && Number.isFinite(first.ms) && first.ms >= 0 && first.kind === kind) {
+    tracker.sourceTtft({ responseId: response.id, ms: first.ms })
+  }
   const token = (kind, suffix = '') => tracker.token({ responseId: response.id, kind, at,
     ...(typeof message.uuid === 'string' ? { eventId: `${message.uuid}${suffix}` } : {}) })
   if (event?.type === 'content_block_start') {

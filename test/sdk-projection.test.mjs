@@ -592,8 +592,9 @@ test('实际rc5：工具规范化与晚到usage不丢逐响应计时，未结束
   let clock = 0, step = 0, frame = 0
   const projection = new SdkProjection({ agent: f.agent, helpers: f.helpers, turn: 1, step: 1,
     runId: 'timing-tool-round', model: 'haiku', timingNow: () => clock, onModelStart: () => ++step })
-  const stream = (event, ttft_ms) => projection.accept({ type: 'stream_event', uuid: `frame-${++frame}`,
-    parent_tool_use_id: null, event, ...(ttft_ms !== undefined ? { ttft_ms } : {}) })
+  const stream = (event, ttft_ms, bridge_first_output) => projection.accept({ type: 'stream_event', uuid: `frame-${++frame}`,
+    parent_tool_use_id: null, event, ...(ttft_ms !== undefined ? { ttft_ms } : {}),
+    ...(bridge_first_output ? { bridge_first_output } : {}) })
   const { z } = await import(resolveDshModule('zod'))
   const definition = createResponseTimingProjection(z)
   const view = () => {
@@ -602,14 +603,16 @@ test('实际rc5：工具规范化与晚到usage不丢逐响应计时，未结束
     return definition.wire.viewSchema.parse(definition.wire.view(state))
   }
   await stream({ type: 'message_start', message: { id: 'timed-tool', usage: { input_tokens: 2 } } }, 400)
-  assert.equal(view().ttftSteps, 1)
-  assert.equal(view().ttftMs, 400)
+  assert.equal(view().ttftSteps, 0) // An SDK header is not the first output token.
   clock = 1000
   await stream({ type: 'content_block_start', index: 0,
     content_block: { type: 'tool_use', id: 'timed-call', name: 'mcp__dsh__local_command', input: {} } })
   clock = 2000
   await stream({ type: 'content_block_delta', index: 0,
-    delta: { type: 'input_json_delta', partial_json: String.raw`{"command":"\u4e2d"}` } })
+    delta: { type: 'input_json_delta', partial_json: String.raw`{"command":"\u4e2d"}` } }, undefined,
+  { version: 1, responseId: 'timed-tool', ms: 450, kind: 'tool-input', source: 'sdk-first-output-estimate' })
+  assert.equal(view().ttftSteps, 1)
+  assert.equal(view().ttftMs, 450)
   await stream({ type: 'content_block_stop', index: 0 })
   await projection.accept({ type: 'assistant', message: { id: 'timed-tool', content: [
     { type: 'tool_use', id: 'timed-call', name: 'mcp__dsh__local_command', input: { command: '中' } },
@@ -626,14 +629,15 @@ test('实际rc5：工具规范化与晚到usage不丢逐响应计时，未结束
   await stream({ type: 'message_start', message: { id: 'timed-final', usage: { input_tokens: 2 } } }, 600)
   await stream({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
   clock = 13000
-  await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '第一段' } })
+  await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '第一段' } }, undefined,
+    { version: 1, responseId: 'timed-final', ms: 650, kind: 'text', source: 'sdk-first-output-estimate' })
   clock = 15000
   await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '第二段' } })
   await stream({ type: 'content_block_stop', index: 0 })
   clock = 16000
   await stream({ type: 'message_delta', usage: { output_tokens: 300 } })
   await stream({ type: 'message_stop' })
-  assert.equal(view().ttftMs / view().ttftSteps, 500)
+  assert.equal(view().ttftMs / view().ttftSteps, 550)
   assert.equal(view().tpsSamples, 2)
   assert.equal(view().decodeTokens, 500)
   assert.equal(view().decodeMs, 5000)
@@ -653,14 +657,15 @@ test('实际rc5：权威工具消息补齐残缺或改变的原始参数时，�
     let clock = 0, frame = 0
     const projection = new SdkProjection({ agent: f.agent, helpers: f.helpers, turn: 1, step: 1,
       runId: 'incomplete-tool-input', model: 'haiku', timingNow: () => clock })
-    const stream = (event, ttft_ms) => projection.accept({ type: 'stream_event', uuid: `raw-${++frame}`,
-      event, ...(ttft_ms === undefined ? {} : { ttft_ms }) })
+    const stream = (event, ttft_ms, bridge_first_output) => projection.accept({ type: 'stream_event', uuid: `raw-${++frame}`,
+      event, ...(ttft_ms === undefined ? {} : { ttft_ms }), ...(bridge_first_output ? { bridge_first_output } : {}) })
     await stream({ type: 'message_start', message: { id: 'incomplete-tool', usage: { input_tokens: 2 } } }, 400)
     clock = 1000
     await stream({ type: 'content_block_start', index: 0,
       content_block: { type: 'tool_use', id: 'input-call', name: 'mcp__dsh__local_command', input: {} } })
     clock = 2000
-    await stream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json } })
+    await stream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json } }, undefined,
+      { version: 1, responseId: 'incomplete-tool', ms: 450, kind: 'tool-input', source: 'sdk-first-output-estimate' })
     await stream({ type: 'content_block_stop', index: 0 })
     await projection.accept({ type: 'assistant', message: { id: 'incomplete-tool', content: [
       { type: 'tool_use', id: 'input-call', name: 'mcp__dsh__local_command', input: { command: 'complete' } },

@@ -12,14 +12,15 @@ const failureReasons = ['incomplete-stream', 'unsupported-block', 'assistant-sup
 const rateReasons = [...failureReasons, 'awaiting-message-stop', 'awaiting-final-usage',
   'final-usage-unavailable', 'no-raw-token-delta', 'nonpositive-duration', 'zero-output-tokens']
 
-/** Numerical evidence only. SDK TTFT and local receive spans never share a clock. */
+/** Numerical evidence only. Remote first-output estimates and local receive
+ * spans are independent; neither is a measurement of upstream generation. */
 export function createResponseTimingTracker({ runId, turn, onRecord = () => {}, now = () => performance.now() }) {
   if (!identifier(runId) || !count(turn)) throw new TypeError('RESPONSE_TIMING_IDENTITY_INVALID')
   const responses = new Map()
   let closed = false
   const snapshot = r => {
-    const ttft = milliseconds(r.sdkTtftMs)
-      ? { status: 'known', ms: r.sdkTtftMs, source: 'sdk-response-start' }
+    const ttft = milliseconds(r.firstOutputMs)
+      ? { status: 'known', ms: r.firstOutputMs, source: 'sdk-first-output-estimate' }
       : { status: 'unknown', reason: 'sdk-ttft-unavailable' }
     const contentSpanMs = r.first === null ? null : r.last - r.first
     const reason = r.failure ?? (!r.ended ? 'awaiting-message-stop'
@@ -46,7 +47,7 @@ export function createResponseTimingTracker({ runId, turn, onRecord = () => {}, 
     publish(r)
   }
   return {
-    responseStarted({ responseId, step, sdkTtftMs, at, streamStarted = false } = {}) {
+    responseStarted({ responseId, step, at, streamStarted = false } = {}) {
       if (closed || !identifier(responseId) || !count(step)) return false
       let r = responses.get(responseId)
       if (!r) {
@@ -54,17 +55,16 @@ export function createResponseTimingTracker({ runId, turn, onRecord = () => {}, 
         r = { id: responseId, step, first: null, last: null, deltas: 0, ended: false,
           eventIds: new Set(), startAt: milliseconds(startAt) ? startAt : null,
           failure: streamStarted !== true ? 'message-start-missing' : !milliseconds(startAt) ? 'clock-invalid' : null,
-          outputTokens: undefined, sdkTtftMs: undefined }
+          outputTokens: undefined, firstOutputMs: undefined }
         responses.set(responseId, r)
       } else if (r.step !== step) return false
-      if (milliseconds(sdkTtftMs)) r.sdkTtftMs = sdkTtftMs
       publish(r)
       return true
     },
     sourceTtft({ responseId, ms } = {}) {
       const r = responses.get(responseId)
-      if (closed || !r || !milliseconds(ms)) return false
-      r.sdkTtftMs = ms
+      if (closed || !r || r.ended || r.interrupted || r.firstOutputMs !== undefined || !milliseconds(ms)) return false
+      r.firstOutputMs = ms
       publish(r)
       return true
     },
@@ -186,7 +186,7 @@ export function createResponseTimingProjection(z) {
     state: z.enum(['open', 'closed', 'interrupted']), captureStatus: z.enum(['pending', 'complete', 'incomplete']),
     reason: z.enum(failureReasons).nullable(), rawDeltaCount: integer, streamStarted: z.boolean(), contentSpanMs: ms.nullable(),
     ttft: z.discriminatedUnion('status', [z.object({ status: z.literal('known'), ms,
-      source: z.literal('sdk-response-start') }).strict(),
+      source: z.literal('sdk-first-output-estimate') }).strict(),
     z.object({ status: z.literal('unknown'), reason: z.literal('sdk-ttft-unavailable') }).strict()]),
     tps: z.discriminatedUnion('status', [z.object({ status: z.literal('known'), durationMs: ms.positive(),
       outputTokens: integer.positive(), source: z.literal('sdk-stream-receive') }).strict(),
