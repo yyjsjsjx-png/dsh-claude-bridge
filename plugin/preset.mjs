@@ -15,6 +15,56 @@ export const REMOTE_PRESET_CONVERSIONS = Object.freeze([
 ]);
 const REMOTE_PERSONA_PREFIX = 'You are a coding agent powered by Claude through the remote Claude Agent SDK.';
 
+function remoteCommands() {
+  return [
+    { id: 'claude-sdk-compact', name: new URL('./compact-command.mjs', import.meta.url).href },
+    { id: 'claude-sdk-recovery', name: new URL('./recovery-command.mjs', import.meta.url).href },
+  ];
+}
+
+/** UI descriptions must follow the effective preset, including basic fallback. */
+export function remotePresetFeatures(report) {
+  const disabled = new Set(report.disabledComponents.map(item => item.name));
+  const unavailable = new Map();
+  if (report.mode === 'basic' || disabled.has('tool-workflow') || disabled.has('workflow-ptc')) {
+    unavailable.set('Workflow 深度限制', '当前远程预设未开启 Workflow。');
+  }
+  if (disabled.has('claude-sdk-compact')) unavailable.set('/compact', '压缩命令组件未就绪。');
+  return {
+    disabledFeatures: [...REMOTE_PRESET_LIMITATIONS.map(item => ({ ...item })), ...report.disabledComponents,
+      ...[...unavailable].map(([name, reason]) => ({ name, status: 'disabled', reason })),
+      ...(report.mode === 'basic' ? [{ name: '子代理与后台任务', status: 'disabled', reason: '基础预设仅保留前台 shell 与必要上下文。' }] : [])],
+    convertedFeatures: REMOTE_PRESET_CONVERSIONS.filter(item => !unavailable.has(item.name)).map(item => ({ ...item })),
+  };
+}
+
+/** Owned minimum composition; it does not read or copy the installed standard. */
+export function createBasicRemoteClaudePreset(platform = process.platform) {
+  const shell = platform === 'win32' ? 'pwsh' : 'bash';
+  return {
+    id: CLAUDE_PRESET,
+    name: '远程会话',
+    description: '基础远程预设：原生 shell、工作目录与完整项目指令。',
+    order: 5,
+    plugins: [
+      { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: REMOTE_PERSONA_PREFIX } },
+      { id: 'agent-instructions', name: '@deepseek-ai/dsh-agent-instructions', config: { maxBytes: 65536 } },
+      { id: `tool-${shell}`, name: `@deepseek-ai/dsh-tool-${shell}`,
+        config: { enableRunInBackground: false, promoteOnTimeout: false } },
+      ...remoteCommands(),
+    ],
+  };
+}
+
+/** Keep all loading and degradation inside this remote preset's scope. */
+export function containRemotePreset(preset, { baseUrl, mode = 'full', reasons = [], platform = process.platform } = {}) {
+  return { ...preset, plugins: [{
+    id: 'claude-remote-composition', name: new URL('./remote-composition.mjs', import.meta.url).href,
+    config: { plugins: preset.plugins, basicPlugins: createBasicRemoteClaudePreset(platform).plugins,
+      baseUrl, mode, reasons, shell: platform === 'win32' ? 'pwsh' : 'bash' },
+  }] };
+}
+
 /**
  * Build from the verified shipped DSH standard preset, retaining its order.
  * Plan mode cannot safely transition inside an SDK query; DSH transcript forks
@@ -72,8 +122,7 @@ export function createRemoteClaudePreset(standard) {
         }),
       };
     });
-  plugins.push({ id: 'claude-sdk-compact', name: new URL('./compact-command.mjs', import.meta.url).href });
-  plugins.push({ id: 'claude-sdk-recovery', name: new URL('./recovery-command.mjs', import.meta.url).href });
+  plugins.push(...remoteCommands());
 
   return {
     id: CLAUDE_PRESET,

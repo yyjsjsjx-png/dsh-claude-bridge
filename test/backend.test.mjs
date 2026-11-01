@@ -9,6 +9,7 @@ import { BridgeState } from '../src/state.mjs'
 import { assistantIdentity, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
 import { HISTORY_ASSISTANT, HISTORY_TOOL_RESULT } from '../src/history-records.mjs'
 import { createHash } from 'node:crypto'
+import { requiredShellName } from '../src/remote-capabilities.mjs'
 
 const provider = 'claude-sdk-remote'
 
@@ -456,15 +457,17 @@ test('批次准备拒绝变化配置时恢复已认领消息，防止指令丢�
   f.agent.inbox = { nextStep: [note('pending-note')], splice(_target, at, count, messages) { this.nextStep.splice(at, count, ...messages) } }
   f.agent.preStep = async () => {
     f.agent.inbox.nextStep = []
-    return { ...f.decision, assembly: { tools: [] }, messages: [note('pending-note'), note('nested-note')] }
+    return { ...f.decision, assembly: { tools: f.decision.assembly.tools.filter(tool => tool.name === requiredShellName()) },
+      messages: [note('pending-note'), note('nested-note')] }
   }
-  await f.backend.runStep(f.agent, f.decision)
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'QUERY_CONFIGURATION_CHANGED' })
 })
 
 async function fixture(t, makeTransport, execute) {
   const parent = resolve(tmpdir())
   const directory = await mkdtemp(join(parent, 'dsh-bridge-backend-'))
   t.after(async () => {
+    await backend.dispose()
     if (dirname(resolve(directory)) !== parent || !directory.startsWith(join(parent, 'dsh-bridge-backend-'))) throw new Error('测试目录无效')
     await rm(directory, { recursive: true, force: true })
   })
@@ -475,7 +478,9 @@ async function fixture(t, makeTransport, execute) {
     sessionProjections: { stateOf() { return { pending: selection } } },
     systemPrompt: { refreshContext() { return [] } },
     fs: { processPathFromHostPath(path) { return path } }, attachments: {},
-    tools: { execute }, agents: { withInitiator(_agent, operation) { return operation() } },
+    tools: { execute: execute ?? (async () => { throw new Error('该用例不应执行工具') }) },
+    approval: { async request() { throw new Error('该用例不应直接请求审批') } },
+    agents: { withInitiator(_agent, operation) { return operation() } },
     sessions: { async flush() { return true } },
   }
   const helpers = {
@@ -502,15 +507,112 @@ async function fixture(t, makeTransport, execute) {
     dispatch: { emit() {} },
   }
   const decision = {
-    assembly: { tools: [{ name: 'local_command', description: '执行本机命令', parameters: {
+    assembly: { tools: [{ name: requiredShellName(), description: '执行基础命令', parameters: {
+      type: 'object', additionalProperties: false, properties: {
+        command: { type: 'string' }, workdir: { type: 'string' }, timeoutMs: { type: 'number' },
+      }, required: ['command'],
+    } }, { name: 'local_command', description: '执行本机命令', parameters: {
       type: 'object', additionalProperties: false, properties: { command: { type: 'string' } }, required: ['command'],
     } }] },
     messages: [{ id: 'user-1', role: 'user', source: { kind: 'human' }, content: [{ type: 'text', text: '测试' }] }],
   }
   const backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers, createTransport: makeTransport })
-  t.after(() => backend.dispose())
   return { backend, agent, decision, records, phaseAbort, ctx, helpers, selection }
 }
+
+test('基础 shell 缺失、不可转换或审批执行记录接口缺失时不连接也不发送 query', async t => {
+  let connections = 0
+  const f = await fixture(t, async () => { connections++; throw new Error('不应连接') })
+  const original = f.decision.assembly.tools
+  f.decision.assembly.tools = original.filter(tool => tool.name !== requiredShellName())
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'REMOTE_SHELL_UNAVAILABLE' })
+  assert.equal(f.backend.remoteCapabilities.status, 'unavailable')
+  assert.equal(f.agent._bridgeStatus.phase, 'failed')
+  f.decision.assembly.tools = original.map(tool => tool.name === requiredShellName()
+    ? { ...tool, parameters: { $ref: '#/unsupported' } } : tool)
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), /无法转换/)
+  f.decision.assembly.tools = original
+  for (const [service, method] of [['tools', 'execute'], ['approval', 'request'], ['sessions', 'flush']]) {
+    const saved = f.ctx[service][method]; delete f.ctx[service][method]
+    await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'REMOTE_SHELL_UNAVAILABLE' })
+    f.ctx[service][method] = saved
+  }
+  assert.equal(connections, 0)
+  assert.equal(f.records.some(record => record.type === 'request/header'), false)
+})
+
+test('高级工具转换失败时提示词、请求头和实际工具集合一致，后续步骤沿用降级状态', async t => {
+  let request
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    request = params
+    assert.deepEqual(await handlers.handlers['step.prepare']({ runId: params.runId },
+      { signal: new AbortController().signal }), {})
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.decision.assembly.tools.push({ name: 'advanced', description: '高级工具', parameters: { $ref: '#/unsupported' } })
+  f.decision.assembly.sections = [{ name: 'tool:advanced', text: '过期高级工具说明。' },
+    { name: 'user:instructions', text: '用户指令保持完整。' }]
+  f.helpers.renderPrompt = assembly => assembly.sections.map(section => section.text).join('\n')
+  f.agent.inbox = { nextStep: [], splice() { throw new Error('无需恢复消息') } }
+  f.agent.preStep = async () => ({ ...f.decision, messages: [] })
+  await f.backend.runStep(f.agent, f.decision)
+  assert.equal(request.tools.some(tool => tool.name === 'advanced'), false)
+  assert.equal(request.systemPrompt.includes('过期高级工具说明。'), false)
+  assert.match(request.systemPrompt, /用户指令保持完整。[\s\S]*advanced：/)
+  const header = f.records.find(record => record.type === 'request/header').data.header
+  assert.equal(header.tools.some(tool => tool.name === 'advanced'), false)
+  assert.equal(f.backend.remoteCapabilities.status, 'ready')
+  assert.equal(f.agent._bridgeStatus.compatibility.tools.find(tool => tool.name === 'advanced').status, 'disabled')
+})
+
+test('完整工具转换达到数量上限挤掉基础 shell 时仍阻止 query', async t => {
+  let queries = 0
+  const f = await fixture(t, async () => ({ peer: { async request(method) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    queries++; return { status: 'completed' }
+  } }, async close() {} }))
+  const shell = f.decision.assembly.tools.find(tool => tool.name === requiredShellName())
+  f.decision.assembly.tools = [...Array.from({ length: 80 }, (_, i) => ({
+    name: `extra_${i}`, description: '附加工具', parameters: { type: 'object', properties: {}, additionalProperties: false },
+  })), shell]
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'REMOTE_SHELL_UNAVAILABLE' })
+  assert.equal(queries, 0)
+  assert.match(f.backend.remoteCapabilities.reason, /超过远程工具数量限制/)
+  assert.equal(f.records.some(record => record.type === 'request/header'), false)
+})
+
+test('基础 shell 注册消失时保留失败结果、停止后续推理并拒绝再次运行，不自动重试', async t => {
+  let queries = 0, executions = 0
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    assert.equal(method, 'query'); queries++
+    const run = f.backend.runs.get(params.runId)
+    run.projection.committedToolCalls.set('missing-shell', { name: requiredShellName(), arguments: '{"command":"pwd"}' })
+    // Another concurrent session can replace the Host's latest report. This
+    // failure must still project only the current run's admitted collection.
+    f.backend.compatibility = [{ name: 'foreign-session-tool', status: 'preserved', reason: '' }]
+    await assert.rejects(handlers.handlers['tool.execute']({ runId: params.runId, callId: 'missing-shell',
+      name: requiredShellName(), arguments: { command: 'pwd' } }, { signal: new AbortController().signal }),
+    { code: 'REMOTE_SHELL_UNAVAILABLE' })
+    await assert.rejects(handlers.handlers['step.prepare']({ runId: params.runId },
+      { signal: new AbortController().signal }), { code: 'REMOTE_SHELL_UNAVAILABLE' })
+    return { status: 'completed' }
+  } }, async close() {} }), async () => {
+    executions++
+    return { content: [{ type: 'text', text: '原生 shell 注册已消失。' }], isError: true,
+      error: { info: { code: 'UNKNOWN_TOOL' } } }
+  })
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'REMOTE_SHELL_UNAVAILABLE' })
+  assert.equal(f.records.filter(record => record.type === 'tool/result').length, 1)
+  assert.equal(f.backend.remoteCapabilities.status, 'unavailable')
+  assert.equal(f.agent._bridgeStatus.compatibility.tools.find(tool => tool.name === requiredShellName()).status, 'disabled')
+  assert.equal(f.agent._bridgeStatus.compatibility.tools.some(tool => tool.name === 'foreign-session-tool'), false)
+  assert.equal(f.agent._bridgeStatus.compatibility.tools.some(tool => tool.name === 'local_command'), true)
+  f.agent.phase = { kind: 'running', turn: 2, step: 1, abort: new AbortController() }
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'REMOTE_SHELL_UNAVAILABLE' })
+  assert.equal(queries, 1); assert.equal(executions, 1)
+})
 
 test('pending 模型优先，重复 callId 只执行一次并记录关联结果', async (t) => {
   let count = 0

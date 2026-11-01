@@ -282,6 +282,7 @@ exports.apply = async function apply(ctx) {
   quotaStore.set(UNKNOWN_QUOTA);
   settingsStore.set({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
+    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
@@ -354,7 +355,9 @@ exports.apply = async function apply(ctx) {
       } else {
         quotaFailures++;
         quotaRetryAt = Date.now() + [60_000, 120_000, 300_000][Math.min(quotaFailures - 1, 2)];
-        quotaStore.set({ ...(previous.status === 'available' ? previous : UNKNOWN_QUOTA),
+        // A reply with no usable plan windows supersedes the old counters.
+        // Transient transport failures may keep a still-fresh snapshot.
+        quotaStore.set({ ...(previous.status === 'available' && value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous : UNKNOWN_QUOTA),
           code: value.code, refreshing: false, paused: undefined, nextRefreshAt: quotaRetryAt });
       }
     })();
@@ -383,6 +386,8 @@ exports.apply = async function apply(ctx) {
           connected: status.connected === true, authentication: status.authentication ?? 'unknown',
           compatibility: status.compatibility ?? [], disabledFeatures: status.disabledFeatures ?? [],
           convertedFeatures: status.convertedFeatures ?? [], activeRuns: status.activeRuns ?? 0,
+          remotePreset: status.remotePreset ?? null, remoteCapabilities: status.remoteCapabilities ?? null,
+          desktopCompatibility: status.desktopCompatibility ?? null,
           usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
@@ -750,12 +755,14 @@ exports.apply = async function apply(ctx) {
     const rows = quota.status === 'available' && quota.expiresAt > currentTime
       ? quota.windows.filter(row => row.resetsAt === null || row.resetsAt > currentTime) : [];
     const fiveHour = rows.find(row => row.id === 'five_hour');
+    const weekly = rows.find(row => row.id === 'seven_day');
     const remaining = row => {
       const value = 100 - row.usedPercent;
       return value > 0 && value < 0.1 ? '<0.1%' : `${Math.round(value * 10) / 10}%`;
     };
     const staleFiveHour = quota.status === 'available' && quota.windows.some(row => row.id === 'five_hour');
-    const reading = fiveHour ? `5h 剩余 ${remaining(fiveHour)}` : staleFiveHour ? '5h 待刷新' : '5h 额度未知';
+    const reading = [fiveHour && `5h 剩余 ${remaining(fiveHour)}`, weekly && `周剩余 ${remaining(weekly)}`]
+      .filter(Boolean).join(' · ') || (staleFiveHour ? '5h 待刷新' : '5h 额度未知');
     const resetTime = row => {
       if (row.resetsAt === null) return '';
       const minutes = Math.max(1, Math.ceil((row.resetsAt - currentTime) / 60_000));
@@ -961,8 +968,24 @@ exports.apply = async function apply(ctx) {
               stat('输入 tokens', displayNumber(usage.inputTokens)), stat('输出 tokens', displayNumber(usage.outputTokens)),
               stat('缓存读取', displayNumber(usage.cacheReadTokens)), stat('缓存写入', displayNumber(usage.cacheWriteTokens)),
               stat('SDK 估算', Number.isFinite(usage.estimatedCostUsd) ? `$${usage.estimatedCostUsd.toFixed(4)}` : '—'))),
+      ['basic', 'degraded', 'unavailable'].includes(state.remotePreset?.mode) && h('div', {
+        role: state.remotePreset.mode === 'unavailable' ? 'alert' : 'status', className: 'dcb-notice',
+      }, state.remotePreset.mode === 'unavailable' ? '远程会话插件不可用。'
+        : state.remotePreset.mode === 'basic' ? '远程会话已回退到基础预设。' : '远程会话的部分可选能力已关闭。',
+      ' 请展开“兼容性与诊断”查看原因。'),
+      state.remoteCapabilities?.status === 'unavailable' && h('p', { role: 'alert', className: 'dcb-notice' },
+        `远程会话插件不可用：${state.remoteCapabilities.reason}`),
       h('details', { className: 'dcb-card dcb-details' },
         h('summary', null, '兼容性与诊断'),
+        state.desktopCompatibility && h('p', null,
+          `DSH ${state.desktopCompatibility.version}；已验证支持：${(state.desktopCompatibility.verifiedVersions ?? []).join('、')}`),
+        state.desktopCompatibility && !state.desktopCompatibility.verifiedVersions?.includes(state.desktopCompatibility.version)
+          && h('p', { role: 'status', className: 'dcb-notice' }, '此桌面版本尚未完成回归验证，建议继续使用已验证版本。'),
+        state.remotePreset && h('p', { role: state.remotePreset.mode === 'unavailable' ? 'alert' : 'status' },
+          `远程预设：${({ unchecked: '尚未检查', full: '完整', degraded: '部分能力已关闭', basic: '基础', unavailable: '插件不可用' })[state.remotePreset.mode] ?? '未知'}`),
+        ...(state.remotePreset?.reasons ?? []).map((reason, index) => h('p', { key: `preset-reason-${index}` }, reason)),
+        state.remoteCapabilities && h('p', { role: state.remoteCapabilities.status === 'unavailable' ? 'alert' : 'status' },
+          `基础 shell（${state.remoteCapabilities.shell}）：${state.remoteCapabilities.reason}`),
         state.disabledFeatures.length > 0 && React.createElement('ul', null, ...state.disabledFeatures.map((item, index) =>
           React.createElement('li', { key: `disabled-${item.name}-${index}` }, `${item.name}：已关闭（${item.reason}）`))),
         state.convertedFeatures.length > 0 && React.createElement('ul', null, ...state.convertedFeatures.map((item, index) =>

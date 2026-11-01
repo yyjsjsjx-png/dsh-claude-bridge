@@ -7,6 +7,7 @@ import { resolveDshModule } from '../../plugin/compat/resolve-dsh-module.mjs'
 import { BridgeBackend } from '../../src/backend.mjs'
 import { localHistory, knownToolResult } from '../../src/history-sync.mjs'
 import { SESSION_STATUS_RECORD } from '../../src/session-status.mjs'
+import { requiredShellName } from '../../src/remote-capabilities.mjs'
 
 const directory = process.env.BRIDGE_FIXTURE_CLIENT
 const connection = JSON.parse(await readFile(process.env.BRIDGE_FIXTURE_CONNECTION, 'utf8'))
@@ -25,7 +26,9 @@ for (let seq = 0; seq < session.seq; seq++) {
   if (Number.isSafeInteger(event.data?.turn)) turn = Math.max(turn, event.data.turn)
 }
 const selection = { provider: 'claude-sdk-remote', model: 'fixture-haiku', reasoningEffort: 'low' }
-const assembly = { tools: [{ name: 'local_command', description: '执行合成工具', parameters: { type: 'object',
+const assembly = { tools: [{ name: requiredShellName(), description: '执行基础命令', parameters: { type: 'object',
+  properties: { command: { type: 'string' }, workdir: { type: 'string' }, timeoutMs: { type: 'number' } },
+  required: ['command'], additionalProperties: false } }, { name: 'local_command', description: '执行合成工具', parameters: { type: 'object',
   properties: { command: { type: 'string' } }, required: ['command'], additionalProperties: false } }] }
 let credential, backend, controller, running
 const emit = event => process.send?.({ event })
@@ -44,6 +47,7 @@ const ctx = {
   sessionProjections: { stateOf(_session, key) { return key === 'modelSelection' ? { pending: selection } : agent._bridgeStatus } },
   systemPrompt: { refreshContext() { return [] } }, fs: { processPathFromHostPath(path) { return path } }, attachments: {},
   agents: { withInitiator(_agent, operation) { return operation() } }, sessions: { flush: checkpoint },
+  approval: { async request() { return 'rejected' } },
   tools: { async execute({ arguments: args, signal }) {
     await appendFile(join(directory, 'tool-starts.txt'), args.command + '\n')
     const toolScript = "setTimeout(()=>{require('node:fs').appendFileSync(process.argv[1], 'effect\\n');process.exit(0)}, Number(process.argv[2]))"

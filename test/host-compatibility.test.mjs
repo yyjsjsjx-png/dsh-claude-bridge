@@ -8,7 +8,7 @@ import { assertHostModule, assertRpcParameters } from '../plugin/compat/host-con
 import { resolveDshModule, readShippedStandardPreset } from '../plugin/compat/resolve-dsh-module.mjs';
 
 test('Host 能力检查允许新版本和新增导出，缺少必需接口才拒绝', () => {
-  const module = { createScope() {}, newOptionalFeature() {} };
+  const module = { createScope() {}, scopeOf() {}, newOptionalFeature() {} };
   for (const version of ['0.2.1-rc.6', '0.2.2', '0.3.0', '1.0.0']) {
     assert.doesNotThrow(() => assertHostModule('@deepseek-ai/dsh-scope', module, version));
   }

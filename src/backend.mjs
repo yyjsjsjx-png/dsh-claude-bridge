@@ -19,6 +19,9 @@ import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
 import { validateContextPreferences } from './context-preferences.mjs'
+import { requiredShellName, assertRemoteShell,
+  shellInfrastructureFailure } from './remote-capabilities.mjs'
+import { prepareRequestAssembly, prepareRequestMessages } from './request-preparation.mjs'
 
 function failure(code, message) {
   const error = new Error(`[${code}] ${message}`)
@@ -50,6 +53,8 @@ export class BridgeBackend {
     this.syncing = new Map()
     this.retiredRuns = new Set()
     this.compatibility = []
+    this.remoteCapabilities = { status: 'unchecked', shell: requiredShellName(), reason: '尚未检查远程会话的基础执行能力。' }
+    this.shellFailures = new WeakMap()
     this.connection = undefined
     this.connecting = undefined
     this.connectionRevision = 0
@@ -125,6 +130,7 @@ export class BridgeBackend {
     await this.state.ready
     const settings = await (await this.settings()).read()
     return { ...settings, connected: this.connection?.connected ?? Boolean(this.connection), compatibility: this.compatibility,
+      remoteCapabilities: this.remoteCapabilities,
       diagnosticsPath: this.diagnostics.path, activeRuns: this.runs.size,
       authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary(),
       contextPreferences: this.contextPreferences(),
@@ -673,6 +679,53 @@ export class BridgeBackend {
     return { ...converted, catalogModels }
   }
 
+  admitRemoteShell(agent, assembly, converted) {
+    try {
+      const previous = this.shellFailures.get(agent.session)
+      if (previous) throw previous
+      this.remoteCapabilities = assertRemoteShell(assembly, converted, this.ctx, agent)
+    } catch (error) {
+      if (error.code !== 'REMOTE_SHELL_UNAVAILABLE') throw error
+      this.remoteCapabilities = error.capabilities
+      this.compatibility = [...converted.compatibility.filter(tool => tool.name !== error.capabilities.shell),
+        { name: error.capabilities.shell, status: 'disabled', reason: error.capabilities.reason }]
+      if (typeof agent?.session?.append === 'function') this.sessionStatus(agent,
+        { phase: 'failed', context: { status: 'unknown' },
+          compatibility: { model: selectionFor(this.ctx, agent).model, version: 1, tools: this.compatibility } })
+      throw error
+    }
+  }
+
+  stopForShellFailure(run, name, result) {
+    const error = shellInfrastructureFailure(name, result)
+    if (!error) return
+    this.shellFailures.set(run.agent.session, error)
+    this.remoteCapabilities = error.capabilities
+    run.compatibility = [...run.compatibility.filter(tool => tool.name !== error.capabilities.shell),
+      { name: error.capabilities.shell, status: 'disabled', reason: error.capabilities.reason }]
+    this.compatibility = run.compatibility
+    this.sessionStatus(run.agent, { compatibility: { model: selectionFor(this.ctx, run.agent).model,
+      version: 1, tools: run.compatibility } })
+    run.preparationError = error
+    this.requestRunStop(run)
+    return error
+  }
+
+  prepareRequest(agent, decision, converted) {
+    return prepareRequestAssembly({ assembly: decision.assembly, converted,
+      admitShell: (assembly, tools) => this.admitRemoteShell(agent, assembly, tools),
+      renderPrompt: assembly => this.helpers.renderPrompt(assembly) })
+  }
+
+  prepareMessages(agent, assembly, messages, signal, continuation = false) {
+    return prepareRequestMessages({ assembly, messages, continuation,
+      context: this.helpers.assembleContextFor(agent, signal),
+      refreshContext: (accepted, context) => this.ctx.systemPrompt.refreshContext(accepted, context),
+      renderContextSections: refreshed => this.helpers.renderContextSections(refreshed),
+      joinContextSections: sections => this.helpers.joinContextSections(sections),
+      projectContext: (text, sections) => agent.runtimeContext.project(text, sections) })
+  }
+
   async runStep(agent, decision) {
     return this.useConnection(() => this.performRunStep(agent, decision))
   }
@@ -684,6 +737,11 @@ export class BridgeBackend {
     const { turn, step, abort: { signal } } = phase
     signal.throwIfAborted()
     const selected = selectionFor(this.ctx, agent)
+    // Fail before connecting or starting a model request. This is an admission
+    // check, not an implicit command: actual executions retain native policy.
+    const shell = requiredShellName()
+    this.admitRemoteShell(agent, decision.assembly,
+      toMcpToolDefinitions((decision.assembly?.tools ?? []).filter(tool => tool.name === shell)))
     const runId = randomUUID()
     const timing = (stage, method) => this.diagnostics.event('perf.local', {
       runId, sessionId: agent.id, model: selected.model, effort: selected.reasoningEffort,
@@ -707,23 +765,13 @@ export class BridgeBackend {
     }
     timing('history_checked')
     const converted = await this.convertTools(decision.assembly, selected)
+    // The full conversion can exclude the shell (for example, the global tool
+    // count cap); the cheap initial probe cannot admit that final collection.
+    const prepared = this.prepareRequest(agent, decision, converted)
     timing('tools_converted')
     this.compatibility = converted.compatibility
-    const refreshed = this.ctx.systemPrompt.refreshContext(decision.assembly, this.helpers.assembleContextFor(agent, signal))
-    const sections = this.helpers.renderContextSections(refreshed)
-    const refreshedContext = agent.runtimeContext.project(this.helpers.joinContextSections(sections), sections)
-    let contextAdmitted = false
-    const messages = []
-    for (const message of decision.messages) {
-      if (message.source.kind === 'runtime-context') {
-        if (refreshedContext && !contextAdmitted) { messages.push(refreshedContext); contextAdmitted = true }
-      } else messages.push(message)
-    }
-    if (refreshedContext && !contextAdmitted) messages.push(refreshedContext)
-    if (messages.some(message => message.content.some(block => block.type === 'text'
-      && block.text.includes('Workspace instructions were omitted or truncated to fit the configured byte budget.')))) {
-      throw failure('INSTRUCTION_BUDGET_EXCEEDED', 'DSH 报告项目指令被省略或截断；请调整专属预设的指令预算后继续。')
-    }
+    const { assembly } = prepared
+    const messages = this.prepareMessages(agent, assembly, decision.messages, signal)
     const media = { attachments: this.ctx.attachments, signal,
       imageInput: converted.tools.some(tool => tool.name === 'read_image'),
       mapHostPath: path => this.ctx.fs.processPathFromHostPath(path) }
@@ -732,21 +780,22 @@ export class BridgeBackend {
     const injectNotice = notice && notice.key !== binding.lastRecoveryNoticeKey
     if (injectNotice) prompt = [{ type: 'text', text: notice.text }, ...prompt]
     signal.throwIfAborted()
-    const systemPrompt = this.helpers.renderPrompt(decision.assembly)
+    const systemPrompt = prepared.renderSystemPrompt()
     timing('prompt_prepared')
     await this.state.beginRun(agent.id, runId, 'query', { turn, step })
     this.verifiedHistory.delete(agent.session)
     timing('journal_prepared')
     const header = { config: { provider: selected.provider, model: selected.model,
       ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
-    tools: decision.assembly.tools }
+    tools: assembly.tools }
     agent.session.append('request/header', { header, reason: binding.started ? 'resume' : 'initial' })
     for (const { message, intent } of agent.systemPrompt.project(systemPrompt, { inHistory: false, startsSeries: true })) {
       agent.session.append('system/message', { turn, step, message }, intent)
     }
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
     const run = { runId, agent, turn, step, signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
-      systemPrompt, toolSignature: JSON.stringify(converted.tools), catalogModels: converted.catalogModels,
+      systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
+      compatibility: converted.compatibility,
       historyGeneration: this.historyGeneration,
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
     run.projection = new SdkProjection({ agent, helpers: this.helpers, turn, step, model: selected.model,
@@ -808,6 +857,7 @@ export class BridgeBackend {
       await transport.peer.drainNotifications?.()
       await run.toolQueue
       signal.throwIfAborted()
+      if (run.preparationError) throw run.preparationError
       if (result.status !== 'completed') throw failure(result.code ?? 'SDK_QUERY_FAILED', result.message ?? '远程会话运行未完成。')
       await this.state.markStarted(agent.id)
       signal.throwIfAborted()
@@ -877,6 +927,7 @@ export class BridgeBackend {
     signal.throwIfAborted()
     await run.toolQueue
     signal.throwIfAborted()
+    if (run.preparationError) throw run.preparationError
     if (run.concluded) return { continue: false }
     const { agent, turn } = run
     if (typeof agent.preStep !== 'function') throw failure('DSH_PRE_STEP_UNAVAILABLE', '当前 DSH 未提供所需的步骤准备接口。')
@@ -891,19 +942,11 @@ export class BridgeBackend {
       signal.throwIfAborted()
       if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
       const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent), run.catalogModels)
-      if (this.helpers.renderPrompt(decision.assembly) !== run.systemPrompt
-        || JSON.stringify(tools.tools) !== run.toolSignature) {
+      const prepared = this.prepareRequest(agent, decision, tools)
+      if (prepared.renderSystemPrompt() !== run.systemPrompt || prepared.toolSignature !== run.toolSignature) {
         throw failure('QUERY_CONFIGURATION_CHANGED', '运行期间 DSH 提示词或工具集合发生变化；本次已停止，请新建会话应用新配置。')
       }
-      const messages = decision.messages.filter(message => message.source.kind !== 'runtime-context')
-      const refreshed = this.ctx.systemPrompt.refreshContext(decision.assembly, this.helpers.assembleContextFor(agent, signal))
-      const sections = this.helpers.renderContextSections(refreshed)
-      const runtime = agent.runtimeContext.project(this.helpers.joinContextSections(sections), sections)
-      if (runtime) messages.push(runtime)
-      if (messages.some(message => message.source.kind === 'agent-instructions' && message.content.some(block => block.type === 'text'
-        && block.text.includes('Workspace instructions were omitted or truncated to fit the configured byte budget.')))) {
-        throw failure('INSTRUCTION_BUDGET_EXCEEDED', 'DSH 报告项目指令被省略或截断；已停止后续推理。')
-      }
+      const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true)
       const blocks = messages.length ? await toSdkPrompt(messages, { ...run.media, signal }) : []
       if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_STEP_CONTEXT', '步骤附加上下文含有无法在此处投递的图片等内容；已停止。')
       signal.throwIfAborted()
@@ -1002,7 +1045,7 @@ export class BridgeBackend {
         await this.state.finishTool(agent.id, run.runId, params.callId, 'unknown', unknownResult.seq)
         this.diagnostics.event('tool.unknown', { runId: run.runId, callId: params.callId, toolName: params.name,
           code: 'UNKNOWN_TOOL_OUTCOME', toolMayHaveExecuted: true, durationMs: Date.now() - startedAt })
-        throw error
+        throw this.stopForShellFailure(run, params.name, error) ?? error
       }
       const resultEvent = agent.session.append('tool/result', { turn, step,
         message: this.helpers.createToolResultMessage({ callId: params.callId, content: result.content, isError: Boolean(result.isError) }),
@@ -1013,6 +1056,8 @@ export class BridgeBackend {
         await this.checkpoint(agent.session)
         await this.state.finishTool(agent.id, run.runId, params.callId, 'completed', resultEvent.seq)
       } catch (error) { run.toolOutcomeUnknown = true; throw error }
+      const shellFailure = this.stopForShellFailure(run, params.name, result)
+      if (shellFailure) throw shellFailure
       const content = await toMcpContent(result.content, run.media)
       const additionalContexts = []
       if (result.isError === true && typeof result.error?.info?.code === 'string'

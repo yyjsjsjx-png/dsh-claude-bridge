@@ -127,8 +127,9 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
     standardConfig.plugins.push({ id: 'future-tool', name: 'future-tool' })
     assert.ok(createRemoteClaudePreset(standardConfig).plugins.some(row => row.id === 'future-tool'))
     const { default: PresetService } = await import('../plugin/preset-service.mjs')
+    let registeredPreset
     const presetScope = new PresetService({ extend: () => ({ agentPresets: {
-      register: async preset => { assert.equal(preset.id, 'claude-sdk-remote'); return () => {} },
+      register: async preset => { registeredPreset = preset; assert.equal(preset.id, 'claude-sdk-remote'); return () => {} },
     } }) })
     const registration = presetScope[Service.init]()
     assert.equal((await registration.next()).done, false)
@@ -141,8 +142,11 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
       error.code === 'DSH_API_INCOMPATIBLE' && /createScope/u.test(error.message))
 
     await writeFile(join(base, '@deepseek-ai/dsh-web-app/presets/standard.patch.yml'), '- insert: []\n')
-    await assert.rejects(presetScope[Service.init]().next(), error =>
-      error.code === 'DSH_API_INCOMPATIBLE' && /标准预设结构不兼容/u.test(error.message))
+    const fallback = presetScope[Service.init]()
+    assert.equal((await fallback.next()).done, false)
+    assert.equal(registeredPreset.plugins[0].config.mode, 'basic')
+    assert.ok(registeredPreset.plugins[0].config.plugins.some(row => row.id === 'tool-pwsh'))
+    await fallback.return()
   } finally {
     process.env.DSH_CLAUDE_BRIDGE_RESOURCES = originalResources
     assert.equal(dirname(directory), resolve(tmpdir()))

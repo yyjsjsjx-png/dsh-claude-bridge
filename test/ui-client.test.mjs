@@ -72,6 +72,9 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
         connected: false, authentication: 'unknown', diagnosticsPath: 'local-diagnostics',
         contextPreferences, autoCompactWindowSupported: true,
         disabledFeatures: [{ name: '规划模式', status: 'disabled', reason: '测试原因' }],
+        remotePreset: { mode: 'basic', reasons: ['标准预设无法适配'], disabledComponents: [] },
+        remoteCapabilities: { status: 'unavailable', shell: 'pwsh', reason: '基础执行失败' },
+        desktopCompatibility: { version: '0.2.1-rc.5', verifiedVersions: ['0.2.1-rc.5'] },
         usageSummary: { sessions: 1, runs: 2, inputTokens: 3, outputTokens: 4,
           cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCostUsd: 0.01, costKind: 'sdk-estimate' } } }),
       saveConnection: async value => { saved = value; configured = true; return { ok: true, value: { configured: true } }; },
@@ -93,6 +96,9 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.equal(catalogCalls, 0);
   assert.equal(JSON.stringify(settings.hooks.settings.getSnapshot()).includes(saved.token), false);
   assert.equal(settings.hooks.settings.getSnapshot().disabledFeatures[0].name, '规划模式');
+  assert.equal(settings.hooks.settings.getSnapshot().remotePreset.mode, 'basic');
+  assert.equal(settings.hooks.settings.getSnapshot().remoteCapabilities.reason, '基础执行失败');
+  assert.equal(settings.hooks.settings.getSnapshot().desktopCompatibility.version, '0.2.1-rc.5');
   assert.equal(settings.hooks.settings.getSnapshot().usageSummary.runs, 2);
   settings.editContextMode('custom'); settings.editContextWindow('200000');
   await settings.refreshStatus();
@@ -346,7 +352,7 @@ test('上下文底栏只显示百分比，浮层展示同源用量与精简分�
   assert.equal(render(), null);
 });
 
-test('额度底栏默认只显示 5h，浮层含周和 Fable 明细，过期不展示旧百分比', async () => {
+test('额度底栏同时显示 5h 和有效周剩余，浮层保留明细，过期或未返回不造百分比', async () => {
   const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
   let entry;
   vm.runInNewContext(source, { document: { body: {} },
@@ -375,6 +381,7 @@ test('额度底栏默认只显示 5h，浮层含周和 Fable 明细，过期不�
     windows: [{ id: 'five_hour', name: '5 小时', scope: 'session', usedPercent: 88, resetsAt: null },
       { id: 'seven_day', name: '周额度', scope: 'weekly', usedPercent: 76, resetsAt: null },
       { id: 'model_weekly_0', name: 'Fable', scope: 'model-weekly', usedPercent: 40, resetsAt: null }] };
+  const fullQuota = quota;
   const textOf = node => node == null || typeof node === 'boolean' ? ''
     : typeof node === 'string' || typeof node === 'number' ? String(node)
     : Array.isArray(node) ? node.map(textOf).join(' ') : node.type === 'style' ? '' : textOf(node.children);
@@ -383,13 +390,28 @@ test('额度底栏默认只显示 5h，浮层含周和 Fable 明细，过期不�
   const render = () => { cursor = 0; return slots.get('dsh-claude-quota')({
     useBridgeStatus: select => select(bridge), useQuota: select => select(quota), readQuota() {},
   }); };
-  assert.equal(textOf(render()).trim(), '5h 剩余 12%');
+  assert.equal(textOf(render()).trim(), '5h 剩余 12% · 周剩余 24%');
   assert.doesNotMatch(textOf(render()), /周额度|Fable/);
   nodesOf(render()).find(node => node.type === 'button').props.onClick();
   assert.match(textOf(render()), /周额度 24%/);
   assert.match(textOf(render()), /Fable · 周额度 60%/);
   assert.equal(nodesOf(render()).find(node => node.props?.role === 'dialog').props['aria-label'], '剩余额度');
-  quota = { ...quota, expiresAt: Date.now() - 1 };
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  quota = { ...fullQuota, windows: fullQuota.windows.filter(row => row.id === 'five_hour') };
+  assert.equal(textOf(render()).trim(), '5h 剩余 12%');
+  quota = { ...fullQuota, windows: fullQuota.windows.filter(row => row.id === 'seven_day') };
+  assert.equal(textOf(render()).trim(), '周剩余 24%');
+  quota = { ...fullQuota, windows: [] };
+  assert.equal(textOf(render()).trim(), '5h 额度未知');
+  assert.doesNotMatch(textOf(render()), /%/);
+  quota = { ...fullQuota, windows: fullQuota.windows.map(row => row.id === 'seven_day'
+    ? { ...row, resetsAt: Date.now() - 1 } : row) };
+  assert.equal(textOf(render()).trim(), '5h 剩余 12%');
+  assert.doesNotMatch(textOf(render()), /周剩余|24%/);
+  quota = { ...fullQuota, windows: fullQuota.windows.map(row => row.id === 'five_hour'
+    ? { ...row, resetsAt: Date.now() - 1 } : row) };
+  assert.equal(textOf(render()).trim(), '周剩余 24%');
+  quota = { ...fullQuota, expiresAt: Date.now() - 1 };
   assert.match(textOf(render()), /5h 待刷新/);
   assert.doesNotMatch(textOf(render()), /12%|24%|60%|100%/);
   bridge = null;
@@ -411,12 +433,14 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   const reads = [];
   let fail = false;
   let blocked = false;
+  let noLimits = false;
   const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured: false } }),
       async planUsage(refresh) {
         reads.push(refresh);
         if (blocked) return { ok: true, value: { status: 'unavailable', code: 'AUTH_EXPIRED' } };
+        if (noLimits) return { ok: true, value: { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE' } };
         return fail ? { ok: false } : { ok: true, value: { status: 'available', observedAt: clock,
           expiresAt: clock + 120_000, windows: [{ id: 'five_hour', usedPercent: 12, resetsAt: null }] } };
       },
@@ -481,6 +505,10 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   await quota.readQuota('manual');
   assert.equal(reads.length, 9);
   assert.equal(quota.hooks.quota.getSnapshot().status, 'available');
+  noLimits = true;
+  await quota.readQuota('manual');
+  assert.equal(quota.hooks.quota.getSnapshot().status, 'unavailable');
+  assert.equal(quota.hooks.quota.getSnapshot().windows.length, 0);
 });
 
 test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行中暂停并清理', async () => {

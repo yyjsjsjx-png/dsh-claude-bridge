@@ -8,8 +8,9 @@ import {
 } from './compat/runtime.mjs';
 import { BridgeBackend } from '../src/backend.mjs';
 import { CLAUDE_PRESET, CLAUDE_PROVIDER } from './policy.mjs';
-import { REMOTE_PRESET_CONVERSIONS, REMOTE_PRESET_LIMITATIONS } from './preset.mjs';
-import { resolveDshModule } from './compat/resolve-dsh-module.mjs';
+import { remotePresetFeatures } from './preset.mjs';
+import { remotePresetStatus } from './preset-loading.mjs';
+import { resolveDshModule, assertDshCompatibility } from './compat/resolve-dsh-module.mjs';
 import { createWorkflowDepthGuard } from './workflow-depth-guard.mjs';
 import { imageCapability } from '../src/model-capabilities.mjs';
 import { createSessionStatusProjection } from '../src/session-status.mjs';
@@ -198,9 +199,11 @@ export class ClaudeBridgeService extends TypertRemoteService {
   async status() {
     this.assertOwner();
     const status = await this.backend.status();
-    return { ...status,
-      disabledFeatures: REMOTE_PRESET_LIMITATIONS.map(entry => ({ ...entry })),
-      convertedFeatures: REMOTE_PRESET_CONVERSIONS.map(entry => ({ ...entry })) };
+    const remotePreset = remotePresetStatus(this.ctx);
+    const host = await assertDshCompatibility();
+    return { ...status, remotePreset,
+      desktopCompatibility: { version: host.version, verifiedVersions: ['0.2.1-rc.5'] },
+      ...remotePresetFeatures(remotePreset) };
   }
 
   @Remote('saveConnection')
