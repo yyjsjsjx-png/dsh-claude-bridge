@@ -13,6 +13,7 @@ import { strictSession } from './fixtures/native-persistence.mjs'
 import { HISTORY_TOOL_RESULT, appendHistoryRecord } from '../src/history-records.mjs'
 import { repairBridgeHistories } from '../scripts/repair-history.mjs'
 import { createClient } from '../plugin/ui/client/entry.mjs'
+import { createUsageProjectionBridge } from '../plugin/ui/client/usage-projection.mjs'
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
 test('实际 rc5：闭合轮次补齐消息和真实工具结果，原生日志与显示历史可重新回放', { skip: !available }, async () => {
@@ -127,7 +128,7 @@ test('实际 rc5 展示：冷回放与实时追加的最终正文在折叠模式
     session.append('step/end', { turn: 1, step: 2 }); session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
     for (const lifecycle of ['cold', 'live']) {
       const view = await nativeChat()
-      createClient({}).installTranscriptOrder(view.ctx)
+      createClient({ createUsageProjectionBridge }).installTranscriptOrder(view.ctx)
       const events = session.snapshotEvents()
       if (lifecycle === 'cold') view.replace(events)
       else for (const event of events) view.append(event)
