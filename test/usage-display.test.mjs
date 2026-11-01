@@ -99,10 +99,12 @@ test('速度复用原生统计组件，运行中采样即更新，旧会话缺�
   const active = wrapper.component(props).children[0]
   assert.equal(active.props.useProjection('sessionStats').ttftMs, 5000)
   assert.equal(active.props.useProjection('sessionStats', state => state.decodeTokens), 1200)
-  assert.match(active.props.t('stats.dialog.ttft'), /首响应平均.*2 个样本/)
+  assert.match(active.props.t('stats.dialog.ttft'), /首 Token 平均.*TTFT.*估算.*2 个样本/)
   assert.match(active.props.t('stats.dialog.speed'), /接收速度.*2 个样本/)
   const explanation = wrapper.component(props).props.title
-  assert.match(explanation, /message_start.*SDK ttft_ms.*平均值/)
+  assert.match(explanation, /SDK 首帧时长.*远端同机.*首个有效输出.*平均/)
+  assert.match(explanation, /非空正文、思考和工具参数 JSON 增量.*排除开始帧、心跳、签名和工具名/)
+  assert.match(explanation, /SDK 缓冲与调度误差.*非精确上游计时/)
   assert.match(explanation, /同一完整响应的输出 Token.*原始 SDK message_start.*最后有效内容帧/)
   assert.match(explanation, /汇总后计算接收速度.*本机观察窗口.*思考阶段和缓冲影响.*不代表上游生成测速/)
   // Each metric reports its own coverage; an absent channel cannot revive native values.
