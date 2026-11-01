@@ -557,6 +557,20 @@ test('额度底栏同时显示 5h 和有效周剩余，浮层保留明细，过�
   assert.doesNotMatch(textOf(render()), /private raw error/u);
   quota = { ...quota, sampling: { ...quota.sampling, fresh: true, error: null } };
   assert.doesNotMatch(textOf(render()), /缓存读数|非实时|额度采样失败/u);
+  quota = { ...quota, sampling: { ...quota.sampling, active: false } };
+  assert.match(textOf(render()), /无运行任务，暂停查询；仅显示缓存读数/u);
+  const cachedRefresh = nodesOf(render()).find(node => node.props?.['aria-label'] === '读取缓存额度');
+  assert.equal(cachedRefresh.props.title, '无运行任务，仅查看缓存额度');
+  quota = { ...quota, refreshing: true };
+  assert.match(textOf(render()), /正在读取缓存/u);
+  assert.doesNotMatch(textOf(render()), /正在刷新|刷新成功/u);
+  quota = { ...quota, refreshing: false };
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  assert.equal(textOf(render()).trim(), '5h 剩余 12% · 周剩余 24%');
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  quota = { ...quota, sampling: { ...quota.sampling, active: true } };
+  assert.doesNotMatch(textOf(render()), /无运行任务|暂停查询/u);
+  assert.ok(nodesOf(render()).find(node => node.props?.['aria-label'] === '刷新额度'));
   quota = fullQuota;
   nodesOf(render()).find(node => node.type === 'button').props.onClick();
   quota = { ...fullQuota, windows: fullQuota.windows.filter(row => row.id === 'five_hour') };
@@ -617,7 +631,8 @@ test('旧服务端额度刷新保留退避，新采样目录遵守服务端冷�
         reads.push(refresh);
         if (versionCode) return { ok: true, value: { status: 'unavailable', code: versionCode, minimumClientVersion: '0.2.5' } };
         if (blocked) return { ok: true, value: { status: 'unavailable', code: 'AUTH_EXPIRED' } };
-        if (noLimits) return { ok: true, value: { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE' } };
+        if (noLimits) return { ok: true, value: { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE',
+          ...(sampling ? { sampling } : {}) } };
         return fail ? { ok: false } : { ok: true, value: { status: 'available', observedAt: sampling?.lastObservedAt ?? clock,
           expiresAt: clock + (sampling ? 1_800_000 : 120_000),
           windows: [{ id: 'five_hour', usedPercent: 12, resetsAt: null }], ...(sampling ? { sampling } : {}) } };
@@ -746,6 +761,14 @@ test('旧服务端额度刷新保留退避，新采样目录遵守服务端冷�
   assert.equal(reads.length, beforeCooldown + 2);
   assert.equal(quota.hooks.quota.getSnapshot().sampling.error, null);
   assert.equal(quota.hooks.quota.getSnapshot().observedAt, clock);
+  clock = sampling.nextAllowedAt;
+  sampling = { fresh: false, active: false, lastObservedAt: null, nextAllowedAt: clock + 300_000,
+    error: null, inFlight: false };
+  noLimits = true;
+  await quota.readQuota('manual');
+  assert.equal(quota.hooks.quota.getSnapshot().status, 'unavailable');
+  assert.equal(quota.hooks.quota.getSnapshot().sampling.active, false);
+  assert.equal(quota.hooks.quota.getSnapshot().nextRefreshAt, sampling.nextAllowedAt);
 });
 
 test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行中暂停并清理', async () => {

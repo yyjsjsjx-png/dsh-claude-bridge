@@ -75,6 +75,7 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
       if (paused) {
         quotaRetryAt = 0;
         store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+          ...(value.sampling ? { sampling: value.sampling } : {}),
           ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
@@ -83,7 +84,9 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
         // A reply with no usable plan windows supersedes the old counters.
         // Transient transport failures may keep a still-fresh snapshot.
         store.set({ ...(previous.status === 'available' && value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous : UNKNOWN_QUOTA),
-          code: value.code, refreshing: false, paused: undefined, nextRefreshAt: quotaRetryAt });
+          ...(value.sampling ? { sampling: value.sampling } : {}),
+          code: value.code, refreshing: false, paused: undefined,
+          nextRefreshAt: Math.max(quotaRetryAt, Number.isFinite(value.sampling?.nextAllowedAt) ? value.sampling.nextAllowedAt : 0) });
       }
     })();
     quotaRequest = request;

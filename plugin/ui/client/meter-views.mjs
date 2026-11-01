@@ -262,6 +262,7 @@ function compactTokens(value) {
       return `${new Date(row.resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 重置`;
     };
     const samplingError = quota.sampling?.error;
+    const samplingPaused = quota.sampling?.active === false;
     const samplingCode = typeof samplingError?.code === 'string'
       && /^[A-Z][A-Z0-9_]{0,63}$/.test(samplingError.code) ? `（${samplingError.code}）` : '';
     const observedAt = Number.isFinite(quota.sampling?.lastObservedAt)
@@ -284,8 +285,12 @@ function compactTokens(value) {
         React.createElement('div', { className: 'dsh-claude-meter-head' },
           React.createElement('strong', null, '剩余额度'),
           React.createElement('button', { type: 'button', className: 'dsh-claude-quota-refresh',
-            'aria-label': '刷新额度', title: '刷新额度', disabled: quota.refreshing || quota.paused === 'offline',
+            'aria-label': samplingPaused ? '读取缓存额度' : '刷新额度',
+            title: samplingPaused ? '无运行任务，仅查看缓存额度' : '刷新额度',
+            disabled: quota.refreshing || quota.paused === 'offline',
             onClick: () => { void readQuota('manual'); } }, quota.refreshing ? '…' : '↻')),
+        samplingPaused && React.createElement('p', { className: 'dsh-claude-quota-reset', style: { margin: '10px 0 0' } },
+          '无运行任务，暂停查询；仅显示缓存读数。'),
         ...rows.map(row => React.createElement('div', { key: row.id, className: 'dsh-claude-quota-row' },
           React.createElement('div', { className: 'dsh-claude-quota-line' },
             React.createElement('span', null, row.scope === 'model-weekly' ? `${row.name} · 周额度` : row.name),
@@ -312,7 +317,7 @@ function compactTokens(value) {
         samplingError && React.createElement('p', { role: 'alert', style: { margin: '10px 0 0' } },
           `额度采样失败${samplingCode}${rows.length ? '，保留上次读数。' : '，请稍后重试。'}`),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
-          quota.refreshing ? '正在刷新…'
+          quota.refreshing ? (samplingPaused ? '正在读取缓存…' : '正在刷新…')
             : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${quota.sampling?.fresh === false ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
