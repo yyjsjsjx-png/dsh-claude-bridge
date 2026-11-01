@@ -174,3 +174,21 @@ test('a run ending before detached sampling starts makes no read or observation'
   assert.equal(calls, 1)
   await coordinator.close()
 })
+
+test('close removes the active timer and neither stale ticks nor reads can restart sampling', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: start })
+  let calls = 0
+  const coordinator = createQuotaCoordinator({ fetchUsage: async () => { calls++; return snapshot(Date.now()) } })
+  coordinator.setActive('worker-a:run-a', true)
+  await coordinator.request()
+  assert.equal(calls, 1)
+  await coordinator.close()
+  assert.equal(coordinator.setActive('worker-b:run-b', true), false)
+  t.mock.timers.tick(900_000)
+  for (let n = 0; n < 6; n++) await Promise.resolve()
+  const result = await coordinator.request()
+  assert.equal(result.error.code, 'QUOTA_CLOSED')
+  assert.equal(result.active, false)
+  assert.equal(result.activeCount, 0)
+  assert.equal(calls, 1)
+})
