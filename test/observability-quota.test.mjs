@@ -10,10 +10,10 @@ const snapshot = (at = start) => ({ status: 'available', source: 'sdk-plan-usage
     usedPercent: 7, resetsAt: at + 3_600_000 }] })
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 
-test('all request reasons share cooldown while cache freshness keeps original observedAt', async () => {
+test('all request reasons share configured cooldown while cache freshness keeps original observedAt', async () => {
   let now = start, calls = 0
   const observations = []
-  const coordinator = createQuotaCoordinator({ now: () => now,
+  const coordinator = createQuotaCoordinator({ now: () => now, cooldownMs: 300_000,
     fetchUsage: async () => { calls++; return snapshot(now) }, onObservation: row => observations.push(row) })
   assert.equal(coordinator.peek().snapshot, null)
   assert.equal(calls, 0)
@@ -141,12 +141,13 @@ test('two active runs share one account timer and the last inactive run stops po
   await tick(0)
   assert.equal(calls, 1)
   assert.equal(coordinator.peek().activeCount, 2)
-  await tick(299_999)
+  assert.equal(coordinator.peek().nextAllowedAt, Date.now() + 120_000)
+  await tick(119_999)
   assert.equal(calls, 1)
   await tick(1)
   assert.equal(calls, 2)
   coordinator.setActive('device-a:run-a', false)
-  await tick(300_000)
+  await tick(120_000)
   assert.equal(calls, 3)
   coordinator.setActive('device-b:run-b', false)
   assert.equal(coordinator.peek().active, false)

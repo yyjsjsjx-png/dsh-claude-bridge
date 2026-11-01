@@ -47,6 +47,7 @@ dsh-claude-bridge/
   runtime/bin/node        指向现有 Node >=24.9 的路径
   claude-config/          仅该账号可访问的官方配置
   sessions/               SDK 原生会话、归属与私有回执
+  observability/          独立的用量、额度与耗时账本
   private/                独立桥接口令
 ```
 
@@ -86,8 +87,8 @@ curl -fsSL https://claude.ai/install.sh | bash -s 2.1.314
 ```sh
 cd /home/bridge/dsh-claude-bridge
 umask 077
-mkdir -p private sessions claude-config
-chmod 700 private sessions claude-config
+mkdir -p private sessions claude-config observability
+chmod 700 private sessions claude-config observability
 ```
 
 账号所有者在服务器桌面打开该用户的终端，运行固定版本 CLI 并亲自在官方页面完成登录：
@@ -142,7 +143,7 @@ BRIDGE_REMOTE_ROOT=/home/bridge/dsh-claude-bridge BRIDGE_PORT=18944 BRIDGE_TOKEN
 
 使用 [bridge.service.example](../deploy/bridge.service.example) 生成自己的系统服务，替换其中 `__USER__`、`__HOME__`、`__ROOT__`、`__PORT__` 和 `__TOKEN_FILE__`。`ExecStart` 的 Node 路径须实际存在。目录含空格时按 systemd 规则引用路径。
 
-此服务由系统 systemd 管理，通过 `User=` 降权运行；启用后可在用户未登录图形桌面时启动，不依赖用户服务的 linger。模板设置异常重启、控制组停止、私有临时目录、只读系统及 home，仅 `sessions` 和 `claude-config` 可写。
+此服务由系统 systemd 管理，通过 `User=` 降权运行；启用后可在用户未登录图形桌面时启动，不依赖用户服务的 linger。模板设置异常重启、控制组停止、私有临时目录、只读系统及 home，仅 `sessions`、`claude-config` 和 `observability` 可写。启动前须创建这三个目录；已有 unit 升级时仅补相同的账本目录权限，不开放整个 home。统计写入失败不会中断对话，能力和查询口径见[账本说明](observability.md)。
 
 可先将模板复制为系统服务，再编辑全部占位符：
 

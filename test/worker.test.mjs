@@ -8,6 +8,7 @@ import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
 
 import { createAuthReader } from '../remote/auth.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
+import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
@@ -456,6 +457,105 @@ test('流式输入、DSH 提示词、工具 ID、审批和诊断保留边界', a
   assert.ok(diagnostics.length > 0)
   assert.equal(JSON.stringify(diagnostics).includes('DSH 专属预设提示词'), false)
   assert.equal(JSON.stringify(diagnostics).includes('Get-Location'), false)
+})
+
+test('共享观测能力显式声明，planUsage 只委托账号额度且不启动 SDK', async t => {
+  const reasons = [], snapshot = { snapshot: null, fresh: false, nextAllowedAt: 0, error: null }
+  const f = await fixture(t, async function* () { throw Error('不应启动模型') }, {
+    observability: { async quota(reason) { reasons.push(reason); return snapshot } },
+  })
+  const initialized = await f.worker.handlers.initialize({ protocolVersion: 1 })
+  assert.equal(initialized.capabilities.observability, true)
+  const authReads = f.state.authReads
+  assert.deepEqual(await f.worker.handlers.planUsage({}, f.context), { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', ...snapshot })
+  const observedAt = Date.now()
+  snapshot.snapshot = { status: 'available', source: 'sdk-plan-usage', observedAt, expiresAt: observedAt + 120_000,
+    windows: [{ id: 'seven_day', name: '周额度', scope: 'weekly', usedPercent: 12, resetsAt: observedAt + 86_400_000 }] }
+  const shared = await f.worker.handlers.planUsage({ refresh: true }, f.context)
+  assert.deepEqual(sanitizePlanUsage(shared), snapshot.snapshot)
+  assert.deepEqual(shared.snapshot, snapshot.snapshot)
+  assert.deepEqual(reasons, ['activity', 'manual'])
+  assert.equal(f.state.authReads, authReads)
+  assert.equal(f.state.queries.length, 0)
+  assert.equal(f.state.catalogQueries.length, 0)
+})
+
+test('观测 query 活跃标记总是成对，数值 run 只记最终主用量及实际模型', async t => {
+  for (const failed of [false, true]) {
+    const activity = [], records = []
+    const f = await fixture(t, async function* ({ prompt }) {
+      await prompt.next()
+      if (failed) throw Error('合成 SDK 失败')
+      yield { type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'response-observed', model: 'claude-haiku-5-5',
+          usage: { input_tokens: 3, output_tokens: 0, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 } } } }
+      yield { type: 'stream_event', event: { type: 'content_block_delta', index: 0,
+        delta: { type: 'text_delta', text: 'PRIVATE_SYNTHETIC_OUTPUT' } } }
+      yield { type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 9 } } }
+      yield { type: 'stream_event', event: { type: 'message_stop' } }
+      yield { type: 'result', subtype: 'success', session_id: SESSION,
+        usage: { input_tokens: 3, output_tokens: 9, cache_read_input_tokens: 11, cache_creation_input_tokens: 13 },
+        modelUsage: { 'claude-haiku-5-5': { inputTokens: 300, outputTokens: 900 } }, total_cost_usd: 0.02 }
+    }, { observability: {
+      activity(key, active) { activity.push([key, active]) },
+      record(kind, row) { records.push({ kind, row }); return true },
+    } })
+    const result = await f.worker.handlers.query(f.params, f.context)
+    assert.equal(result.status, failed ? 'failed' : 'completed')
+    assert.deepEqual(activity, [[f.params.runId, true], [f.params.runId, false]])
+    const runs = records.filter(record => record.kind === 'run')
+    assert.equal(runs.length, 1)
+    assert.equal(runs[0].row.runId, f.params.runId)
+    assert.equal(runs[0].row.deviceId, DEVICE)
+    assert.equal(runs[0].row.sdkSessionId, SESSION)
+    assert.equal(runs[0].row.status, result.status)
+    assert.equal(runs[0].row.model, failed ? 'unknown' : 'claude-haiku-5-5')
+    assert.equal(Number.isSafeInteger(runs[0].row.startedAt), true)
+    assert.equal(runs[0].row.finishedAt >= runs[0].row.startedAt, true)
+    if (failed) assert.equal(runs[0].row.usage, undefined)
+    else assert.deepEqual(runs[0].row.usage, { scope: 'current-turn-main-agent', uncachedInputTokens: 3,
+      outputTokens: 9, cacheReadTokens: 11, cacheWriteTokens: 13 })
+    assert.equal(JSON.stringify(records).includes('PRIVATE_SYNTHETIC_OUTPUT'), false)
+    assert.equal(JSON.stringify(records).includes(f.params.prompt), false)
+  }
+})
+
+test('观测账本查询与汇总只委托本地读取，不触发额度或 SDK', async t => {
+  const reads = [], filters = { from: 1_800_000_000_000, to: 1_800_000_100_000 }
+  const f = await fixture(t, async function* () { throw Error('不应启动模型') }, { observability: {
+    async query(value) { reads.push(['query', value]); return { status: 'ok', rows: [] } },
+    async summarize(value) { reads.push(['summarize', value]); return { status: 'ok', totals: {} } },
+    async status() { reads.push(['status']); return { status: 'ok' } },
+    quota() { throw Error('只读账本不能请求额度') },
+  } })
+  await f.worker.handlers.initialize({ protocolVersion: 1 })
+  const authReads = f.state.authReads
+  assert.equal((await f.worker.handlers.observabilityQuery({ filters })).status, 'ok')
+  assert.equal((await f.worker.handlers.observabilityQuery({ operation: 'summarize', filters })).status, 'ok')
+  assert.equal((await f.worker.handlers.observabilityQuery({ operation: 'status' })).status, 'ok')
+  assert.deepEqual(reads, [['query', filters], ['summarize', filters], ['status']])
+  assert.equal(f.state.authReads, authReads)
+  assert.equal(f.state.queries.length, 0)
+  assert.equal(f.state.catalogQueries.length, 0)
+})
+
+test('本机计时记录拒绝伪造设备或远端计时身份，只接受绑定设备的数值记录', async t => {
+  const records = []
+  const f = await fixture(t, async function* () { throw Error('不应启动模型') }, { authorizedDeviceId: DEVICE,
+    observability: { record(kind, row) { records.push({ kind, row }); return true } },
+  })
+  await f.worker.handlers.initialize({ protocolVersion: 1 })
+  const row = { version: 1, deviceId: DEVICE, dshSessionId: 'synthetic-dsh', sdkSessionId: SESSION,
+    runId: 'synthetic-local-run', model: 'unknown', observedAt: Date.now(), level: 'run', side: 'local',
+    metric: 'first-output', quality: 'precise', clock: 'local-monotonic', source: 'local-rpc-first-output', durationMs: 25 }
+  for (const invalid of [{ ...row, deviceId: OTHER_DEVICE }, { ...row, side: 'upstream' }, { ...row, clock: 'remote-monotonic' }]) {
+    assert.deepEqual(await f.worker.handlers.observabilityTiming(invalid), { status: 'unavailable', code: 'OBSERVABILITY_INVALID_RECORD' })
+  }
+  assert.equal(records.length, 0)
+  assert.deepEqual(await f.worker.handlers.observabilityTiming(row), { status: 'queued' })
+  assert.deepEqual(records, [{ kind: 'timing', row }])
+  assert.equal(f.state.queries.length, 0)
+  assert.equal(f.state.catalogQueries.length, 0)
 })
 
 test('恢复要求设备和会话归属一致，Claude 模型可按目录切换', async (t) => {

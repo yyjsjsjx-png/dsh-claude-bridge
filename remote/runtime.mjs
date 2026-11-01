@@ -13,6 +13,9 @@ import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { validateContextPreferences } from '../src/context-preferences.mjs'
 import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
 import { createFirstOutputObserver } from './first-output.mjs'
+import { createRunObservations } from './run-observations.mjs'
+import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
+import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { createPromptInput } from './prompt-input.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
@@ -347,7 +350,7 @@ export function parseServiceBudget(value) {
 }
 
 /** Create handlers for one private stdio worker. Dependencies are injected for offline tests. */
-export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, inputConfirmationTimeoutMs = 30_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now() }) {
+export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, inputConfirmationTimeoutMs = 30_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now(), observability }) {
   if (!sdk || typeof sdk.query !== 'function' || typeof sdk.tool !== 'function'
     || typeof sdk.createSdkMcpServer !== 'function' || typeof sdk.getSessionInfo !== 'function') {
     throw new TypeError('SDK 接口不完整')
@@ -445,6 +448,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         manualCompact: true,
         autoCompactWindow: true,
         planUsage: true,
+        ...(observability ? { observability: true } : {}),
         historySync: typeof sdk.getSessionMessages === 'function',
         nativeFileAndShellTools: false,
         nativeSubagents: false,
@@ -485,6 +489,11 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         || (params.refresh !== undefined && typeof params.refresh !== 'boolean')) {
         throw new WorkerError('INVALID_REQUEST', '额度请求参数无效')
       }
+      if (observability) {
+        const view = await observability.quota(params.refresh ? 'manual' : 'activity')
+        // Keep the original flat snapshot for older Hosts; sampling is additive.
+        return { ...sanitizePlanUsage(view?.snapshot), ...view }
+      }
       await requireAuth(context.signal, params.refresh === true)
       return await planUsageReader.read({ signal: context.signal })
     } catch (error) {
@@ -497,6 +506,35 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     const blocked = compatibilityFailure()
     if (blocked) return blocked
     return readHistory(params, context)
+  }
+
+  async function readObservabilityQuota(context = {}) {
+    await requireAuth(context.signal, false)
+    return planUsageReader.read({ signal: context.signal })
+  }
+
+  async function observabilityQuery(params = {}) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
+    if (!observability) return { status: 'unavailable', code: 'OBSERVABILITY_UNSUPPORTED' }
+    if (!params || typeof params !== 'object' || Array.isArray(params)
+      || Object.keys(params).some(k => !['operation', 'filters'].includes(k))) return { status: 'unavailable', code: 'OBSERVABILITY_INVALID_QUERY' }
+    if (params.operation === 'status') return observability.status()
+    if (params.operation === 'summarize') return observability.summarize(params.filters)
+    if (params.operation === undefined || params.operation === 'query') return observability.query(params.filters)
+    return { status: 'unavailable', code: 'OBSERVABILITY_INVALID_QUERY' }
+  }
+
+  function observabilityTiming(params) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
+    if (!observability) return { status: 'unavailable', code: 'OBSERVABILITY_UNSUPPORTED' }
+    try {
+      const row = normalizeObservabilityRecord('timing', params)
+      if (authorizedDeviceId && row.deviceId.toLowerCase() !== authorizedDeviceId.toLowerCase()
+        || row.side !== 'local' || row.clock !== 'local-monotonic' || row.level !== 'run') throw Error('identity')
+      return { status: observability.record('timing', row) ? 'queued' : 'unavailable' }
+    } catch { return { status: 'unavailable', code: 'OBSERVABILITY_INVALID_RECORD' } }
   }
 
   async function query(params, context) {
@@ -573,6 +611,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       if (typeof params.resume !== 'boolean') throw new WorkerError('INVALID_REQUEST', '必须明确指定是否恢复会话')
       if (params.model !== undefined) requireString(params.model, 'model', 256)
       if (params.effort !== undefined) requireString(params.effort, 'effort', 64)
+      if (observability) run.observations = createRunObservations({ params: { ...params, deviceId, sessionId },
+        record: (kind, row) => observability.record(kind, row) })
       if (params.maxBudgetUsd !== undefined && (typeof params.maxBudgetUsd !== 'number'
         || !Number.isFinite(params.maxBudgetUsd) || params.maxBudgetUsd <= 0
         || (maxBudgetUsd !== undefined && params.maxBudgetUsd > maxBudgetUsd))) {
@@ -1040,6 +1080,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           timing('hooks_verified')
           // Verify hooks before any user prompt can start inference.
           promptInput.start()
+          if (observability) { observability.activity(runId, true); run.quotaActive = true }
           for await (const incoming of sdkQuery) {
           const responseObservedAt = responseTimingNow()
           let message = incoming
@@ -1080,6 +1121,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             throw new WorkerError('SDK_TOOLSET_UNVERIFIED', 'SDK 未提供可验证的工具清单')
           }
           if (!compact) message = firstOutput.observe(message, responseObservedAt)
+          run.observations?.observe(message)
           if (!compact && (message?.type === 'stream_event'
             || (message?.type === 'assistant' && !isNoResponsePlaceholder(message.message)))) {
             if (!firstModelEvent) { firstModelEvent = true; timing('first_model_event') }
@@ -1243,6 +1285,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         }
       }
       if (run) {
+        run.observations?.finish(run.outcome)
+        if (run.quotaActive) observability?.activity(runId, false)
         activeRuns.delete(runId)
         const outcome = run.outcome
           ? { status: run.outcome.status, ...(run.outcome.code ? { code: run.outcome.code } : {}),
@@ -1293,5 +1337,6 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     return Promise.allSettled([planUsageReader.close(), ...[...activeRuns.values()].map(({ settled }) => settled)])
   }
 
-  return { handlers: { initialize, authStatus, catalog, planUsage, history, query, settle }, close }
+  return { handlers: { initialize, authStatus, catalog, planUsage, history, query, settle,
+    observabilityQuery, observabilityTiming }, readObservabilityQuota, close }
 }
