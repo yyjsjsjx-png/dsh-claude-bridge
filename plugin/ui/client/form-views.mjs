@@ -170,6 +170,8 @@ const SETTINGS_CSS = `
     const bridgeCompatibility = state.bridgeCompatibility;
     const catalogCode = typeof state.modelCatalog?.code === 'string'
       && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.modelCatalog.code) ? `（${state.modelCatalog.code}）` : '';
+    const observabilityCode = typeof state.observabilityWarning?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.observabilityWarning.code) ? `（${state.observabilityWarning.code}）` : '';
     const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     const hostChecks = Array.isArray(state.host?.checks) ? state.host.checks : [];
     const checkRows = [
@@ -287,6 +289,9 @@ const SETTINGS_CSS = `
         `远程会话插件不可用：${state.remoteCapabilities.reason}`),
       h('details', { className: 'dcb-card dcb-details' },
         h('summary', null, '兼容性与诊断'),
+        state.observabilityWarning && h('p', { role: 'alert', 'aria-label': '统计记录状态',
+          className: 'dcb-notice', 'data-tone': 'error' },
+          `统计记录异常${observabilityCode}，对话仍可继续；记录可能有缺口。`),
         bridgeCompatibility && h('p', null,
           `客户端插件 ${bridgeCompatibility.clientVersion || '未知'}；服务端 ${bridgeCompatibility.serverVersion || '未声明'}`),
         bridgeCompatibility?.status === 'legacy' && h('p', null, '服务端未声明版本要求，按旧版兼容模式连接。'),

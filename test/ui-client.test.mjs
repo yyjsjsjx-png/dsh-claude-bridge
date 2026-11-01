@@ -358,6 +358,24 @@ test('设置页打开及可见时刷新统计，合并请求并保留地址草�
   await settings.refreshStatus();
   assert.equal(settings.hooks.settings.getSnapshot().modelCatalog.status, 'ready');
   assert.equal(catalogAlert(), undefined);
+  const warning = { code: 'USAGE_LEDGER_WRITE_FAILED', observedAt: Date.now(), gap: true };
+  latest = { ...latest, observabilityWarning: warning };
+  await settings.refreshStatus();
+  assert.deepEqual(settings.hooks.settings.getSnapshot().observabilityWarning, warning);
+  const diagnostics = nodesOf(render()).find(node => node.type === 'details');
+  const warningAlert = () => nodesOf(render()).find(node => node.props?.role === 'alert'
+    && node.props['aria-label'] === '统计记录状态');
+  assert.equal(nodesOf(diagnostics).filter(node => node.props?.role === 'alert'
+    && node.props['aria-label'] === '统计记录状态').length, 1);
+  assert.match(textOf(diagnostics), /统计记录异常（USAGE_LEDGER_WRITE_FAILED），对话仍可继续；记录可能有缺口/u);
+  assert.match(textOf(warningAlert()), /USAGE_LEDGER_WRITE_FAILED/u);
+  latest = { ...latest, observabilityWarning: { code: 'arbitrary private message', gap: true } };
+  await settings.refreshStatus();
+  assert.doesNotMatch(textOf(warningAlert()), /arbitrary private message/u);
+  latest = { ...latest, observabilityWarning: null };
+  await settings.refreshStatus();
+  assert.equal(settings.hooks.settings.getSnapshot().observabilityWarning, null);
+  assert.equal(warningAlert(), undefined);
   for (const dispose of cleanup) dispose();
   assert.equal(timers.size, 0);
   assert.equal(listeners.size, 0);
@@ -522,6 +540,24 @@ test('额度底栏同时显示 5h 和有效周剩余，浮层保留明细，过�
   assert.match(textOf(render()), /周额度 24%/);
   assert.match(textOf(render()), /Fable · 周额度 60%/);
   assert.equal(nodesOf(render()).find(node => node.props?.role === 'dialog').props['aria-label'], '剩余额度');
+  const lastObservedAt = fullQuota.observedAt - 300_000;
+  quota = { ...fullQuota, sampling: { fresh: false, lastObservedAt,
+    nextAllowedAt: Date.now() + 300_000, inFlight: false,
+    error: { code: 'PLAN_USAGE_SAMPLE_FAILED', observedAt: Date.now(), message: 'private upstream failure' } } };
+  assert.match(textOf(render()), /5h 剩余 12% · 周剩余 24%/);
+  assert.match(textOf(render()), /更新于 .* · 缓存读数 · 非实时/u);
+  assert.ok(textOf(render()).includes(new Date(lastObservedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })));
+  assert.match(textOf(nodesOf(render()).find(node => node.props?.role === 'alert')),
+    /额度采样失败（PLAN_USAGE_SAMPLE_FAILED），保留上次读数/u);
+  assert.doesNotMatch(textOf(render()), /private upstream failure/u);
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  assert.equal(textOf(render()).trim(), '5h 剩余 12% · 周剩余 24%');
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  quota = { ...quota, sampling: { ...quota.sampling, error: { code: 'private raw error' } } };
+  assert.doesNotMatch(textOf(render()), /private raw error/u);
+  quota = { ...quota, sampling: { ...quota.sampling, fresh: true, error: null } };
+  assert.doesNotMatch(textOf(render()), /缓存读数|非实时|额度采样失败/u);
+  quota = fullQuota;
   nodesOf(render()).find(node => node.type === 'button').props.onClick();
   quota = { ...fullQuota, windows: fullQuota.windows.filter(row => row.id === 'five_hour') };
   assert.equal(textOf(render()).trim(), '5h 剩余 12%');
@@ -556,7 +592,7 @@ test('额度底栏同时显示 5h 和有效周剩余，浮层保留明细，过�
   assert.equal(render(), null);
 });
 
-test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退避，手动可立即更新', async () => {
+test('旧服务端额度刷新保留退避，新采样目录遵守服务端冷却且手动不绕过', async () => {
   const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
   let clock = Date.now();
   const startedAt = clock;
@@ -573,6 +609,7 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   let blocked = false;
   let noLimits = false;
   let versionCode;
+  let sampling;
   const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured: false } }),
@@ -581,8 +618,9 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
         if (versionCode) return { ok: true, value: { status: 'unavailable', code: versionCode, minimumClientVersion: '0.2.5' } };
         if (blocked) return { ok: true, value: { status: 'unavailable', code: 'AUTH_EXPIRED' } };
         if (noLimits) return { ok: true, value: { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE' } };
-        return fail ? { ok: false } : { ok: true, value: { status: 'available', observedAt: clock,
-          expiresAt: clock + 120_000, windows: [{ id: 'five_hour', usedPercent: 12, resetsAt: null }] } };
+        return fail ? { ok: false } : { ok: true, value: { status: 'available', observedAt: sampling?.lastObservedAt ?? clock,
+          expiresAt: clock + (sampling ? 1_800_000 : 120_000),
+          windows: [{ id: 'five_hour', usedPercent: 12, resetsAt: null }], ...(sampling ? { sampling } : {}) } };
       },
     } }, slots: { inject: (_name, register) => register(), register(options, component) {
       slots.set(options.id, { options, component }); return () => {};
@@ -677,6 +715,37 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   await quota.readQuota('manual');
   assert.equal(quota.hooks.quota.getSnapshot().status, 'available');
   assert.equal(reads.length, beforeVersionPause + 2);
+  const firstObservedAt = clock;
+  sampling = { fresh: true, lastObservedAt: firstObservedAt, nextAllowedAt: clock + 300_000,
+    error: null, inFlight: false };
+  await quota.readQuota('manual');
+  const beforeCooldown = reads.length;
+  assert.equal(quota.hooks.quota.getSnapshot().nextRefreshAt, sampling.nextAllowedAt);
+  clock += 60_000;
+  await quota.readQuota('manual'); await quota.readQuota('poll'); await quota.readQuota('activity');
+  assert.equal(reads.length, beforeCooldown);
+  assert.equal(quota.hooks.quota.getSnapshot().observedAt, firstObservedAt);
+  clock = sampling.nextAllowedAt;
+  sampling = { ...sampling, fresh: false, nextAllowedAt: clock + 300_000,
+    error: { code: 'PLAN_USAGE_SAMPLE_FAILED', observedAt: clock } };
+  await quota.readQuota('queued');
+  const failedSample = quota.hooks.quota.getSnapshot();
+  assert.equal(reads.length, beforeCooldown + 1);
+  assert.equal(reads.at(-1), false);
+  assert.equal(failedSample.status, 'available');
+  assert.equal(failedSample.observedAt, firstObservedAt);
+  assert.equal(failedSample.windows[0].usedPercent, 12);
+  assert.equal(failedSample.sampling.error.code, 'PLAN_USAGE_SAMPLE_FAILED');
+  assert.equal(failedSample.nextRefreshAt, sampling.nextAllowedAt);
+  await quota.readQuota('manual');
+  assert.equal(reads.length, beforeCooldown + 1);
+  clock = sampling.nextAllowedAt;
+  sampling = { fresh: true, lastObservedAt: clock, nextAllowedAt: clock + 300_000,
+    error: null, inFlight: false };
+  await quota.readQuota('manual');
+  assert.equal(reads.length, beforeCooldown + 2);
+  assert.equal(quota.hooks.quota.getSnapshot().sampling.error, null);
+  assert.equal(quota.hooks.quota.getSnapshot().observedAt, clock);
 });
 
 test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行中暂停并清理', async () => {

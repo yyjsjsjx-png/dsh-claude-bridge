@@ -261,6 +261,11 @@ function compactTokens(value) {
       if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟后重置`;
       return `${new Date(row.resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 重置`;
     };
+    const samplingError = quota.sampling?.error;
+    const samplingCode = typeof samplingError?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(samplingError.code) ? `（${samplingError.code}）` : '';
+    const observedAt = Number.isFinite(quota.sampling?.lastObservedAt)
+      ? quota.sampling.lastObservedAt : quota.observedAt;
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
@@ -304,9 +309,11 @@ function compactTokens(value) {
           href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
           target: '_blank', rel: 'noopener noreferrer',
         }, '查看更新说明'),
+        samplingError && React.createElement('p', { role: 'alert', style: { margin: '10px 0 0' } },
+          `额度采样失败${samplingCode}${rows.length ? '，保留上次读数。' : '，请稍后重试。'}`),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
           quota.refreshing ? '正在刷新…'
-            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(quota.observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`)), document.body));
+            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${quota.sampling?.fresh === false ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
   return { SessionMeter, QuotaMeter };
