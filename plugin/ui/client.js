@@ -23,7 +23,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
   const store = createStore({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
     remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
-    diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
+    diagnosticsPath: '', observabilityWarning: null, activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
     contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
@@ -57,7 +57,8 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
           host: status.host ?? null,
-          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
+          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '',
+          observabilityWarning: status.observabilityWarning ?? null, statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
             contextWindow: String(status.contextPreferences?.autoCompactWindowTokens ?? 200000), contextDirty: false } : {}) });
@@ -253,6 +254,15 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
     if (quotaRequest) return quotaRequest;
     if (previous.paused === 'offline') store.set({ ...previous, paused: undefined });
     if (reason === 'online') quotaRetryAt = 0;
+    // New servers own the account-wide sampling gate. A manual click must not
+    // turn a retained cache snapshot into another upstream quota request.
+    const nextAllowedAt = previous.sampling?.nextAllowedAt;
+    if (Number.isFinite(nextAllowedAt) && nextAllowedAt > now) {
+      if (previous.nextRefreshAt !== nextAllowedAt) {
+        store.set({ ...store.getSnapshot(), nextRefreshAt: nextAllowedAt });
+      }
+      return Promise.resolve();
+    }
     if (!manual && ['open', 'visible', 'online'].includes(reason) && previous.status === 'available'
       && previous.expiresAt > now && now - previous.observedAt < 30_000
       && previous.windows.every(row => row.resetsAt === null || row.resetsAt > now)) return Promise.resolve();
@@ -279,7 +289,9 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
       if (disposed || revision !== quotaGeneration) return;
       if (value.status === 'available') {
         quotaFailures = 0; quotaRetryAt = 0;
-        store.set({ ...value, refreshing: false, nextRefreshAt: 0 });
+        const nextAllowedAt = value.sampling?.nextAllowedAt;
+        store.set({ ...value, refreshing: false,
+          nextRefreshAt: Number.isFinite(nextAllowedAt) && nextAllowedAt > Date.now() ? nextAllowedAt : 0 });
         return;
       }
       const paused = quotaAuthCodes.has(value.code) ? 'auth'
@@ -669,6 +681,11 @@ function compactTokens(value) {
       if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟后重置`;
       return `${new Date(row.resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 重置`;
     };
+    const samplingError = quota.sampling?.error;
+    const samplingCode = typeof samplingError?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(samplingError.code) ? `（${samplingError.code}）` : '';
+    const observedAt = Number.isFinite(quota.sampling?.lastObservedAt)
+      ? quota.sampling.lastObservedAt : quota.observedAt;
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
       React.createElement('button', { type: 'button', className: 'dsh-claude-meter-trigger',
@@ -712,9 +729,11 @@ function compactTokens(value) {
           href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
           target: '_blank', rel: 'noopener noreferrer',
         }, '查看更新说明'),
+        samplingError && React.createElement('p', { role: 'alert', style: { margin: '10px 0 0' } },
+          `额度采样失败${samplingCode}${rows.length ? '，保留上次读数。' : '，请稍后重试。'}`),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
           quota.refreshing ? '正在刷新…'
-            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(quota.observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`)), document.body));
+            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${quota.sampling?.fresh === false ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
   return { SessionMeter, QuotaMeter };
@@ -891,6 +910,8 @@ const SETTINGS_CSS = `
     const bridgeCompatibility = state.bridgeCompatibility;
     const catalogCode = typeof state.modelCatalog?.code === 'string'
       && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.modelCatalog.code) ? `（${state.modelCatalog.code}）` : '';
+    const observabilityCode = typeof state.observabilityWarning?.code === 'string'
+      && /^[A-Z][A-Z0-9_]{0,63}$/.test(state.observabilityWarning.code) ? `（${state.observabilityWarning.code}）` : '';
     const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     const hostChecks = Array.isArray(state.host?.checks) ? state.host.checks : [];
     const checkRows = [
@@ -1008,6 +1029,9 @@ const SETTINGS_CSS = `
         `远程会话插件不可用：${state.remoteCapabilities.reason}`),
       h('details', { className: 'dcb-card dcb-details' },
         h('summary', null, '兼容性与诊断'),
+        state.observabilityWarning && h('p', { role: 'alert', 'aria-label': '统计记录状态',
+          className: 'dcb-notice', 'data-tone': 'error' },
+          `统计记录异常${observabilityCode}，对话仍可继续；记录可能有缺口。`),
         bridgeCompatibility && h('p', null,
           `客户端插件 ${bridgeCompatibility.clientVersion || '未知'}；服务端 ${bridgeCompatibility.serverVersion || '未声明'}`),
         bridgeCompatibility?.status === 'legacy' && h('p', null, '服务端未声明版本要求，按旧版兼容模式连接。'),

@@ -3,7 +3,7 @@ export function createSettingsController({ rpc, createStore, textError, createMo
   const store = createStore({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
     remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null, host: null,
-    diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
+    diagnosticsPath: '', observabilityWarning: null, activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
     contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
@@ -37,7 +37,8 @@ export function createSettingsController({ rpc, createStore, textError, createMo
           desktopCompatibility: status.desktopCompatibility ?? null,
           bridgeCompatibility: status.bridgeCompatibility ?? null,
           host: status.host ?? null,
-          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
+          usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '',
+          observabilityWarning: status.observabilityWarning ?? null, statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
             contextWindow: String(status.contextPreferences?.autoCompactWindowTokens ?? 200000), contextDirty: false } : {}) });
