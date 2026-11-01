@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { BridgeBackend } from '../src/backend.mjs'
@@ -12,6 +12,64 @@ import { createHash } from 'node:crypto'
 import { requiredShellName } from '../src/remote-capabilities.mjs'
 
 const provider = 'claude-sdk-remote'
+const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
+const nextClientVersion = `${BigInt(currentClientVersion.split('.')[0]) + 1n}.0.0`
+
+test('握手发送插件版本，服务端仅升级不强制客户端更新，旧服务端仍按协议连接', async t => {
+  for (const declaration of [undefined, { serverVersion: nextClientVersion, minimumClientVersion: null },
+    { serverVersion: nextClientVersion, minimumClientVersion: currentClientVersion }]) {
+    const requests = []
+    const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+      requests.push({ method, params })
+      return { protocolVersion: 1, authenticated: true, ...declaration }
+    } }, async close() {} }))
+    f.backend.connectionSettings = { async read() { return { configured: true } } }
+    await f.backend.connect()
+    assert.equal(requests[0].method, 'initialize')
+    assert.equal(requests[0].params.clientVersion, currentClientVersion)
+    const status = await f.backend.status()
+    assert.equal(status.bridgeCompatibility.status, declaration ? 'compatible' : 'legacy')
+    assert.equal(status.bridgeCompatibility.clientVersion, currentClientVersion)
+  }
+})
+
+test('服务端要求更新时保留明确版本提示，发送 query 和运行日志前停止，换连接清除旧报告', async t => {
+  const methods = []; let closed = 0
+  const f = await fixture(t, async () => ({ peer: { async request(method) {
+    methods.push(method)
+    return { protocolVersion: 1, serverVersion: nextClientVersion, minimumClientVersion: nextClientVersion, clientCompatible: false,
+      authenticated: null, capabilities: {} }
+  } }, async close() { closed++ } }))
+  f.backend.connectionSettings = { async read() { return { configured: true } } }
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), error => {
+    assert.equal(error.code, 'CLIENT_UPDATE_REQUIRED'); assert.ok(error.message.includes(nextClientVersion)); return true
+  })
+  assert.deepEqual(methods, ['initialize']); assert.equal(closed, 1)
+  assert.equal(f.backend.state.value.sessions[f.agent.id].runs, undefined)
+  const status = await f.backend.status()
+  assert.equal(status.connected, false)
+  assert.equal(status.bridgeCompatibility.status, 'update-required')
+  assert.equal(status.bridgeCompatibility.minimumClientVersion, nextClientVersion)
+  const quota = await f.backend.planUsage(true)
+  assert.equal(quota.code, 'CLIENT_UPDATE_REQUIRED')
+  assert.equal(quota.minimumClientVersion, nextClientVersion)
+  f.backend.connectionSettings = { async clear() { return { configured: false, status: 'missing' } } }
+  await f.backend.clearConnection()
+  assert.equal(f.backend.bridgeCompatibility.status, 'unchecked')
+})
+
+test('无效服务端要求或明确拒绝不能被当成旧版兼容而继续执行', async t => {
+  for (const declaration of [{ serverVersion: '0.3.0', minimumClientVersion: 'invalid' },
+    { clientCompatible: false }]) {
+    let closed = 0
+    const f = await fixture(t, async () => ({ peer: { async request() {
+      return { protocolVersion: 1, authenticated: true, ...declaration }
+    } }, async close() { closed++ } }))
+    await assert.rejects(f.backend.connect(), { code: 'SERVER_COMPATIBILITY_INVALID' })
+    assert.equal(closed, 1)
+    assert.equal(f.backend.bridgeCompatibility.status, 'invalid')
+  }
+})
 
 test('上下文默认值仅本设备持久保存，下轮透传且旧服务器明确拒绝自定义值', async t => {
   const requests = []

@@ -8,13 +8,21 @@
 
 | 组件 | 本项目要求或实测基线 |
 | --- | --- |
-| 客户端插件 | `v0.2.2` |
+| 客户端插件 | 使用已发布正式版；是否需要升级以服务端声明的最低版本为准 |
 | DSH Desktop | 实测 `0.2.1-rc.5`，其他版本按接口能力检查，仍需实际确认 |
 | 服务器 Node.js | `>=24.9`，须准备可独立执行的 Node 和 npm |
 | Claude Agent SDK | 锁定 `0.3.314` |
 | 官方 Claude Code CLI | 锁定 `2.1.314` |
 
 这些是本项目的兼容范围，不表示它们是上游最新版。不要为升级本插件顺便升级 SDK 或 CLI；其他版本需要重新验证。
+
+### 桥接程序版本与最低客户端要求
+
+桥接服务程序版本由 `remote/package.json` 的 `version` 提供，通过 `serverVersion` 返回；最低客户端版本来自同文件的 `bridge.minimumClientVersion`，通过 `minimumClientVersion` 返回。这两个字段与 DSH Desktop、Agent SDK、CLI 的版本独立，两端桥接版本也不必相等。
+
+v0.2.3 的服务器代码新增这些声明，本次 `bridge.minimumClientVersion` 为 `null`，兼容旧客户端，不因服务端升级而额外要求客户端更新。新版客户端连接尚未提供这些字段的旧服务器时，继续按旧版兼容方式连接；只更新客户端不会让旧服务器增加版本声明。
+
+维护者只在未来真正不兼容的更新中提高最低客户端版本。声明了有效最低要求后，低于要求或未提供版本的客户端会被服务端操作门禁拒绝，返回带所需版本的 `CLIENT_UPDATE_REQUIRED`；旧客户端即使没有新界面，也能收到明确错误。未声明最低要求时不额外强制更新；非法声明会明确报错，不默认放行。完整规则见 [版本协商](compatibility-inventory.md#客户端与服务端版本协商)。
 
 客户端的自定义自动压缩窗口需要 v0.2.2 或更新的服务器代码。服务器按每轮请求单独向官方 CLI 传入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`，不会写入 Claude 登录配置，也不会共享或覆盖其他设备的阈值。跟随模型默认时不设置该变量。官方允许 100,000–1,000,000 tokens，并按模型上下文上限约束实际窗口，见 [自动压缩窗口说明](https://code.claude.com/docs/en/model-config#set-the-auto-compact-window)。
 
@@ -208,6 +216,8 @@ Windows 脚本按当前用户限制私钥权限，保持转发并退避重连。
 | 连得上 TLS，却认证失败 | 核对独立桥接口令与客户端保存值；它与 Claude 官方登录是两层认证 |
 | `AUTH_REQUIRED` / `AUTH_EXPIRED` | 账号所有者在同一服务用户、同一 `claude-config` 目录重新完成官方登录 |
 | `SDK_VERSION_MISMATCH` / `CLI_VERSION_MISMATCH` | 核对锁定 SDK 和固定 CLI 绝对路径，不直接升级依赖来消除报错 |
+| `CLIENT_UPDATE_REQUIRED` | 按错误给出的最低客户端版本更新插件；无需将两端版本号强行对齐 |
+| `SERVER_COMPATIBILITY_INVALID` | 核对服务端程序版本和最低客户端版本声明，使用合法 SemVer 或以 `null` 表示无最低要求 |
 | `MODEL_UNAVAILABLE` / `EFFORT_UNSUPPORTED` | 刷新账号目录，选择实际返回的明确模型及受支持强度 |
 | `BUDGET_EXHAUSTED` | 检查是否明确配置了 SDK 美元预算；默认不设。SDK 已输出正文后仍可能报告预算终态，与订阅剩余额度不是同一个值 |
 | 连接后仍无模型目录或 RPC 关闭 | 检查自己服务器 worker 的简短启动错误；主服务 active 只证明监听进程存在 |

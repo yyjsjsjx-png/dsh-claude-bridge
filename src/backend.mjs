@@ -2,6 +2,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { BridgeState } from './state.mjs'
 import { createDiagnostics } from './diagnostics.mjs'
 import { createSshTransport } from './ssh-transport.mjs'
@@ -22,6 +23,11 @@ import { validateContextPreferences } from './context-preferences.mjs'
 import { requiredShellName, assertRemoteShell,
   shellInfrastructureFailure } from './remote-capabilities.mjs'
 import { prepareRequestAssembly, prepareRequestMessages } from './request-preparation.mjs'
+import { evaluateBridgeCompatibility, bridgeCompatibilityAllowed } from './bridge-compatibility.mjs'
+
+const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+const uncheckedBridgeCompatibility = () => ({ status: 'unchecked', clientVersion,
+  serverVersion: undefined, minimumClientVersion: undefined, message: '尚未检查服务器版本要求。' })
 
 function failure(code, message) {
   const error = new Error(`[${code}] ${message}`)
@@ -53,6 +59,7 @@ export class BridgeBackend {
     this.syncing = new Map()
     this.retiredRuns = new Set()
     this.compatibility = []
+    this.bridgeCompatibility = uncheckedBridgeCompatibility()
     this.remoteCapabilities = { status: 'unchecked', shell: requiredShellName(), reason: '尚未检查远程会话的基础执行能力。' }
     this.shellFailures = new WeakMap()
     this.connection = undefined
@@ -99,6 +106,7 @@ export class BridgeBackend {
     this.connection = undefined
     this.connecting = undefined
     this.initialized = undefined
+    this.bridgeCompatibility = uncheckedBridgeCompatibility()
     this.authentication = 'unknown'
     this.catalogCache = undefined
     this.catalogPending = undefined
@@ -130,7 +138,7 @@ export class BridgeBackend {
     await this.state.ready
     const settings = await (await this.settings()).read()
     return { ...settings, connected: this.connection?.connected ?? Boolean(this.connection), compatibility: this.compatibility,
-      remoteCapabilities: this.remoteCapabilities,
+      remoteCapabilities: this.remoteCapabilities, bridgeCompatibility: this.bridgeCompatibility,
       diagnosticsPath: this.diagnostics.path, activeRuns: this.runs.size,
       authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary(),
       contextPreferences: this.contextPreferences(),
@@ -243,9 +251,20 @@ export class BridgeBackend {
       }
       try {
         if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
-        const initialized = await transport.peer.request('initialize', { protocolVersion: 1 }, { timeoutMs: 30000 })
+        this.initialized = undefined
+        const initialized = await transport.peer.request('initialize', { protocolVersion: 1, clientVersion }, { timeoutMs: 30000 })
         if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         if (initialized.protocolVersion !== 1) throw failure('PROTOCOL_MISMATCH', '服务器协议不兼容。')
+        this.bridgeCompatibility = evaluateBridgeCompatibility({ clientVersion,
+          serverVersion: initialized.serverVersion, minimumClientVersion: initialized.minimumClientVersion })
+        if (initialized.clientCompatible === false && bridgeCompatibilityAllowed(this.bridgeCompatibility)) {
+          this.bridgeCompatibility = { ...this.bridgeCompatibility, status: 'invalid',
+            message: '服务器拒绝了客户端版本协商，请核对服务器的最低客户端版本配置。' }
+        }
+        if (!bridgeCompatibilityAllowed(this.bridgeCompatibility)) {
+          throw failure(this.bridgeCompatibility.status === 'update-required' ? 'CLIENT_UPDATE_REQUIRED' : 'SERVER_COMPATIBILITY_INVALID',
+            this.bridgeCompatibility.message)
+        }
         this.initialized = initialized
         this.authentication = initialized.authenticated === true ? 'logged-in' : initialized.authenticated === false ? 'login-required' : 'unknown'
         if (initialized.authenticated === false) throw failure('AUTH_REQUIRED', '请在服务器上完成 Claude 官方登录。')
@@ -293,6 +312,9 @@ export class BridgeBackend {
         value = sanitizePlanUsage(reply)
       } catch (error) { value = sanitizePlanUsage({ status: 'unavailable', code: error.code ?? 'QUOTA_READ_FAILED' }) }
       if (revision !== this.connectionRevision) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
+      if (['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID'].includes(value.code)) {
+        value = { ...value, minimumClientVersion: this.bridgeCompatibility.minimumClientVersion }
+      }
       if (['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(value.code)) this.authentication = 'login-required'
       this.planUsageCache = { value, until: value.status === 'available' ? planUsageFreshUntil(value) : Date.now() + 30_000 }
       return structuredClone(value)

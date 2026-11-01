@@ -56,21 +56,26 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   const source = await readFile(new URL('../plugin/ui/client.js', import.meta.url), 'utf8');
   let entry;
   vm.runInNewContext(source, { window: { __ModuleLoader__: { load: value => { entry = value; } } } });
-  const client = entry.factory(name => name === 'react' ? { createElement() {} }
+  const react = { createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: initial => [initial, () => {}], useEffect() {} };
+  const client = entry.factory(name => name === 'react' ? react
     : name === 'zod' ? { z: {} } : {});
   const slots = new Map();
   let configured = false;
   let catalogCalls = 0;
+  let catalogError;
   let saved;
   let modelIds = ['haiku'];
   let contextPreferences = { autoCompactWindowTokens: null };
   let contextSaves = 0;
+  let bridgeCompatibility = { status: 'compatible', clientVersion: '0.2.3-rc.1',
+    serverVersion: '9.0.0', minimumClientVersion: '0.2.0', message: '客户端符合服务端版本要求。' };
   const ctx = {
     workspaces: {}, uiWorkspace: {},
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured, url: 'wss://example.test/',
         connected: false, authentication: 'unknown', diagnosticsPath: 'local-diagnostics',
-        contextPreferences, autoCompactWindowSupported: true,
+        contextPreferences, autoCompactWindowSupported: true, bridgeCompatibility,
         disabledFeatures: [{ name: '规划模式', status: 'disabled', reason: '测试原因' }],
         remotePreset: { mode: 'basic', reasons: ['标准预设无法适配'], disabledComponents: [] },
         remoteCapabilities: { status: 'unavailable', shell: 'pwsh', reason: '基础执行失败' },
@@ -78,7 +83,8 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
         usageSummary: { sessions: 1, runs: 2, inputTokens: 3, outputTokens: 4,
           cacheReadTokens: 5, cacheWriteTokens: 6, estimatedCostUsd: 0.01, costKind: 'sdk-estimate' } } }),
       saveConnection: async value => { saved = value; configured = true; return { ok: true, value: { configured: true } }; },
-      refreshCatalog: async () => { catalogCalls++; return { ok: true, value: { models: [] } }; },
+      refreshCatalog: async () => { catalogCalls++; return catalogError
+        ? { ok: false, error: catalogError } : { ok: true, value: { models: [] } }; },
       modelPreferences: async () => ({ ok: true, value: { models: [
         { value: 'haiku', displayName: 'Haiku' }, { value: 'sonnet', displayName: 'Sonnet' },
       ], enabledIds: modelIds, usingDefaults: false } }),
@@ -100,6 +106,33 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.equal(settings.hooks.settings.getSnapshot().remoteCapabilities.reason, '基础执行失败');
   assert.equal(settings.hooks.settings.getSnapshot().desktopCompatibility.version, '0.2.1-rc.5');
   assert.equal(settings.hooks.settings.getSnapshot().usageSummary.runs, 2);
+  const slot = slots.get('dsh-claude-bridge');
+  const render = () => slot.component({ ...settings, useSettings: select => select(settings.hooks.settings.getSnapshot()) });
+  const nodesOf = node => node == null || typeof node !== 'object' ? []
+    : Array.isArray(node) ? node.flatMap(nodesOf) : [node, ...nodesOf(node.children)];
+  const textOf = node => node == null || typeof node === 'boolean' ? ''
+    : typeof node === 'string' || typeof node === 'number' ? String(node)
+      : Array.isArray(node) ? node.map(textOf).join(' ') : node.type === 'style' ? '' : textOf(node.children);
+  const versionAlert = tree => nodesOf(tree).find(node => node.props?.role === 'alert' && node.props['aria-label'] === '客户端版本要求');
+  assert.equal(settings.hooks.settings.getSnapshot().bridgeCompatibility.status, 'compatible');
+  assert.match(textOf(render()), /客户端插件 0\.2\.3-rc\.1；服务端 9\.0\.0/);
+  assert.equal(versionAlert(render()), undefined);
+  bridgeCompatibility = { ...bridgeCompatibility, status: 'update-required', minimumClientVersion: '0.2.4',
+    message: '请更新客户端插件。' };
+  await settings.refreshStatus();
+  const requiredBanner = versionAlert(render());
+  assert.match(textOf(requiredBanner), /最低客户端版本：0\.2\.4/);
+  assert.equal(nodesOf(requiredBanner).find(node => node.type === 'a').props.href,
+    'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md');
+  bridgeCompatibility = { ...bridgeCompatibility, status: 'invalid', minimumClientVersion: null,
+    message: '服务端版本要求无效。' };
+  await settings.refreshStatus();
+  assert.match(textOf(versionAlert(render())), /服务端版本要求无效/);
+  bridgeCompatibility = { status: 'legacy', clientVersion: '0.2.3-rc.1', serverVersion: null,
+    minimumClientVersion: null, message: '' };
+  await settings.refreshStatus();
+  assert.equal(versionAlert(render()), undefined);
+  assert.match(textOf(render()), /服务端未声明版本要求，按旧版兼容模式连接/);
   settings.editContextMode('custom'); settings.editContextWindow('200000');
   await settings.refreshStatus();
   assert.equal(settings.hooks.settings.getSnapshot().contextWindow, '200000');
@@ -120,6 +153,15 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   await settings.saveModels();
   assert.deepEqual(modelIds, ['sonnet']);
   assert.deepEqual(Array.from(settings.hooks.settings.getSnapshot().selectedModelIds), ['sonnet']);
+  catalogError = { code: 'CLIENT_UPDATE_REQUIRED', message: '请更新客户端后重新连接。' };
+  bridgeCompatibility = { status: 'update-required', clientVersion: '0.2.3-rc.1', serverVersion: '9.0.0',
+    minimumClientVersion: '0.2.5', message: catalogError.message };
+  await settings.refresh();
+  const handshakeBanner = versionAlert(render());
+  assert.match(textOf(handshakeBanner), /最低客户端版本：0\.2\.5/);
+  assert.equal(nodesOf(handshakeBanner).find(node => node.type === 'a').props.href,
+    'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md');
+  assert.equal(settings.hooks.settings.getSnapshot().error, catalogError.message);
 });
 
 test('远程新建默认沿用上次模型和强度，目录失效时要求重新选择', async () => {
@@ -414,6 +456,18 @@ test('额度底栏同时显示 5h 和有效周剩余，浮层保留明细，过�
   quota = { ...fullQuota, expiresAt: Date.now() - 1 };
   assert.match(textOf(render()), /5h 待刷新/);
   assert.doesNotMatch(textOf(render()), /12%|24%|60%|100%/);
+  quota = { status: 'unavailable', paused: 'version', code: 'CLIENT_UPDATE_REQUIRED',
+    minimumClientVersion: '0.2.5', windows: [] };
+  assert.equal(textOf(render()).trim(), '客户端需更新');
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  assert.match(textOf(render()), /最低客户端版本：0\.2\.5/);
+  assert.doesNotMatch(textOf(render()), /12%|24%|60%|100%/);
+  assert.equal(nodesOf(render()).find(node => node.type === 'a').props.href,
+    'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md');
+  quota = { ...quota, code: 'SERVER_COMPATIBILITY_INVALID', minimumClientVersion: null };
+  assert.match(textOf(render()), /版本校验失败/);
+  assert.match(textOf(render()), /服务端版本要求无效，请核对版本声明后重试/);
+  assert.doesNotMatch(textOf(render()), /请更新后重试/);
   bridge = null;
   assert.equal(render(), null);
 });
@@ -434,11 +488,13 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   let fail = false;
   let blocked = false;
   let noLimits = false;
+  let versionCode;
   const ctx = { sessions: {}, workspaces: {}, uiWorkspace: {},
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured: false } }),
       async planUsage(refresh) {
         reads.push(refresh);
+        if (versionCode) return { ok: true, value: { status: 'unavailable', code: versionCode, minimumClientVersion: '0.2.5' } };
         if (blocked) return { ok: true, value: { status: 'unavailable', code: 'AUTH_EXPIRED' } };
         if (noLimits) return { ok: true, value: { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE' } };
         return fail ? { ok: false } : { ok: true, value: { status: 'available', observedAt: clock,
@@ -509,6 +565,34 @@ test('额度刷新合并请求、自动间隔 30 秒，失败按 1/2/5 分钟退
   await quota.readQuota('manual');
   assert.equal(quota.hooks.quota.getSnapshot().status, 'unavailable');
   assert.equal(quota.hooks.quota.getSnapshot().windows.length, 0);
+  noLimits = false;
+  versionCode = 'CLIENT_UPDATE_REQUIRED';
+  await quota.readQuota('manual');
+  assert.equal(quota.hooks.quota.getSnapshot().code, 'CLIENT_UPDATE_REQUIRED');
+  assert.equal(quota.hooks.quota.getSnapshot().paused, 'version');
+  assert.equal(quota.hooks.quota.getSnapshot().minimumClientVersion, '0.2.5');
+  assert.equal(quota.hooks.quota.getSnapshot().windows.length, 0);
+  assert.equal(quota.hooks.quota.getSnapshot().nextRefreshAt, 0);
+  const beforeVersionPause = reads.length;
+  clock += 600_000;
+  await quota.readQuota('poll'); await quota.readQuota('open'); await quota.readQuota('online');
+  network.onLine = false;
+  await quota.readQuota('manual');
+  assert.equal(quota.hooks.quota.getSnapshot().paused, 'version');
+  assert.equal(reads.length, beforeVersionPause);
+  network.onLine = true;
+  versionCode = 'SERVER_COMPATIBILITY_INVALID';
+  await quota.readQuota('manual');
+  assert.equal(quota.hooks.quota.getSnapshot().code, 'SERVER_COMPATIBILITY_INVALID');
+  assert.equal(quota.hooks.quota.getSnapshot().paused, 'version');
+  assert.equal(reads.length, beforeVersionPause + 1);
+  clock += 600_000;
+  await quota.readQuota('poll');
+  assert.equal(reads.length, beforeVersionPause + 1);
+  versionCode = undefined;
+  await quota.readQuota('manual');
+  assert.equal(quota.hooks.quota.getSnapshot().status, 'available');
+  assert.equal(reads.length, beforeVersionPause + 2);
 });
 
 test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行中暂停并清理', async () => {

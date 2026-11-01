@@ -29,6 +29,10 @@ test('额度边界保留安全错误分类，未知错误和正文不会透传',
     { status: 'unavailable', code: 'AUTH_EXPIRED' })
   assert.deepEqual(sanitizePlanUsage({ status: 'unavailable', code: 'private-account-detail' }),
     { status: 'unavailable', code: 'QUOTA_READ_FAILED' })
+  for (const code of ['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID']) {
+    assert.deepEqual(sanitizePlanUsage({ status: 'unavailable', code, private: 'secret' }),
+      { status: 'unavailable', code })
+  }
 })
 
 test('无额度、空值、非法比例或已重置的窗口不能冒充 100% 剩余', () => {

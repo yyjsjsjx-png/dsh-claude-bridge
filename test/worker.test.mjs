@@ -10,6 +10,103 @@ const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
 const OTHER_DEVICE = 'a4270ab7-90c7-440c-8fdc-5601b47dd29b'
 
+test('版本协商默认报告服务端版本，无最低要求时允许旧客户端且不启动 SDK', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  const manifest = JSON.parse(await readFile(new URL('../remote/package.json', import.meta.url), 'utf8'))
+  const initialized = await f.worker.handlers.initialize({ protocolVersion: 1 })
+  assert.equal(initialized.serverVersion, manifest.version)
+  assert.equal(initialized.minimumClientVersion, manifest.bridge?.minimumClientVersion ?? null)
+  assert.equal(initialized.clientCompatible, true)
+  assert.equal(initialized.authenticated, true)
+  assert.equal(initialized.capabilities.localMcpTools, true)
+  assert.equal((await f.worker.handlers.initialize({ protocolVersion: 1, clientVersion: '0.0.1' })).clientCompatible, true)
+  assert.equal(f.state.authReads, 2)
+  assert.equal(f.state.queries.length, 0)
+  assert.equal(f.state.catalogQueries.length, 0)
+})
+
+test('版本门禁在初始化缺失或客户端过旧时先于参数解析阻止全部 SDK 操作', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') }, {
+    bridgeRelease: { serverVersion: '0.3.0', minimumClientVersion: '0.2.3' },
+  })
+  const blockedOperations = async expected => {
+    for (const name of ['catalog', 'planUsage', 'history', 'query']) {
+      const result = await f.worker.handlers[name](null, f.context)
+      assert.equal(result.status, 'failed', name)
+      assert.equal(result.code, expected, name)
+      assert.match(result.message, /0\.2\.3/)
+    }
+  }
+  await blockedOperations('CLIENT_UPDATE_REQUIRED')
+  for (const clientVersion of [undefined, '0.2.2', 'invalid-client']) {
+    const initialized = await f.worker.handlers.initialize({ protocolVersion: 1,
+      ...(clientVersion === undefined ? {} : { clientVersion }) })
+    assert.equal(initialized.serverVersion, '0.3.0')
+    assert.equal(initialized.minimumClientVersion, '0.2.3')
+    assert.equal(initialized.clientCompatible, false)
+    assert.equal(initialized.code, 'CLIENT_UPDATE_REQUIRED')
+    assert.equal(initialized.authenticated, null)
+    assert.deepEqual(initialized.capabilities, {})
+    await blockedOperations('CLIENT_UPDATE_REQUIRED')
+  }
+  assert.equal(f.state.authReads, 0)
+  assert.equal(f.state.queries.length, 0)
+  assert.equal(f.state.catalogQueries.length, 0)
+  assert.equal(f.state.info.length, 0)
+  assert.equal(f.state.requests.length, 0)
+  const accepted = await f.worker.handlers.initialize({ protocolVersion: 1, clientVersion: '0.2.3' })
+  assert.equal(accepted.clientCompatible, true)
+  assert.equal(accepted.authenticated, true)
+  assert.equal((await f.worker.handlers.catalog({}, f.context)).status, 'ok')
+  assert.equal(f.state.catalogQueries.length, 1)
+})
+
+test('非法服务端版本声明关闭执行能力，仍保留 settle 与 close 清理', async t => {
+  for (const bridgeRelease of [
+    { serverVersion: 'invalid-server', minimumClientVersion: null },
+    { serverVersion: '0.2.3', minimumClientVersion: 'invalid-minimum' },
+  ]) {
+    const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') }, { bridgeRelease })
+    const initialized = await f.worker.handlers.initialize({ protocolVersion: 1, clientVersion: '0.2.3' })
+    assert.equal(initialized.clientCompatible, false)
+    assert.equal(initialized.code, 'SERVER_COMPATIBILITY_INVALID')
+    assert.equal(initialized.authenticated, null)
+    assert.deepEqual(initialized.capabilities, {})
+    for (const name of ['catalog', 'planUsage', 'history', 'query']) {
+      const result = await f.worker.handlers[name](null, f.context)
+      assert.equal(result.status, 'failed', name)
+      assert.equal(result.code, 'SERVER_COMPATIBILITY_INVALID', name)
+    }
+    assert.equal(f.state.authReads, 0)
+    assert.equal(f.state.queries.length, 0)
+    assert.equal(f.state.catalogQueries.length, 0)
+    assert.equal(f.state.info.length, 0)
+    assert.equal((await f.worker.handlers.settle({ runId: 'not-started' })).code, 'RUN_UNKNOWN')
+    await f.worker.close()
+  }
+})
+
+test('重新协商为旧客户端不阻塞已有执行的 settle 或清理，也不自动重发', async t => {
+  let began, release
+  const started = new Promise(resolveStarted => { began = resolveStarted })
+  const allowedToFinish = new Promise(resolveFinish => { release = resolveFinish })
+  const f = await fixture(t, async function* ({ prompt }, state) {
+    await prompt.next(); state.exists = true; began()
+    await allowedToFinish
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  }, { bridgeRelease: { serverVersion: '0.2.3', minimumClientVersion: '0.2.3' } })
+  await f.worker.handlers.initialize({ protocolVersion: 1, clientVersion: '0.2.3' })
+  const running = f.worker.handlers.query(f.params, f.context)
+  await started
+  assert.equal((await f.worker.handlers.initialize({ protocolVersion: 1, clientVersion: '0.2.2' })).clientCompatible, false)
+  const settled = f.worker.handlers.settle({ runId: f.params.runId }, f.context)
+  release()
+  assert.equal((await running).status, 'completed')
+  assert.equal((await settled).status, 'completed')
+  assert.equal(f.state.queries.length, 1)
+  await f.worker.close()
+})
+
 test('自动压缩窗口按本轮设置注入 CLI，恢复默认不继承上轮或其他会话设置', async t => {
   const f = await fixture(t, async function* ({ prompt }, state) {
     await prompt.next(); state.exists = true
@@ -169,7 +266,7 @@ test('主动压缩取消后不接受晚到 boundary，不自动重发', async t 
   assert.equal(f.state.queries.length, 2)
 })
 
-async function fixture(t, queryImplementation) {
+async function fixture(t, queryImplementation, overrides = {}) {
   const tempParent = resolve(tmpdir())
   const root = await mkdtemp(join(tempParent, 'dsh-claude-worker-'))
   t.after(async () => {
@@ -179,7 +276,7 @@ async function fixture(t, queryImplementation) {
     await rm(root, { recursive: true, force: true })
   })
   const state = {
-    queries: [], catalogQueries: [], catalogCloses: 0, info: [], requests: [], notifications: [], exists: false,
+    queries: [], catalogQueries: [], catalogCloses: 0, info: [], requests: [], notifications: [], exists: false, authReads: 0,
     models: [
       { value: 'default', resolvedModel: 'model-a', displayName: '账号默认', supportedEffortLevels: ['low', 'medium', 'high'] },
       { value: 'model-a', displayName: '模型甲', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
@@ -236,7 +333,8 @@ async function fixture(t, queryImplementation) {
     sdk, zod, sessionRoot: join(root, 'sessions'), configDir: '/isolated/claude-config',
     cliPath: '/desktop/.local/share/claude/versions/2.1.314', homeDir: '/desktop',
     sdkVersion: '0.3.314', cliVersion: '2.1.314', acquireLock,
-    authReader: { async read() { return { loggedIn: true, authMethod: 'claude.ai' } } },
+    authReader: { async read() { state.authReads++; return { loggedIn: true, authMethod: 'claude.ai' } } },
+    ...overrides,
   }
   const worker = createWorkerHandlers(config)
   const peer = {

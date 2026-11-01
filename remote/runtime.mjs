@@ -11,6 +11,11 @@ import { createHistoryReader, createRunStore } from './history.mjs'
 import { createDiagnostics } from '../src/diagnostics.mjs'
 import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { validateContextPreferences } from '../src/context-preferences.mjs'
+import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
+
+const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
+const defaultBridgeRelease = { serverVersion: bridgeManifest.version,
+  minimumClientVersion: bridgeManifest.bridge?.minimumClientVersion ?? null }
 
 const MAX_PROMPT_BYTES = 3 * 1024 * 1024
 const MAX_INSTRUCTION_BYTES = 1024 * 1024
@@ -351,7 +356,7 @@ export function parseServiceBudget(value) {
 }
 
 /** Create handlers for one private stdio worker. Dependencies are injected for offline tests. */
-export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000 }) {
+export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, bridgeRelease = defaultBridgeRelease }) {
   if (!sdk || typeof sdk.query !== 'function' || typeof sdk.tool !== 'function'
     || typeof sdk.createSdkMcpServer !== 'function' || typeof sdk.getSessionInfo !== 'function') {
     throw new TypeError('SDK 接口不完整')
@@ -379,7 +384,19 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   const planUsageReader = createPlanUsageReader({ sdk, sessionRoot, cliPath, childEnv })
   const authReader = injectedAuthReader ?? createAuthReader({ cliPath, childEnv })
   const runStore = createRunStore()
-  const history = createHistoryReader({ sdk, sessionRoot, authorizedDeviceId, acquireLock, requireAuth, activeSessions })
+  const readHistory = createHistoryReader({ sdk, sessionRoot, authorizedDeviceId, acquireLock, requireAuth, activeSessions })
+  const serverVersion = bridgeRelease?.serverVersion
+  const minimumClientVersion = bridgeRelease?.minimumClientVersion ?? null
+  let clientVersion
+
+  // Release versions describe compatibility, never authenticated identity.
+  // An omitted initialize cannot bypass an explicitly configured minimum.
+  function compatibilityFailure() {
+    const compatibility = evaluateBridgeCompatibility({ clientVersion, serverVersion, minimumClientVersion })
+    if (compatibility.status === 'compatible' || compatibility.status === 'legacy') return undefined
+    return { status: 'failed', code: compatibility.status === 'update-required'
+      ? 'CLIENT_UPDATE_REQUIRED' : 'SERVER_COMPATIBILITY_INVALID', message: compatibility.message }
+  }
 
   async function requireAuth(signal, refresh = false) {
     const status = await authReader.read({ signal, refresh })
@@ -407,11 +424,19 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
 
   async function initialize(params, context = {}) {
     if (!params || params.protocolVersion !== 1) throw new WorkerError('UNSUPPORTED_PROTOCOL', '不支持该协议版本')
+    clientVersion = params.clientVersion
+    const release = { serverVersion, minimumClientVersion }
+    const blocked = compatibilityFailure()
+    if (blocked) return { protocolVersion: 1, sdkVersion, cliVersion, ...release,
+      clientCompatible: false, code: blocked.code, message: blocked.message,
+      authenticated: null, capabilities: {} }
     const auth = await authStatus({}, context)
     return {
       protocolVersion: 1,
       sdkVersion,
       cliVersion,
+      ...release,
+      clientCompatible: true,
       authenticated: typeof auth.loggedIn === 'boolean' ? auth.loggedIn : null,
       ...(auth.authMethod ? { authMethod: auth.authMethod } : {}),
       ...(auth.code ? { authStatusError: { code: auth.code, message: auth.message } } : {}),
@@ -441,6 +466,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   }
 
   async function catalog(params = {}, context = {}) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
     try {
       requireObject(params, '模型目录请求')
       if (Object.keys(params).some((key) => key !== 'refresh')
@@ -457,6 +484,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   }
 
   async function planUsage(params = {}, context = {}) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
     try {
       requireObject(params, '额度请求')
       if (Object.keys(params).some(key => key !== 'refresh')
@@ -471,7 +500,15 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     }
   }
 
+  async function history(params, context = {}) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
+    return readHistory(params, context)
+  }
+
   async function query(params, context) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
     let sessionId
     let deviceId
     let active = false

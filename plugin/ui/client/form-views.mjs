@@ -167,6 +167,8 @@ const SETTINGS_CSS = `
     const selectedCount = state.modelsLoaded
       ? state.models.filter(model => state.selectedModelIds.includes(model.value)).length : 0;
     const authTone = state.authentication === 'logged-in' ? 'ok' : state.authentication === 'login-required' ? 'error' : 'warn';
+    const bridgeCompatibility = state.bridgeCompatibility;
+    const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     return h('section', { className: 'dcb-page' },
       h('style', null, SETTINGS_CSS),
       h('header', { className: 'dcb-header' },
@@ -176,6 +178,13 @@ const SETTINGS_CSS = `
           chip('配置', state.configured ? '已配置' : '未配置', state.configured ? 'ok' : 'warn'),
           chip('连接', state.connected ? '已连接' : '未连接', state.connected ? 'ok' : state.configured ? 'error' : 'warn'),
           chip('官方登录（最近验证）', authentication, authTone))),
+      clientUpdateRequired && h('div', { role: 'alert', 'aria-label': '客户端版本要求',
+        className: 'dcb-notice', 'data-tone': 'error' },
+      h('p', null, bridgeCompatibility.message || (bridgeCompatibility.status === 'update-required'
+        ? '当前客户端低于服务端要求，请更新插件。' : '服务端版本要求无效，暂时无法确认兼容性。')),
+      bridgeCompatibility.minimumClientVersion && h('p', null, `最低客户端版本：${bridgeCompatibility.minimumClientVersion}`),
+      h('a', { href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
+        target: '_blank', rel: 'noopener noreferrer' }, '查看更新说明')),
       h('div', { className: 'dcb-card' },
         h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '服务器连接')),
         h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '服务器地址'), h('input', {
@@ -261,6 +270,11 @@ const SETTINGS_CSS = `
         `远程会话插件不可用：${state.remoteCapabilities.reason}`),
       h('details', { className: 'dcb-card dcb-details' },
         h('summary', null, '兼容性与诊断'),
+        bridgeCompatibility && h('p', null,
+          `客户端插件 ${bridgeCompatibility.clientVersion || '未知'}；服务端 ${bridgeCompatibility.serverVersion || '未声明'}`),
+        bridgeCompatibility?.status === 'legacy' && h('p', null, '服务端未声明版本要求，按旧版兼容模式连接。'),
+        bridgeCompatibility?.status === 'compatible' && h('p', null, bridgeCompatibility.message || '客户端符合服务端版本要求。'),
+        bridgeCompatibility?.status === 'unchecked' && h('p', null, '连接后核对服务端版本要求。'),
         state.desktopCompatibility && h('p', null,
           `DSH ${state.desktopCompatibility.version}；已验证支持：${(state.desktopCompatibility.verifiedVersions ?? []).join('、')}`),
         state.desktopCompatibility && !state.desktopCompatibility.verifiedVersions?.includes(state.desktopCompatibility.version)

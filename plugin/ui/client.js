@@ -22,7 +22,7 @@ function textError(error) {
 function createSettingsController({ rpc, createStore, textError, createModelController, onConnectionChange }) {
   const store = createStore({ url: '', configured: false, connected: false, authentication: 'unknown',
     compatibility: [], disabledFeatures: [], convertedFeatures: [], usageSummary: null,
-    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null,
+    remotePreset: null, remoteCapabilities: null, desktopCompatibility: null, bridgeCompatibility: null,
     diagnosticsPath: '', activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
@@ -54,6 +54,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
           convertedFeatures: status.convertedFeatures ?? [], activeRuns: status.activeRuns ?? 0,
           remotePreset: status.remotePreset ?? null, remoteCapabilities: status.remoteCapabilities ?? null,
           desktopCompatibility: status.desktopCompatibility ?? null,
+          bridgeCompatibility: status.bridgeCompatibility ?? null,
           usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '', statusError: '',
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
@@ -159,7 +160,12 @@ function createModelController({ rpc, store, updateSettings, textError,
       await readStatus(true);
       await loadModelPreferences(true);
       updateSettings({ message: `连接成功，已读取 ${response.value.models?.length ?? 0} 个账号模型。` });
-    } catch (error) { updateSettings({ error: textError(error) }); }
+    } catch (error) {
+      updateSettings({ error: textError(error) });
+      // A failed handshake can carry a newer minimum-client requirement in
+      // the Host status even though no model catalog was returned.
+      await readStatus(true);
+    }
     finally { updateSettings({ busy: false }); }
   }
 
@@ -216,10 +222,11 @@ function createModelController({ rpc, store, updateSettings, textError,
 }
 
 function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthenticationRequired = () => {} }) {
-  const UNKNOWN_QUOTA = { status: 'unavailable', windows: [], refreshing: false, nextRefreshAt: 0 };
+  const UNKNOWN_QUOTA = { status: 'unavailable', windows: [], refreshing: false, nextRefreshAt: 0, minimumClientVersion: null };
   const store = createStore(UNKNOWN_QUOTA);
   const quotaAuthCodes = new Set(['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_METHOD_UNSUPPORTED',
     'AUTHORIZATION_DENIED', 'ACCOUNT_ON_HOLD']);
+  const quotaVersionCodes = new Set(['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID']);
   let disposed = false;
   let quotaRequest;
   let quotaGeneration = 0;
@@ -233,14 +240,14 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
     const previous = store.getSnapshot();
     const manual = reason === 'manual';
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      if (!['auth', 'unsupported'].includes(previous.paused)
+      if (!['auth', 'unsupported', 'version'].includes(previous.paused)
         && (previous.paused !== 'offline' || previous.nextRefreshAt)) {
         store.set({ ...previous, paused: 'offline', nextRefreshAt: 0 });
       }
       return Promise.resolve();
     }
     if (!manual && (typeof document !== 'undefined' && document.hidden
-      || ['auth', 'unsupported'].includes(previous.paused))) return Promise.resolve();
+      || ['auth', 'unsupported', 'version'].includes(previous.paused))) return Promise.resolve();
     if (quotaRequest) return quotaRequest;
     if (previous.paused === 'offline') store.set({ ...previous, paused: undefined });
     if (reason === 'online') quotaRetryAt = 0;
@@ -274,10 +281,12 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
         return;
       }
       const paused = quotaAuthCodes.has(value.code) ? 'auth'
-        : value.code === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported' : undefined;
+        : value.code === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported'
+          : quotaVersionCodes.has(value.code) ? 'version' : undefined;
       if (paused) {
         quotaRetryAt = 0;
-        store.set({ ...UNKNOWN_QUOTA, code: value.code, paused });
+        store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+          ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
         quotaFailures++;
@@ -597,7 +606,9 @@ function compactTokens(value) {
       return () => document.removeEventListener('keydown', dismiss);
     }, [open]);
     if (!remoteSession) return null;
-    const rows = quota.status === 'available' && quota.expiresAt > currentTime
+    const versionBlocked = quota.paused === 'version';
+    const clientUpdateRequired = quota.code === 'CLIENT_UPDATE_REQUIRED';
+    const rows = !versionBlocked && quota.status === 'available' && quota.expiresAt > currentTime
       ? quota.windows.filter(row => row.resetsAt === null || row.resetsAt > currentTime) : [];
     const fiveHour = rows.find(row => row.id === 'five_hour');
     const weekly = rows.find(row => row.id === 'seven_day');
@@ -606,8 +617,9 @@ function compactTokens(value) {
       return value > 0 && value < 0.1 ? '<0.1%' : `${Math.round(value * 10) / 10}%`;
     };
     const staleFiveHour = quota.status === 'available' && quota.windows.some(row => row.id === 'five_hour');
-    const reading = [fiveHour && `5h 剩余 ${remaining(fiveHour)}`, weekly && `周剩余 ${remaining(weekly)}`]
-      .filter(Boolean).join(' · ') || (staleFiveHour ? '5h 待刷新' : '5h 额度未知');
+    const reading = versionBlocked ? (clientUpdateRequired ? '客户端需更新' : '版本校验失败')
+      : [fiveHour && `5h 剩余 ${remaining(fiveHour)}`, weekly && `周剩余 ${remaining(weekly)}`]
+        .filter(Boolean).join(' · ') || (staleFiveHour ? '5h 待刷新' : '5h 额度未知');
     const resetTime = row => {
       if (row.resetsAt === null) return '';
       const minutes = Math.max(1, Math.ceil((row.resetsAt - currentTime) / 60_000));
@@ -647,9 +659,17 @@ function compactTokens(value) {
               borderRadius: 'inherit', background: 'var(--dsw-static-blue-450, #4e8cff)' } })),
           row.resetsAt !== null && React.createElement('div', { className: 'dsh-claude-quota-reset' }, resetTime(row)))),
         !rows.length && React.createElement('p', { style: { margin: '10px 0 0' } },
-          quota.refreshing ? '正在读取额度…' : quota.paused === 'auth' ? '请在服务器重新登录后刷新。'
+          quota.refreshing ? '正在读取额度…' : versionBlocked ? (clientUpdateRequired
+            ? '当前客户端低于服务端版本要求，请更新后重试。' : '服务端版本要求无效，请核对版本声明后重试。')
+            : quota.paused === 'auth' ? '请在服务器重新登录后刷新。'
             : quota.paused === 'unsupported' ? '当前服务器不支持额度查询。'
               : quota.paused === 'offline' ? '网络离线，恢复后自动刷新。' : '暂时无法获取有效额度。'),
+        versionBlocked && quota.minimumClientVersion && React.createElement('p', null,
+          `最低客户端版本：${quota.minimumClientVersion}`),
+        versionBlocked && React.createElement('a', {
+          href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
+          target: '_blank', rel: 'noopener noreferrer',
+        }, '查看更新说明'),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
           quota.refreshing ? '正在刷新…'
             : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(quota.observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`)), document.body));
@@ -826,6 +846,8 @@ const SETTINGS_CSS = `
     const selectedCount = state.modelsLoaded
       ? state.models.filter(model => state.selectedModelIds.includes(model.value)).length : 0;
     const authTone = state.authentication === 'logged-in' ? 'ok' : state.authentication === 'login-required' ? 'error' : 'warn';
+    const bridgeCompatibility = state.bridgeCompatibility;
+    const clientUpdateRequired = ['update-required', 'invalid'].includes(bridgeCompatibility?.status);
     return h('section', { className: 'dcb-page' },
       h('style', null, SETTINGS_CSS),
       h('header', { className: 'dcb-header' },
@@ -835,6 +857,13 @@ const SETTINGS_CSS = `
           chip('配置', state.configured ? '已配置' : '未配置', state.configured ? 'ok' : 'warn'),
           chip('连接', state.connected ? '已连接' : '未连接', state.connected ? 'ok' : state.configured ? 'error' : 'warn'),
           chip('官方登录（最近验证）', authentication, authTone))),
+      clientUpdateRequired && h('div', { role: 'alert', 'aria-label': '客户端版本要求',
+        className: 'dcb-notice', 'data-tone': 'error' },
+      h('p', null, bridgeCompatibility.message || (bridgeCompatibility.status === 'update-required'
+        ? '当前客户端低于服务端要求，请更新插件。' : '服务端版本要求无效，暂时无法确认兼容性。')),
+      bridgeCompatibility.minimumClientVersion && h('p', null, `最低客户端版本：${bridgeCompatibility.minimumClientVersion}`),
+      h('a', { href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
+        target: '_blank', rel: 'noopener noreferrer' }, '查看更新说明')),
       h('div', { className: 'dcb-card' },
         h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '服务器连接')),
         h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '服务器地址'), h('input', {
@@ -920,6 +949,11 @@ const SETTINGS_CSS = `
         `远程会话插件不可用：${state.remoteCapabilities.reason}`),
       h('details', { className: 'dcb-card dcb-details' },
         h('summary', null, '兼容性与诊断'),
+        bridgeCompatibility && h('p', null,
+          `客户端插件 ${bridgeCompatibility.clientVersion || '未知'}；服务端 ${bridgeCompatibility.serverVersion || '未声明'}`),
+        bridgeCompatibility?.status === 'legacy' && h('p', null, '服务端未声明版本要求，按旧版兼容模式连接。'),
+        bridgeCompatibility?.status === 'compatible' && h('p', null, bridgeCompatibility.message || '客户端符合服务端版本要求。'),
+        bridgeCompatibility?.status === 'unchecked' && h('p', null, '连接后核对服务端版本要求。'),
         state.desktopCompatibility && h('p', null,
           `DSH ${state.desktopCompatibility.version}；已验证支持：${(state.desktopCompatibility.verifiedVersions ?? []).join('、')}`),
         state.desktopCompatibility && !state.desktopCompatibility.verifiedVersions?.includes(state.desktopCompatibility.version)

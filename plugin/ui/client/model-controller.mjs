@@ -13,7 +13,12 @@ export function createModelController({ rpc, store, updateSettings, textError,
       await readStatus(true);
       await loadModelPreferences(true);
       updateSettings({ message: `连接成功，已读取 ${response.value.models?.length ?? 0} 个账号模型。` });
-    } catch (error) { updateSettings({ error: textError(error) }); }
+    } catch (error) {
+      updateSettings({ error: textError(error) });
+      // A failed handshake can carry a newer minimum-client requirement in
+      // the Host status even though no model catalog was returned.
+      await readStatus(true);
+    }
     finally { updateSettings({ busy: false }); }
   }
 

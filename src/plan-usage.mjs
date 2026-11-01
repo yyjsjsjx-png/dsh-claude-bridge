@@ -5,6 +5,7 @@ const label = value => typeof value === 'string' && value.trim().length > 0 && v
   && !/[\x00-\x1f\x7f]/.test(value)
 const scopes = new Set(['session', 'weekly', 'model-weekly', 'extra'])
 const unavailableCodes = new Set(['PLAN_LIMITS_UNAVAILABLE', 'SDK_QUOTA_UNAVAILABLE', 'QUOTA_READ_FAILED',
+  'CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID',
   'AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_METHOD_UNSUPPORTED', 'AUTHORIZATION_DENIED', 'ACCOUNT_ON_HOLD',
   'NETWORK', 'RATE_LIMITED', 'CANCELLED', 'CONNECTION_CHANGED'])
 const unavailable = code => ({ status: 'unavailable', code })

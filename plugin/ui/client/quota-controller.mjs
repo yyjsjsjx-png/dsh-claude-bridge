@@ -1,9 +1,10 @@
 /** Own plan-usage requests, pause states, backoff and connection revisions. */
 export function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthenticationRequired = () => {} }) {
-  const UNKNOWN_QUOTA = { status: 'unavailable', windows: [], refreshing: false, nextRefreshAt: 0 };
+  const UNKNOWN_QUOTA = { status: 'unavailable', windows: [], refreshing: false, nextRefreshAt: 0, minimumClientVersion: null };
   const store = createStore(UNKNOWN_QUOTA);
   const quotaAuthCodes = new Set(['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_METHOD_UNSUPPORTED',
     'AUTHORIZATION_DENIED', 'ACCOUNT_ON_HOLD']);
+  const quotaVersionCodes = new Set(['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID']);
   let disposed = false;
   let quotaRequest;
   let quotaGeneration = 0;
@@ -17,14 +18,14 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
     const previous = store.getSnapshot();
     const manual = reason === 'manual';
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      if (!['auth', 'unsupported'].includes(previous.paused)
+      if (!['auth', 'unsupported', 'version'].includes(previous.paused)
         && (previous.paused !== 'offline' || previous.nextRefreshAt)) {
         store.set({ ...previous, paused: 'offline', nextRefreshAt: 0 });
       }
       return Promise.resolve();
     }
     if (!manual && (typeof document !== 'undefined' && document.hidden
-      || ['auth', 'unsupported'].includes(previous.paused))) return Promise.resolve();
+      || ['auth', 'unsupported', 'version'].includes(previous.paused))) return Promise.resolve();
     if (quotaRequest) return quotaRequest;
     if (previous.paused === 'offline') store.set({ ...previous, paused: undefined });
     if (reason === 'online') quotaRetryAt = 0;
@@ -58,10 +59,12 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
         return;
       }
       const paused = quotaAuthCodes.has(value.code) ? 'auth'
-        : value.code === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported' : undefined;
+        : value.code === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported'
+          : quotaVersionCodes.has(value.code) ? 'version' : undefined;
       if (paused) {
         quotaRetryAt = 0;
-        store.set({ ...UNKNOWN_QUOTA, code: value.code, paused });
+        store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+          ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
         quotaFailures++;

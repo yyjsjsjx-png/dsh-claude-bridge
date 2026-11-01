@@ -210,7 +210,9 @@ function compactTokens(value) {
       return () => document.removeEventListener('keydown', dismiss);
     }, [open]);
     if (!remoteSession) return null;
-    const rows = quota.status === 'available' && quota.expiresAt > currentTime
+    const versionBlocked = quota.paused === 'version';
+    const clientUpdateRequired = quota.code === 'CLIENT_UPDATE_REQUIRED';
+    const rows = !versionBlocked && quota.status === 'available' && quota.expiresAt > currentTime
       ? quota.windows.filter(row => row.resetsAt === null || row.resetsAt > currentTime) : [];
     const fiveHour = rows.find(row => row.id === 'five_hour');
     const weekly = rows.find(row => row.id === 'seven_day');
@@ -219,8 +221,9 @@ function compactTokens(value) {
       return value > 0 && value < 0.1 ? '<0.1%' : `${Math.round(value * 10) / 10}%`;
     };
     const staleFiveHour = quota.status === 'available' && quota.windows.some(row => row.id === 'five_hour');
-    const reading = [fiveHour && `5h 剩余 ${remaining(fiveHour)}`, weekly && `周剩余 ${remaining(weekly)}`]
-      .filter(Boolean).join(' · ') || (staleFiveHour ? '5h 待刷新' : '5h 额度未知');
+    const reading = versionBlocked ? (clientUpdateRequired ? '客户端需更新' : '版本校验失败')
+      : [fiveHour && `5h 剩余 ${remaining(fiveHour)}`, weekly && `周剩余 ${remaining(weekly)}`]
+        .filter(Boolean).join(' · ') || (staleFiveHour ? '5h 待刷新' : '5h 额度未知');
     const resetTime = row => {
       if (row.resetsAt === null) return '';
       const minutes = Math.max(1, Math.ceil((row.resetsAt - currentTime) / 60_000));
@@ -260,9 +263,17 @@ function compactTokens(value) {
               borderRadius: 'inherit', background: 'var(--dsw-static-blue-450, #4e8cff)' } })),
           row.resetsAt !== null && React.createElement('div', { className: 'dsh-claude-quota-reset' }, resetTime(row)))),
         !rows.length && React.createElement('p', { style: { margin: '10px 0 0' } },
-          quota.refreshing ? '正在读取额度…' : quota.paused === 'auth' ? '请在服务器重新登录后刷新。'
+          quota.refreshing ? '正在读取额度…' : versionBlocked ? (clientUpdateRequired
+            ? '当前客户端低于服务端版本要求，请更新后重试。' : '服务端版本要求无效，请核对版本声明后重试。')
+            : quota.paused === 'auth' ? '请在服务器重新登录后刷新。'
             : quota.paused === 'unsupported' ? '当前服务器不支持额度查询。'
               : quota.paused === 'offline' ? '网络离线，恢复后自动刷新。' : '暂时无法获取有效额度。'),
+        versionBlocked && quota.minimumClientVersion && React.createElement('p', null,
+          `最低客户端版本：${quota.minimumClientVersion}`),
+        versionBlocked && React.createElement('a', {
+          href: 'https://github.com/yyjsjsjx-png/dsh-claude-bridge/blob/main/docs/updating.md',
+          target: '_blank', rel: 'noopener noreferrer',
+        }, '查看更新说明'),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
           quota.refreshing ? '正在刷新…'
             : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(quota.observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`)), document.body));
