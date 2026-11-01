@@ -61,3 +61,67 @@ test('复用原生用量与轮末组件，仅远程映射数值，卸载和原�
   assert.ok([...listeners.values()].every(list => list.size === 0))
   removeNative()
 })
+
+test('速度复用原生统计组件，运行中采样即更新，旧会话缺数据不回退旧TPS', () => {
+  const entries = [], listeners = new Map()
+  const Native = () => {}
+  const inject = () => ({ hooks: { performanceUsage: 'kept' } })
+  entries.push({ options: { id: 'activity', order: 0 }, component: Native, locale: 'chat', inject })
+  const ctx = { slots: {
+    entries: key => key === 'conversation.composer.dock' ? entries : [],
+    subscribe(key, callback) { listeners.set(key, callback); return () => listeners.delete(key) },
+    register(options, component) {
+      const entry = { options, component, inject: options.inject, locale: options.locale }
+      entries.push(entry); listeners.get(options.name)?.()
+      return () => { entries.splice(entries.indexOf(entry), 1); listeners.get(options.name)?.() }
+    },
+  } }
+  const React = { createElement: (type, props, ...children) => ({ type, props, children }) }
+  const dispose = createUsageProjectionBridge({ React })(ctx)
+  const wrapper = entries.find(entry => entry.component !== Native)
+  assert.equal(wrapper.inject, inject)
+  const native = { turns: 2, steps: 21, llmMs: 136685, toolMs: 189731,
+    ttftMs: 7104, ttftSteps: 1, decodeTokens: 689, decodeMs: 362 }
+  let remote = true, timing = null
+  const props = { t: key => key, useProjection(key, selector) {
+    const value = key === 'claudeBridge' ? remote ? {} : null
+      : key === 'claudeBridgeResponseStats' ? timing : native
+    return typeof selector === 'function' ? selector(value) : value
+  } }
+  const empty = wrapper.component(props)
+  const emptyView = empty.children[0]
+  const zero = emptyView.props.useProjection('sessionStats')
+  assert.deepEqual(zero, { turns: 2, steps: 21, llmMs: native.llmMs, toolMs: native.toolMs,
+    ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 })
+  assert.match(empty.children[1].children[0], /计时样本不足/)
+  timing = { ttftMs: 5000, ttftSteps: 2, decodeTokens: 1200, decodeMs: 6000,
+    responseCount: 2, tpsSamples: 2 }
+  const active = wrapper.component(props).children[0]
+  assert.equal(active.props.useProjection('sessionStats').ttftMs, 5000)
+  assert.equal(active.props.useProjection('sessionStats', state => state.decodeTokens), 1200)
+  assert.match(active.props.t('stats.dialog.ttft'), /首 Token 平均.*TTFT.*估算.*2 个样本/)
+  assert.match(active.props.t('stats.dialog.speed'), /接收速度.*2 个样本/)
+  const explanation = wrapper.component(props).props.title
+  assert.match(explanation, /SDK 首帧时长.*远端同机.*首个有效输出.*平均/)
+  assert.match(explanation, /非空正文、思考和工具参数 JSON 增量.*排除开始帧、心跳、签名和工具名/)
+  assert.match(explanation, /SDK 缓冲与调度误差.*非精确上游计时/)
+  assert.match(explanation, /同一完整响应的输出 Token.*原始 SDK message_start.*最后有效内容帧/)
+  assert.match(explanation, /汇总后计算接收速度.*本机观察窗口.*思考阶段和缓冲影响.*不代表上游生成测速/)
+  // Each metric reports its own coverage; an absent channel cannot revive native values.
+  timing = { ttftMs: 2500, ttftSteps: 1, responseCount: 3 }
+  const ttftOnly = wrapper.component(props)
+  assert.equal(ttftOnly.children[0].props.useProjection('sessionStats').decodeTokens, 0)
+  assert.match(ttftOnly.children[0].props.t('stats.dialog.ttft'), /1 个样本/)
+  assert.match(ttftOnly.children[0].props.t('stats.dialog.speed'), /0 个样本/)
+  assert.match(ttftOnly.props.title, /1\/3.*0\/3/)
+  assert.equal(ttftOnly.children[1].children[0], '部分计时')
+  timing = { decodeTokens: 1200, decodeMs: 6000, tpsSamples: 2, responseCount: 3 }
+  const tpsOnly = wrapper.component(props)
+  assert.equal(tpsOnly.children[0].props.useProjection('sessionStats').ttftMs, 0)
+  assert.equal(tpsOnly.children[0].props.useProjection('sessionStats').ttftSteps, 0)
+  assert.match(tpsOnly.props.title, /0\/3.*2\/3/)
+  remote = false
+  assert.equal(wrapper.component(props).props, props)
+  dispose()
+  assert.equal(entries.length, 1)
+})
