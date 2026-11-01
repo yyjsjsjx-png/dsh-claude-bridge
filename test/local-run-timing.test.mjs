@@ -43,4 +43,5 @@ test('额度共享缓存区分新鲜度与保留期，不改变读数时间或�
   assert.equal(view.sampling.fresh, false); assert.equal(view.sampling.error.code, 'RATE_LIMITED')
   assert.equal(view.windows.length, 1); assert.equal(view.windows[0].usedPercent, 12.5)
   assert.equal(retainedPlanUsage({ snapshot }, observedAt + 1_800_001).status, 'unavailable')
+  assert.equal(retainedPlanUsage({ status: 'unavailable', code: 'OBSERVABILITY_CHANNEL_CLOSED' }).sampling.error.code, 'OBSERVABILITY_CHANNEL_CLOSED')
 })

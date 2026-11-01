@@ -15,6 +15,7 @@ import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
 import { createFirstOutputObserver } from './first-output.mjs'
 import { createRunObservations } from './run-observations.mjs'
 import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
+import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { createPromptInput } from './prompt-input.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
@@ -488,7 +489,11 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         || (params.refresh !== undefined && typeof params.refresh !== 'boolean')) {
         throw new WorkerError('INVALID_REQUEST', '额度请求参数无效')
       }
-      if (observability) return await observability.quota(params.refresh ? 'manual' : 'activity')
+      if (observability) {
+        const view = await observability.quota(params.refresh ? 'manual' : 'activity')
+        // Keep the original flat snapshot for older Hosts; sampling is additive.
+        return { ...sanitizePlanUsage(view?.snapshot), ...view }
+      }
       await requireAuth(context.signal, params.refresh === true)
       return await planUsageReader.read({ signal: context.signal })
     } catch (error) {

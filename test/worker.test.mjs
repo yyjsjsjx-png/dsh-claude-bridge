@@ -8,6 +8,7 @@ import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
 
 import { createAuthReader } from '../remote/auth.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
+import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
@@ -466,8 +467,13 @@ test('共享观测能力显式声明，planUsage 只委托账号额度且不启�
   const initialized = await f.worker.handlers.initialize({ protocolVersion: 1 })
   assert.equal(initialized.capabilities.observability, true)
   const authReads = f.state.authReads
-  assert.deepEqual(await f.worker.handlers.planUsage({}, f.context), snapshot)
-  assert.deepEqual(await f.worker.handlers.planUsage({ refresh: true }, f.context), snapshot)
+  assert.deepEqual(await f.worker.handlers.planUsage({}, f.context), { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', ...snapshot })
+  const observedAt = Date.now()
+  snapshot.snapshot = { status: 'available', source: 'sdk-plan-usage', observedAt, expiresAt: observedAt + 120_000,
+    windows: [{ id: 'seven_day', name: '周额度', scope: 'weekly', usedPercent: 12, resetsAt: observedAt + 86_400_000 }] }
+  const shared = await f.worker.handlers.planUsage({ refresh: true }, f.context)
+  assert.deepEqual(sanitizePlanUsage(shared), snapshot.snapshot)
+  assert.deepEqual(shared.snapshot, snapshot.snapshot)
   assert.deepEqual(reasons, ['activity', 'manual'])
   assert.equal(f.state.authReads, authReads)
   assert.equal(f.state.queries.length, 0)

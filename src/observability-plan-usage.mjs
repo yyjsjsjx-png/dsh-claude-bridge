@@ -4,10 +4,11 @@ const retainMs = 30 * 60_000
 /** Freshness differs from retention. Never move the real observation timestamp. */
 export function retainedPlanUsage(view, now = Date.now()) {
   const raw = view?.snapshot
+  const failure = view?.error ?? (view?.status === 'unavailable' ? { code: view.code, observedAt: now } : null)
   const sampling = { fresh: view?.fresh === true, lastObservedAt: raw?.observedAt ?? null,
     nextAllowedAt: Number.isSafeInteger(view?.nextAllowedAt) ? view.nextAllowedAt : 0,
-    error: view?.error && /^[A-Z][A-Z0-9_]{0,79}$/.test(view.error.code)
-      ? { code: view.error.code, observedAt: view.error.observedAt } : null,
+    error: failure && /^[A-Z][A-Z0-9_]{0,79}$/.test(failure.code)
+      ? { code: failure.code, observedAt: failure.observedAt } : null,
     inFlight: view?.inFlight === true }
   sampling.active = view?.active === true
   if (!raw || !Number.isSafeInteger(raw.observedAt) || raw.observedAt > now + 30_000 || now >= raw.observedAt + retainMs) {
