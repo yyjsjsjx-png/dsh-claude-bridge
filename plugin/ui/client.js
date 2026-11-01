@@ -1047,6 +1047,12 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
             || !context.matches.some(({ event }) => event.type === 'assistant/message'
               && (event.data.message.source?.provider === 'claude-sdk-remote'
                 || event.data.message.id?.startsWith('claude-sdk:')))) return result;
+          const process = result.location?.kind === 'step' ? result.location.turn.data.get('turn-process') : undefined;
+          // The native answer boundary also controls whole-turn disclosure. Moving
+          // its answer before that boundary hides both the reply and its toggle.
+          if (process?.answerStep === result.data.step && Number.isFinite(process.answerAnchorSeq)) {
+            return result.anchorSeq >= process.answerAnchorSeq ? result : { ...result, anchorSeq: process.answerAnchorSeq };
+          }
           const start = context.start?.event.type === 'step/start' ? context.start.event
             : result.location?.kind === 'step' ? result.location.step.start : undefined;
           const first = context.matches.find(({ event }) => event.type === 'assistant/message');

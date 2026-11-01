@@ -96,6 +96,42 @@ test('实际 rc5 helper：流式 thinking 作为 reasoning 展示并持久记录
     && frame.frame.chunk.type === 'reasoning-delta' && frame.frame.chunk.text === '分析样本'), true)
 })
 
+test('实际 rc5 helper：thinking 分块的完整消息不结算流，同 ID 正文增量在最终消息前持续送达', { skip: !available }, async () => {
+  const { records, frames, projection } = await fixture()
+  const id = 'same-api-thinking-text'
+  const thinking = '合成分析片段'
+  const parts = ['合成正文第一段', '合成正文第二段']
+  const stream = event => projection.accept({ type: 'stream_event', event })
+  await stream({ type: 'message_start', message: { id } })
+  await stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } })
+  await stream({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking } })
+  await stream({ type: 'content_block_stop', index: 0 })
+  await projection.accept({ type: 'assistant', message: { id, content: [{ type: 'thinking', thinking }] } })
+  assert.equal(records.length, 0)
+  await stream({ type: 'content_block_start', index: 1, content_block: { type: 'text' } })
+  const textFrames = () => frames.filter(value => value.frame.type === 'chunk'
+    && value.frame.chunk.type === 'text-delta').map(value => value.frame.chunk.text)
+  for (const [index, text] of parts.entries()) {
+    await stream({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text } })
+    // Assert delivery before either the full text message or query result exists.
+    assert.deepEqual(textFrames(), parts.slice(0, index + 1))
+    assert.equal(records.length, 0)
+  }
+  await stream({ type: 'content_block_stop', index: 1 })
+  await projection.accept({ type: 'assistant', message: { id, content: [
+    { type: 'thinking', thinking }, { type: 'text', text: parts.join('') },
+  ] } })
+  await stream({ type: 'message_delta', usage: { output_tokens: 8 } })
+  await stream({ type: 'message_stop' })
+  await projection.accept({ type: 'result', usage: { output_tokens: 8 } })
+  assert.deepEqual(textFrames(), parts)
+  assert.equal(frames.filter(value => value.frame.type === 'start').length, 1)
+  const messages = records.filter(record => record.type === 'assistant/message')
+  assert.equal(messages.length, 1)
+  assert.deepEqual(messages[0].data.message.content,
+    [{ type: 'reasoning', text: thinking }, { type: 'text', text: parts.join('') }])
+})
+
 test('实际 rc5 helper：partial 流省略 thinking 时保留完整消息中的 thinking', { skip: !available }, async () => {
   const { records, projection } = await fixture()
   await projection.accept({ type: 'stream_event', event: { type: 'message_start', message: { id: 'thinking-partial' } } })
