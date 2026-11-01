@@ -623,6 +623,7 @@ export async function createBridgeServer({
 }
 
 async function main() {
+  if (typeof process.getuid !== 'function' || process.getuid() <= 0) throw new Error('远端服务必须由非 root 用户运行')
   const port = process.env.BRIDGE_PORT === undefined ? undefined : Number(process.env.BRIDGE_PORT)
   const remoteRoot = process.env.BRIDGE_REMOTE_ROOT ?? posix.join(userInfo().homedir, 'dsh-claude-bridge')
   const observability = createObservabilityHost({ directory: posix.join(remoteRoot, 'observability'),
