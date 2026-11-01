@@ -3,7 +3,7 @@ import { normalizeObservedQuota, quotaFailureCode } from '../src/observability-s
 
 /** One account-wide sampler, gated by actual active runs. No SDK dependency. */
 export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, onDiagnostic = () => {},
-  now = Date.now, cooldownMs = 300_000, freshnessMs = 120_000, timeoutMs = 15_000 } = {}) {
+  now = Date.now, cooldownMs = 120_000, freshnessMs = 120_000, timeoutMs = 15_000 } = {}) {
   const active = new Set(), skipped = Symbol('inactive')
   let snapshot = null, error = null, nextAllowedAt = 0, inFlight, pollTimer, closed = false, failures = 0
   const report = (code, gap = false) => {
