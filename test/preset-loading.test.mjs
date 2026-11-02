@@ -85,7 +85,7 @@ test('自有完整预设保留 v024 声明顺序和默认配置，仅显式关�
   assert.equal(row('tool-plugin-market').disabled, true);
   assert.deepEqual(row('delegation').isolate, { workflowEngine: true });
   const spawn = row('delegation').config.find(item => item.id === 'tool-subagent');
-  assert.deepEqual(spawn.config, { provider: 'spawn', toolName: 'subagent', modelSelectionSettings: false });
+  assert.deepEqual(spawn.config, { provider: 'spawn', toolName: 'subagent', modelSelectionSettings: true });
   assert.equal(row('delegation').config.find(item => item.id === 'tool-subagent-fork').disabled, true);
   const next = createOwnedRemoteClaudePreset();
   assert.notEqual(row('tool-pwsh').disabled, next.plugins.find(item => item.id === 'tool-pwsh').disabled);
@@ -93,15 +93,20 @@ test('自有完整预设保留 v024 声明顺序和默认配置，仅显式关�
     .find(item => item.id === 'tool-subagent').config);
 });
 
-test('基础或降级预设不向界面宣称未开启的 Workflow 和压缩命令已转换', () => {
+test('基础或降级预设不向界面宣称未开启的 Workflow、子代理和压缩命令已转换', () => {
   const status = remotePresetFeatures({ mode: 'basic', disabledComponents: [
     { name: 'claude-sdk-compact', status: 'disabled', reason: '缺少命令服务' },
   ] });
   assert.deepEqual(status.convertedFeatures.map(item => item.name), ['身份提示']);
   assert.ok(status.disabledFeatures.some(item => item.name === '/compact'));
   assert.ok(status.disabledFeatures.some(item => item.name === '子代理与后台任务'));
+  assert.ok(status.disabledFeatures.some(item => item.name === '子任务独立选型'));
   assert.ok(status.disabledFeatures.some(item => item.name === '自动时间与时区上下文'
     && item.status === 'disabled' && item.reason.includes('浏览器时区')));
+  assert.ok(remotePresetFeatures({ mode: 'full', disabledComponents: [] }).convertedFeatures
+    .some(item => item.name === '子任务独立选型'));
+  assert.ok(!remotePresetFeatures({ mode: 'degraded', disabledComponents: [{ name: 'tool-subagent' }] }).convertedFeatures
+    .some(item => item.name === '子任务独立选型'));
 });
 
 test('可选组件导入、激活或依赖失败只关闭该组件，先等待清理', async () => {

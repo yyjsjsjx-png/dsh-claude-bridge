@@ -19,6 +19,7 @@ import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { createPromptInput } from './prompt-input.mjs'
 import { createToolCalls } from './tool-calls.mjs'
 import { createRunSettlement } from './run-settlement.mjs'
+import { readSessionTitleMetadata } from './session-title-metadata.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
 const defaultBridgeRelease = { serverVersion: bridgeManifest.version,
@@ -1215,6 +1216,12 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       if (diagnosticLog) await diagnosticLog.flush().catch(() => {
         try { context.peer.notify('diagnostic', { event: 'diagnostics.failed', runId, code: 'DIAGNOSTIC_WRITE_FAILED' }) } catch {}
       })
+    }
+    // Optional metadata is read once after durable settlement and lock release.
+    // It belongs only to this RPC reply, never to the execution/settle journal.
+    if (finalOutcome?.status === 'completed' && params.action !== 'compact' && run?.recoveryCwd) {
+      const sessionTitle = await readSessionTitleMetadata({ sdk, sessionId, cwd: run.recoveryCwd, signal: context.signal })
+      if (sessionTitle !== undefined && !context.signal?.aborted) return { ...finalOutcome, sessionTitle }
     }
     return finalOutcome
   }

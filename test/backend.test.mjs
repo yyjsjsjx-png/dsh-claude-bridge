@@ -815,6 +815,26 @@ test('批次准备拒绝变化配置时恢复已认领消息，防止指令丢�
   await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'QUERY_CONFIGURATION_CHANGED' })
 })
 
+test('成功query的SDK标题在主checkpoint后投影，旧服务无字段与投影失败均不改变主结果', async t => {
+  for (const title of [undefined, 'SDK 原生标题']) await t.test(title === undefined ? 'old-server' : 'optional-failure', async t => {
+    const f = await fixture(t, async () => ({ peer: { async request(method) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+      assert.equal(method, 'query')
+      return { status: 'completed', ...(title === undefined ? {} : { sessionTitle: title }) }
+    } }, async close() {} }))
+    const sequence = []
+    f.ctx.sessions.flush = async () => { sequence.push('checkpoint'); return true }
+    f.backend.onSessionTitle = (session, value) => {
+      sequence.push('title')
+      assert.equal(session, f.agent.session); assert.equal(value, title)
+      throw new Error('synthetic optional title failure')
+    }
+    assert.deepEqual(await f.backend.runStep(f.agent, f.decision), { kind: 'completed' })
+    if (title === undefined) assert.equal(sequence.includes('title'), false)
+    else assert.deepEqual(sequence.slice(-2), ['checkpoint', 'title'])
+  })
+})
+
 async function fixture(t, makeTransport, execute, hostCompatibility) {
   const parent = resolve(tmpdir())
   const directory = await mkdtemp(join(parent, 'dsh-bridge-backend-'))

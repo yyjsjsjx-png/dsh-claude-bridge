@@ -33,6 +33,8 @@ var __esDecorate = (this && this.__esDecorate) || function (ctor, descriptorIn, 
     done = true;
 };
 /** DSH rc.5 Host service and catalog facade for the remote SDK engine. */
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { TypertRemoteService, Remote, RemoteError, principalOf, LlmAdapter, schema, resolveDshHome, credentialKey, renderPrompt, renderContextSections, joinContextSections, assembleContextFor, createAssistantMessage, createToolResultMessage, createSystemMessage, AssistantStreamAccumulator, BlockAssembler, } from './compat/runtime.mjs';
 import { BridgeBackend } from '../src/backend.mjs';
 import { CLAUDE_PRESET, CLAUDE_PROVIDER } from './policy.mjs';
@@ -45,9 +47,14 @@ import { createSessionStatusProjection } from '../src/session-status.mjs';
 import { createRunProgressProjection } from '../src/run-progress.mjs';
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
+import { installRemoteNativeTitles } from './remote-native-titles.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
+const nativeTitle = await Promise.resolve().then(() => {
+    const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'));
+    return import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session-title')).href);
+}).catch(() => undefined);
 const hostCompatibility = await assertDshCompatibility();
 /** Catalog only: all model calls belong to ClaudeLoopAgent, never LlmRuntime. */
 export const ClaudeCatalogAdapter = createClaudeCatalogAdapter(LlmAdapter);
@@ -108,6 +115,19 @@ let ClaudeBridgeService = (() => {
                 AssistantStreamAccumulator, BlockAssembler,
             };
             this.backend = new BridgeBackend(ctx, config, { helpers, hostCompatibility });
+            ctx.inject(['sessionTitle'], titleCtx => {
+                titleCtx.effect(() => {
+                    const titles = installRemoteNativeTitles(titleCtx, { normalizeSessionTitle: nativeTitle?.normalizeSessionTitle,
+                        report: code => this.backend.diagnostics.event('title.sync', { code }) });
+                    const previous = this.backend.onSessionTitle;
+                    this.backend.onSessionTitle = titles.sync;
+                    return () => {
+                        if (this.backend.onSessionTitle === titles.sync)
+                            this.backend.onSessionTitle = previous;
+                        titles.dispose();
+                    };
+                }, 'SDK 原生标题展示');
+            });
             ctx.sessionProjections.register(createSessionStatusProjection(z));
             ctx.sessionProjections.register(createRunProgressProjection(z));
             ctx.sessionProjections.register(createResponseUsageProjection(z));

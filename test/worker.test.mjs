@@ -10,10 +10,96 @@ import { createAuthReader } from '../remote/auth.mjs'
 import { createRunStore } from '../remote/history.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
+import { readSessionTitleMetadata } from '../remote/session-title-metadata.mjs'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
 const OTHER_DEVICE = 'a4270ab7-90c7-440c-8fdc-5601b47dd29b'
+
+test('原生标题元数据只在成功结算释放锁后读取一次，不生成标题或写入运行回执', async t => {
+  let held = false, reads = 0
+  const f = await fixture(t, async function* ({ prompt }, state) {
+    await prompt.next(); state.exists = true
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  }, { acquireLock: async () => {
+    held = true
+    return { get held() { return held }, lost: new Promise(() => {}), async release() { held = false } }
+  } })
+  f.sdk.getSessionInfo = async (sessionId, { dir }) => {
+    reads++
+    assert.equal(sessionId, SESSION)
+    assert.equal(dir, f.state.queries[0].options.cwd)
+    assert.equal(held, false)
+    assert.deepEqual(await f.worker.handlers.settle({ runId: f.params.runId }), { status: 'completed' })
+    const saved = JSON.parse(await readFile(join(dir, 'bridge-runs.json'), 'utf8'))
+    assert.equal(saved.runs[f.params.runId].status, 'completed')
+    assert.equal(Object.hasOwn(saved.runs[f.params.runId], 'sessionTitle'), false)
+    return { sessionId, customTitle: 'SDK 原生标题', get summary() { assert.fail('不能读取摘要作为标题') } }
+  }
+  const result = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(result.sessionTitle, 'SDK 原生标题')
+  assert.equal(result.status, 'completed')
+  assert.equal(reads, 1)
+  assert.equal(f.state.queries.length, 1)
+  assert.equal(f.state.catalogQueries.length, 1, '仅保留主查询原有的冷目录验证，不新增标题 Query')
+  assert.equal(f.state.authReads, 1)
+  assert.equal(Object.hasOwn(f.state.queries[0].options, 'title'), false)
+  assert.equal(f.state.notifications.some(row => JSON.stringify(row).includes('SDK 原生标题')), false)
+})
+
+test('原生标题元数据缺失、非法或读取失败不改变成功结果，也不从summary兜底', async t => {
+  for (const info of [undefined, { sessionId: SESSION, summary: '不能冒充标题' },
+    { sessionId: SESSION, customTitle: '   ' }, { sessionId: SESSION, customTitle: 'x'.repeat(201) },
+    { sessionId: SESSION, customTitle: '标题\n正文' }, { sessionId: SESSION, customTitle: '隐藏\u202e文本' },
+    { sessionId: DEVICE, customTitle: '其他会话标题' }, new Error('PRIVATE_METADATA_ERROR')]) {
+    const f = await fixture(t, async function* () { yield { type: 'result', subtype: 'success', session_id: SESSION } })
+    let reads = 0
+    f.sdk.getSessionInfo = async () => { reads++; if (info instanceof Error) throw info; return info }
+    assert.deepEqual(await f.worker.handlers.query(f.params, f.context), { sessionId: SESSION, status: 'completed' })
+    assert.equal(reads, 1)
+  }
+})
+
+test('原生标题元数据慢读可取消且不阻塞settle，超时不重读或晚补标题', async t => {
+  let started, finish
+  const reading = new Promise(resolve => { started = resolve })
+  const late = new Promise(resolve => { finish = resolve })
+  const cancel = new AbortController()
+  const f = await fixture(t, async function* () { yield { type: 'result', subtype: 'success', session_id: SESSION } })
+  f.sdk.getSessionInfo = () => { started(); return late }
+  const pending = f.worker.handlers.query(f.params, { ...f.context, signal: cancel.signal })
+  await reading
+  assert.deepEqual(await f.worker.handlers.settle({ runId: f.params.runId }), { status: 'completed' })
+  cancel.abort()
+  assert.deepEqual(await pending, { sessionId: SESSION, status: 'completed' })
+  finish({ sessionId: SESSION, customTitle: '不能晚补的标题' })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let calls = 0
+  const timed = readSessionTitleMetadata({ sdk: { getSessionInfo() { calls++; return new Promise(() => {}) } },
+    sessionId: SESSION, cwd: '/synthetic' })
+  await Promise.resolve()
+  t.mock.timers.tick(1000)
+  assert.equal(await timed, undefined)
+  assert.equal(calls, 1)
+})
+
+test('原生标题元数据不在失败结果或主动压缩后额外读取', async t => {
+  const failed = await fixture(t, async function* () { yield { type: 'result', subtype: 'error_during_execution', is_error: true } })
+  failed.sdk.getSessionInfo = () => assert.fail('失败结果不能取标题')
+  assert.equal((await failed.worker.handlers.query(failed.params, failed.context)).status, 'failed')
+  const f = await fixture(t, async function* ({ prompt }, state) {
+    await prompt.next(); state.exists = true
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  await f.worker.handlers.query(f.params, f.context)
+  f.state.commands = [{ name: 'compact' }]
+  let reads = 0
+  f.sdk.getSessionInfo = async sessionId => { reads++; return { sessionId, customTitle: '不得附加的标题' } }
+  const compacted = await f.worker.handlers.query(compactRequest(f.params, 'compact-title'), f.context)
+  assert.equal(compacted.status, 'completed')
+  assert.equal(Object.hasOwn(compacted, 'sessionTitle'), false)
+  assert.equal(reads, 1, '压缩只保留既有 SDK 会话存在性门禁，不新增标题读取')
+})
 
 test('远端在首有效思考帧附数值TTFT估算，保留官方头字段并隔离子代理', async t => {
   let clock = 0

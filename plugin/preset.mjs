@@ -5,7 +5,6 @@ import { createLegacyV024RemoteClaudePreset } from './presets/legacy-v024.mjs';
 export const REMOTE_PRESET_LIMITATIONS = Object.freeze([
   Object.freeze({ name: '计划模式', status: 'disabled', reason: '暂不提供计划模式。' }),
   Object.freeze({ name: 'subagent_fork', status: 'disabled', reason: '不支持分叉子任务。' }),
-  Object.freeze({ name: '子任务独立选型', status: 'disabled', reason: '子任务默认沿用父会话模型。' }),
   Object.freeze({ name: 'DSH 原生压缩', status: 'disabled', reason: '远程 Agent SDK 负责自身会话的上下文和压缩。' }),
   Object.freeze({ name: '会话分叉', status: 'disabled', reason: '请通过新建会话开始其他任务。' }),
   Object.freeze({ name: '自动时间与时区上下文', status: 'disabled', reason: '远程预设不自动发送当前时间、浏览器时区或距上条消息的时间。' }),
@@ -14,6 +13,7 @@ export const REMOTE_PRESET_CONVERSIONS = Object.freeze([
   Object.freeze({ name: '/compact', status: 'converted', reason: '由远程 Agent SDK 压缩上下文，保留对话历史。' }),
   Object.freeze({ name: '身份提示', status: 'converted', reason: '云端会话使用固定的 Claude 身份提示。' }),
   Object.freeze({ name: 'Workflow 深度限制', status: 'converted', reason: '沿用 DSH 子任务深度上限。' }),
+  Object.freeze({ name: '子任务独立选型', status: 'converted', reason: '默认继承父会话，可显式选择同一 Claude 账号模型与推理强度。' }),
 ]);
 const REMOTE_PERSONA_PREFIX = 'You are a coding agent powered by Claude through the remote Claude Agent SDK.';
 
@@ -37,6 +37,9 @@ export function remotePresetFeatures(report) {
     unavailable.set('Workflow 深度限制', '当前远程预设未开启 Workflow。');
   }
   if (disabled.has('claude-sdk-compact')) unavailable.set('/compact', '压缩命令组件未就绪。');
+  if (report.mode === 'basic' || disabled.has('tool-subagent')) {
+    unavailable.set('子任务独立选型', '当前远程预设未开启子代理。');
+  }
   return {
     disabledFeatures: [...REMOTE_PRESET_LIMITATIONS.map(item => ({ ...item })), ...report.disabledComponents,
       ...[...unavailable].map(([name, reason]) => ({ name, status: 'disabled', reason })),
@@ -75,7 +78,7 @@ export function containRemotePreset(preset, { baseUrl, mode = 'full', reasons = 
 /**
  * Build from the verified shipped DSH standard preset, retaining its order.
  * Plan mode cannot safely transition inside an SDK query; DSH transcript forks
- * are not SDK forks. Keep fresh child delegation but inherit the parent model.
+ * are not SDK forks. Fresh children inherit the parent unless explicitly selected.
  */
 export function createRemoteClaudePreset(standard) {
   if (standard === null || typeof standard !== 'object' || Array.isArray(standard)
@@ -124,7 +127,7 @@ export function createRemoteClaudePreset(standard) {
         config: entry.config.map((child) => {
           if (child.id === 'tool-subagent-fork') return { ...child, disabled: true };
           if (child.id === 'tool-subagent') {
-            return { ...child, config: { ...child.config, modelSelectionSettings: false } };
+            return { ...child, config: { ...child.config, modelSelectionSettings: true } };
           }
           return { ...child };
         }),
