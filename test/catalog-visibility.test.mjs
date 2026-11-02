@@ -42,7 +42,8 @@ test('实际 rc5 服务：同步 RPC 解包 resolveAgent 结果并保留解析�
   const { ClaudeBridgeService } = await import('../plugin/index.mjs');
   const agent = { id: 's', session: { header: { agentPreset: 'claude-sdk-remote' } } };
   let resolved = { agent };
-  const service = { assertOwner() {}, ctx: { get: () => ({ resolveAgent: async () => resolved }) },
+  const service = { assertOwner() {}, ctx: { agents: { get: () => undefined }, sessions: { get: () => undefined },
+    get: () => ({ resolveAgent: async () => resolved }) },
     backend: { async syncSession(value) { assert.equal(value, agent); return { status: 'ready', added: 0 }; } } };
   assert.deepEqual(await ClaudeBridgeService.prototype.syncSession.call(service, 's'), { status: 'ready', added: 0 });
   const missing = new Error('session unavailable');
