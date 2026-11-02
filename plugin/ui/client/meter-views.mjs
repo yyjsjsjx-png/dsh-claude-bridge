@@ -181,12 +181,13 @@ function compactTokens(value) {
 
   /** Read-only child label: lastUsed is folded from request/header, while next
    * may still be an unsent selection. Catalog names never authorize execution. */
-  function ChildModelBadge({ sessionId, isSubagent = false, useBridgeStatus, useModelSelection, useSessionList, useModelDirectory }) {
-    const bridge = useBridgeStatus(value => value);
-    const selected = useModelSelection(value => value)?.lastUsed;
-    const summary = useSessionList(value => value)?.byId?.[sessionId];
+  function ChildModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
+    const bridge = useProjection('claudeBridge');
+    const selected = useProjection('modelSelection')?.lastUsed;
+    const session = useSession(value => value);
+    const summary = useSessions(value => value)?.byId?.[sessionId];
     const directory = useModelDirectory(value => value);
-    if (bridge == null || (!isSubagent && summary?.origin !== 'subagent')) return null;
+    if (bridge == null || (session?.subagent == null && summary?.origin !== 'subagent')) return null;
     const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
     const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
       ?.find(row => row.id === selected.model) : undefined;

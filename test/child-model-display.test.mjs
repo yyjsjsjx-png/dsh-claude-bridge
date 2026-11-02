@@ -7,8 +7,8 @@ const React = { createElement: (type, props, ...children) => ({ type, props, chi
 const { ChildModelBadge } = createMeterViews({ React })
 const hook = value => select => select(value)
 const props = (selection, bridge = {}, origin = 'subagent') => ({ sessionId: 'child',
-  useBridgeStatus: hook(bridge), useModelSelection: hook(selection),
-  useSessionList: hook({ byId: { child: { origin } } }),
+  useProjection: key => key === 'claudeBridge' ? bridge : selection, useSession: hook({}),
+  useSessions: hook({ byId: { child: { origin } } }),
   useModelDirectory: hook({ groups: [{ id: 'claude-sdk-remote', models: [
     { id: 'sonnet', name: 'Sonnet 5.5', reasoning: { defaultEffort: 'high' } },
   ] }] }),
@@ -35,55 +35,46 @@ test('普通child与远程root不显示子代理标签，避免更改普通路�
   assert.equal(ChildModelBadge(props(selected, null)), null)
   assert.equal(ChildModelBadge(props(selected, {}, null)), null)
   const nativeAddress = props(selected, {}, null)
-  nativeAddress.isSubagent = true
+  nativeAddress.useSession = hook({ subagent: { address: { childSessionId: 'child' } } })
   assert.deepEqual(ChildModelBadge(nativeAddress).children, ['Sonnet 5.5 · 模型默认'])
 })
 
-test('共有ChatView使用当前pane原生binding，侧栏无header和root binding也只显示一个标签', () => {
-  const client = createClient({ React, createUsageProjectionBridge: () => () => {} })
-  const NativeChat = () => null, nativeHooks = { chat: 'native-chat-hook' }
-  const native = { options: { name: 'conversation.view', id: 'chat', order: 0 }, locale: 'chat', component: NativeChat,
-    inject: id => ({ sessionId: id, hooks: nativeHooks, nativeMarker: true }) }
-  const entries = [native]
-  let listener, loads = 0
+test('唯一dock标签复用实际pane标准hooks，不依赖header/root binding或替换factory且不加载目录', async () => {
+  const store = { getSnapshot: () => ({}), subscribe: () => () => {} }
+  const client = createClient({ React, createUsageProjectionBridge: () => () => {}, createMeterViews,
+    createSettingsController: () => ({ store, models: {}, async readStatus() {} }),
+    createQuotaController: () => ({ store }), createPickerController: () => ({ store }),
+    createFormViews: () => ({}) })
+  const entries = []
+  let loads = 0
   const directory = { getSnapshot: () => ({ groups: [{ id: 'claude-sdk-remote', models: [{ id: 'sonnet', name: 'Sonnet 5.5' }] }] }),
     subscribe: () => () => {} }
-  const ctx = { get: name => {
+  const ctx = { sessions: {}, remote: { session: {}, claudeBridge: {}, $mount: async () => () => {} },
+    effect() {}, inject: (_services, callback) => callback(ctx), get: name => {
     assert.equal(name, 'modelDirectories')
     return { directoryFor: id => { assert.equal(id, 'child'); return { store: directory, load: () => { loads++ } } } }
   }, slots: {
-    entries: name => { assert.equal(name, 'conversation.view'); return entries },
-    subscribe: (_name, callback) => { listener = callback; return () => { listener = undefined } },
-    register(options, component) {
-      const entry = { options, component, locale: options.locale, inject: options.inject }
-      entries.push(entry); listener?.()
-      return () => { entries.splice(entries.indexOf(entry), 1) }
-    },
+    inject: (_name, callback) => callback(),
+    register: (options, component) => { entries.push({ options, component }); return () => {} },
   } }
-  const dispose = client.installChildModelView(ctx, ChildModelBadge)
-  const wrapped = entries.find(entry => entry !== native)
-  const injected = wrapped.inject('child')
-  assert.equal(injected.nativeMarker, true); assert.equal(injected.hooks.chat, nativeHooks.chat)
-  assert.equal(injected.hooks.childModelDirectory, directory); assert.equal(loads, 0)
-  const props = { sessionId: 'child', useSession: select => select({ subagent: { address: { childSessionId: 'child' } } }),
+  await client.apply(ctx)
+  const labels = entries.filter(entry => entry.options.id === 'dsh-claude-child-model')
+  assert.equal(labels.length, 1)
+  const label = labels[0], injected = label.options.inject('child')
+  assert.equal(label.options.name, 'conversation.composer.dock')
+  assert.equal(injected.hooks.modelDirectory, directory); assert.equal(loads, 0)
+  assert.equal(entries.some(entry => entry.options.name === 'conversation.view'
+    || entry.options.name === 'conversation.session.header.utilities'), false)
+  const pane = { sessionId: 'child', useSession: select => select({ subagent: { address: { childSessionId: 'child' } } }),
     useSessions: select => select({ byId: {} }),
-    useProjection: (key, select) => {
+    useProjection: key => {
       const value = key === 'claudeBridge' ? {} : { lastUsed: { provider: 'claude-sdk-remote', model: 'sonnet', reasoningEffort: 'high' } }
-      return select ? select(value) : value
-    }, useChildModelDirectory: select => select(directory.getSnapshot()),
+      return value
+    }, useModelDirectory: select => select(directory.getSnapshot()),
   }
   for (const occurrence of ['sidepane', 'full-page']) {
-    const view = wrapped.component({ ...props, occurrence })
-    const badge = view.children[0].children[0]
-    assert.equal(badge.type, ChildModelBadge)
-    assert.deepEqual(badge.type(badge.props).children, ['Sonnet 5.5 · high'])
-    assert.equal(view.children[1].children[0].type, NativeChat)
+    assert.deepEqual(label.component({ ...pane, occurrence }).children, ['Sonnet 5.5 · high'])
   }
-  const ordinary = { ...props, useProjection: () => null }
-  const ordinaryView = wrapped.component(ordinary)
-  assert.equal(ordinaryView.type, NativeChat); assert.equal(ordinaryView.props, ordinary)
-  const root = { ...props, useSession: select => select({}) }
-  assert.equal(wrapped.component(root).type, NativeChat)
-  dispose()
-  assert.deepEqual(entries, [native])
+  assert.equal(label.component({ ...pane, useProjection: () => null }), null)
+  assert.equal(label.component({ ...pane, useSession: select => select({}) }), null)
 })
