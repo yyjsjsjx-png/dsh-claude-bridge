@@ -58,7 +58,7 @@ test('恢复只接受完整一致的持久绑定，不从展示记录推断', ()
   assert.throws(() => assertModelSelection({ ...binding, initialModel: local }, remote), code('BINDING_INVALID'));
 });
 
-test('远程预设关闭计划与分叉，保留独立子代理并继承父模型', () => {
+test('远程预设关闭计划与分叉，允许独立子代理显式选型', () => {
   const standard = { plugins: [
     { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'example {{model}}' } },
     { id: 'tool-pwsh', name: 'tool-pwsh' },
@@ -82,7 +82,7 @@ test('远程预设关闭计划与分叉，保留独立子代理并继承父模�
   assert.equal(standard.plugins[0].config.prefix, 'example {{model}}');
   const children = preset.plugins.find(entry => entry.id === 'delegation').config;
   assert.equal(children.find(entry => entry.id === 'tool-subagent-fork').disabled, true);
-  assert.equal(children.find(entry => entry.id === 'tool-subagent').config.modelSelectionSettings, false);
+  assert.equal(children.find(entry => entry.id === 'tool-subagent').config.modelSelectionSettings, true);
   assert.equal(children.find(entry => entry.id === 'tool-workflow').disabled, undefined);
   assert.equal(standard.plugins[4].config[0].config.modelSelectionSettings, true);
   assert.equal(standard.plugins[4].config[1].disabled, undefined);

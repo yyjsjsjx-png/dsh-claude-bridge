@@ -48,7 +48,7 @@ When ready, call exit_plan_mode with the complete plan markdown, starting with a
         { id: 'tool-subagent-control', name: '@deepseek-ai/dsh-tool-subagent-control' },
         { id: 'tool-subagent-list-agents', name: '@deepseek-ai/dsh-tool-subagent-control/list-agents' },
         { id: 'tool-subagent', name: '@deepseek-ai/dsh-tool-subagent',
-          config: { provider: 'spawn', toolName: 'subagent', modelSelectionSettings: false } },
+          config: { provider: 'spawn', toolName: 'subagent', modelSelectionSettings: true } },
         { id: 'tool-subagent-fork', name: '@deepseek-ai/dsh-tool-subagent', disabled: true,
           config: { provider: 'fork', toolName: 'subagent_fork' } },
         { id: 'workflow-ptc', name: '@deepseek-ai/dsh-workflow-ptc', config: { provider: 'spawn' } },

@@ -34,18 +34,21 @@ export async function apply(ctx, config) {
   let disposed = false;
   // Register teardown before loading so partial activation is also owned.
   ctx.effect(() => async () => { disposed = true; await composition?.dispose(); }, '远程预设组件清理');
-  const auditedInstructions = rows => rows.map(row => {
+  const remoteEntries = rows => rows.map(row => {
     if (row.id === 'agent-instructions') {
       if (row.name !== '@deepseek-ai/dsh-agent-instructions') {
         throw Object.assign(new Error('远程预设的原生指令组件无法审计。'), { code: 'INSTRUCTION_AUDIT_UNAVAILABLE' });
       }
       return { ...row, name: new URL('./instruction-audit-plugin.mjs', import.meta.url).href };
     }
-    return row.group && Array.isArray(row.config) ? { ...row, config: auditedInstructions(row.config) } : row;
+    if (row.id === 'tool-subagent' && row.name === '@deepseek-ai/dsh-tool-subagent') {
+      return { ...row, name: new URL('./remote-subagent.mjs', import.meta.url).href };
+    }
+    return row.group && Array.isArray(row.config) ? { ...row, config: remoteEntries(row.config) } : row;
   });
   composition = await loadRemoteComposition({ ...config,
     createTree: () => new RemoteTree(ctx.extend({ baseUrl: config.baseUrl })),
-    prepareRows: rows => prepareProfileEntries(ctx, auditedInstructions(rows), config.baseUrl),
+    prepareRows: rows => prepareProfileEntries(ctx, remoteEntries(rows), config.baseUrl),
     report: status => {
       currentStatus = status;
       // Declaration-source notices are visible to the user. Only actual
