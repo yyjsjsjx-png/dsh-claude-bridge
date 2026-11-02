@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto'
 
 const DEFAULT_MAX_LINE_BYTES = 4 * 1024 * 1024
 const MAX_INCOMING_IDS = 100_000
+const MAX_TIMING_BUCKETS = 2048
+const RPC_ID = /^[0-9a-f-]{36}:[1-9][0-9]*$/i
+const RUN_ID = /^(?:[0-9a-f-]{36}|run-[a-z0-9_.-]{1,100})$/i
+const safeMethod = value => typeof value === 'string' && /^[a-zA-Z0-9_.$/-]{1,100}$/.test(value)
+  && !/^(?:sk|pk|token|secret)[-_]/i.test(value)
 const textDecoder = new TextDecoder('utf-8', { fatal: true })
 
 /** An RPC failure that does not contain request or response bodies. */
@@ -86,6 +91,7 @@ export function createRpcPeer({
   const pending = new Map()
   const incoming = new Map()
   const seenIncomingIds = new Set()
+  const timings = new Map()
   let lineBuffer = Buffer.alloc(0)
   let lineBytes = 0
   let notificationQueue = Promise.resolve()
@@ -96,18 +102,60 @@ export function createRpcPeer({
   let finishClosed
   const closed = new Promise((resolve) => { finishClosed = resolve })
 
-  function diagnose(event, { id, method, startedAt, code } = {}) {
+  function diagnose(event, { id, method, startedAt, code, runId, stage, durationMs, bytes, samples, maxMs } = {}) {
     if (!onDiagnostic) return
     const record = { event }
-    if (typeof id === 'string' && /^[0-9a-f-]{36}:[1-9][0-9]*$/i.test(id)) record.requestId = id
-    if (typeof method === 'string' && /^[a-zA-Z0-9_.$/-]{1,100}$/.test(method)
-      && !/^(?:sk|pk|token|secret)[-_]/i.test(method)) record.method = method
+    if (typeof id === 'string' && RPC_ID.test(id)) record.requestId = id
+    if (safeMethod(method)) record.method = method
     if (typeof startedAt === 'number') record.durationMs = Math.max(0, Date.now() - startedAt)
+    if (event === 'perf.rpc') {
+      if (typeof runId === 'string' && RUN_ID.test(runId)) record.runId = runId
+      record.stage = stage
+      if (Number.isFinite(durationMs) && durationMs >= 0) record.durationMs = durationMs
+      if (Number.isSafeInteger(bytes) && bytes >= 0) record.bytes = bytes
+      record.samples = samples
+      record.maxMs = maxMs
+    }
     if ((typeof code === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(code)) || Number.isInteger(code)) record.code = code
     try {
       const result = onDiagnostic(record)
       if (result && typeof result.then === 'function') Promise.resolve(result).catch(() => {})
     } catch { /* Diagnostics must not interrupt the transport. */ }
+  }
+
+  function rpcMetadata(message, request) {
+    if (!onDiagnostic) return {}
+    try {
+      const origin = request ?? (typeof message.method === 'string' ? message : pending.get(message.id))
+      const runId = origin?.params?.runId ?? origin?.runId
+      return { ...(typeof message.id === 'string' && RPC_ID.test(message.id) ? { id: message.id } : {}),
+        ...(safeMethod(origin?.method) ? { method: origin.method } : {}),
+        ...(typeof runId === 'string' && RUN_ID.test(runId) ? { runId } : {}) }
+    } catch { return {} }
+  }
+
+  function rpcTiming(stage, startedAt, bytes, metadata) {
+    if (!onDiagnostic || isClosed) return
+    const durationMs = Math.max(0, performance.now() - startedAt)
+    const group = metadata.runId ? `run:${metadata.runId}` : metadata.id ? `request:${metadata.id}` : 'notifications'
+    const key = JSON.stringify([group, metadata.method, stage])
+    let row = timings.get(key)
+    if (!row) {
+      if (timings.size >= MAX_TIMING_BUCKETS) return
+      row = { ...metadata, group, stage, durationMs: 0, bytes: 0, samples: 0, maxMs: 0 }
+      timings.set(key, row)
+    }
+    if (row.id !== metadata.id) delete row.id
+    row.durationMs += durationMs; row.bytes += bytes; row.samples++
+    row.maxMs = Math.max(row.maxMs, durationMs)
+  }
+
+  function flushTimings(group) {
+    for (const [key, { group: owner, ...row }] of timings) {
+      if (group !== undefined && group !== owner) continue
+      timings.delete(key)
+      diagnose('perf.rpc', row)
+    }
   }
 
   function finishPending(id, method, value) {
@@ -121,6 +169,12 @@ export function createRpcPeer({
       ...(method === 'reject' ? { code: value?.code } : {}),
     })
     entry[method](value)
+    if (!entry.runId) flushTimings(`request:${id}`)
+    else if (entry.method === 'query') {
+      // Do not log every streamed delta. Include the already-received tail's
+      // queue/handler intervals without delaying or awaiting the RPC result.
+      notificationQueue.then(() => flushTimings(`run:${entry.runId}`)).catch(() => {})
+    }
     return true
   }
 
@@ -136,14 +190,16 @@ export function createRpcPeer({
     for (const controller of incoming.values()) controller.abort()
     incoming.clear()
     for (const id of [...pending.keys()]) finishPending(id, 'reject', closedError())
+    flushTimings()
     const info = { reason: typeof reason === 'string' && /^[a-z0-9_]{1,40}$/.test(reason) ? reason : 'closed' }
     diagnose('rpc_closed', { code: info.reason })
     try { onClose?.(info) } catch { /* Close notifications cannot undo teardown. */ }
     finishClosed(info)
   }
 
-  function send(message) {
+  function send(message, request) {
     if (isClosed) throw closedError()
+    const encodingAt = performance.now()
     let json
     try {
       json = JSON.stringify(message)
@@ -152,6 +208,8 @@ export function createRpcPeer({
     }
     if (typeof json !== 'string') throw new RpcError('RPC 消息无法序列化', 'RPC_SERIALIZE')
     const frame = Buffer.from(`${json}\n`, 'utf8')
+    const metadata = rpcMetadata(message, request)
+    rpcTiming('encode', encodingAt, frame.length, metadata)
     if (frame.length - 1 > maxLineBytes) throw new RpcError('RPC 消息超过大小限制', 'RPC_TOO_LARGE')
     const buffered = typeof output.writableLength === 'number' ? output.writableLength : 0
     if (buffered + frame.length > maxLineBytes * 4 + 4) {
@@ -160,7 +218,9 @@ export function createRpcPeer({
     }
     try {
       traffic('sent', message)
-      output.write(frame)
+      const writingAt = performance.now()
+      try { output.write(frame) }
+      finally { rpcTiming('write', writingAt, frame.length, metadata) }
     } catch {
       close('write_error')
       throw closedError()
@@ -202,7 +262,8 @@ export function createRpcPeer({
     if (options.signal?.aborted) return Promise.reject(cancelledError())
     const id = `${prefix}:${++counter}`
     return new Promise((resolve, reject) => {
-      const entry = { resolve, reject, signal: options.signal, method, startedAt: Date.now() }
+      const entry = { resolve, reject, signal: options.signal, method, startedAt: Date.now(),
+        runId: rpcMetadata({ method, params }).runId }
       entry.abort = () => cancelPending(id, cancelledError())
       if (options.timeoutMs !== undefined) {
         entry.timer = setTimeout(() => cancelPending(id,
@@ -220,12 +281,12 @@ export function createRpcPeer({
     })
   }
 
-  function sendError(id, code, message) {
+  function sendError(id, code, message, request) {
     if (isClosed) return
-    try { send({ jsonrpc: '2.0', id, error: { code, message } }) } catch { close('write_error') }
+    try { send({ jsonrpc: '2.0', id, error: { code, message } }, request) } catch { close('write_error') }
   }
 
-  function handleCall(message, frameBytes) {
+  function handleCall(message, frameBytes, wireBytes) {
     if (typeof message.method !== 'string' || message.method.length === 0) return close('protocol_error')
     if ('params' in message && (message.params === null || typeof message.params !== 'object')) return close('protocol_error')
     if ('result' in message || 'error' in message) return close('protocol_error')
@@ -240,8 +301,15 @@ export function createRpcPeer({
         diagnose('rpc_notification_received')
         notificationBytes += frameBytes
         if (notificationBytes > maxLineBytes * 4) return close('notification_backpressure')
+        const queuedAt = performance.now()
+        const metadata = rpcMetadata(message)
         notificationQueue = notificationQueue
-          .then(() => onNotification(message.method, message.params))
+          .then(async () => {
+            rpcTiming('notification_wait', queuedAt, wireBytes, metadata)
+            const handlingAt = performance.now()
+            try { return await onNotification(message.method, message.params) }
+            finally { rpcTiming('notification_handle', handlingAt, wireBytes, metadata) }
+          })
           .catch(() => {
             notificationFailure = new RpcError('通知处理失败', 'RPC_NOTIFICATION_FAILED')
             close('notification_error')
@@ -257,7 +325,7 @@ export function createRpcPeer({
     const handler = Object.hasOwn(handlers, message.method) ? handlers[message.method] : undefined
     if (typeof handler !== 'function') {
       diagnose('rpc_handler_failed', { id: message.id, code: -32601 })
-      return sendError(message.id, -32601, '方法不存在')
+      return sendError(message.id, -32601, '方法不存在', message)
     }
     const controller = new AbortController()
     const startedAt = Date.now()
@@ -269,22 +337,25 @@ export function createRpcPeer({
         if (isClosed) return
         if (controller.signal.aborted) {
           diagnose('rpc_handler_failed', { id: message.id, method: message.method, startedAt, code: -32800 })
-          return sendError(message.id, -32800, '请求已取消')
+          return sendError(message.id, -32800, '请求已取消', message)
         }
         try {
-          send({ jsonrpc: '2.0', id: message.id, result: result === undefined ? null : result })
+          send({ jsonrpc: '2.0', id: message.id, result: result === undefined ? null : result }, message)
           diagnose('rpc_handler_result', { id: message.id, method: message.method, startedAt })
         } catch {
           diagnose('rpc_handler_failed', { id: message.id, method: message.method, startedAt, code: -32603 })
-          sendError(message.id, -32603, '处理结果无法发送')
+          sendError(message.id, -32603, '处理结果无法发送', message)
         }
       } catch {
         diagnose('rpc_handler_failed', { id: message.id, method: message.method, startedAt,
           code: controller.signal.aborted ? -32800 : -32000 })
         sendError(message.id, controller.signal.aborted ? -32800 : -32000,
-          controller.signal.aborted ? '请求已取消' : '请求处理失败')
+          controller.signal.aborted ? '请求已取消' : '请求处理失败', message)
       } finally {
         incoming.delete(key)
+        const metadata = rpcMetadata(message)
+        if (!metadata.runId) flushTimings(`request:${message.id}`)
+        else if (message.method === 'query') flushTimings(`run:${metadata.runId}`)
       }
     })
   }
@@ -306,12 +377,15 @@ export function createRpcPeer({
   }
 
   function handleLine(line) {
+    const receivedAt = performance.now()
+    const frameBytes = line.length + 1
     if (line.length > 0 && line[line.length - 1] === 13) line = line.subarray(0, -1)
     let message
     try { message = JSON.parse(textDecoder.decode(line)) } catch { return close('protocol_error') }
     if (!isRecord(message) || message.jsonrpc !== '2.0') return close('protocol_error')
+    rpcTiming('receive', receivedAt, frameBytes, rpcMetadata(message))
     traffic('received', message)
-    if ('method' in message) handleCall(message, line.length)
+    if ('method' in message) handleCall(message, line.length, frameBytes)
     else handleResponse(message)
   }
 

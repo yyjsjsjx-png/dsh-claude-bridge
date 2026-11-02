@@ -553,11 +553,19 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         })
       } catch { /* A broken transport is handled by the active query signal. */ }
     }
-    const timing = (stage, durationMs = elapsed(), event = 'perf.remote') => {
+    const timing = (stage, durationMs = elapsed(), event = 'perf.remote', interval = {}) => {
       const fields = { runId, stage, durationMs, model: params.model, effort: params.effort,
-        method: params.action === 'compact' ? 'compact' : 'query' }
+        method: params.action === 'compact' ? 'compact' : 'query', ...interval }
       diagnosticLog?.event(event, fields)
       try { context.peer.notify('diagnostic', { event, ...fields }) } catch {}
+    }
+    let phaseSequence = 0
+    const startPhase = (stage, fields = {}) => {
+      const startedAt = performance.now()
+      return () => {
+        try { timing(stage, Math.max(0, performance.now() - startedAt), 'perf.remote',
+          { ...fields, sampleId: `phase-${++phaseSequence}` }) } catch {}
+      }
     }
     try {
       requireObject(params, '请求')
@@ -952,6 +960,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             }
             diagnose('approval', 'requested')
             let response
+            const callId = typeof options?.toolUseID === 'string' && /^[a-zA-Z0-9_.:-]{1,160}$/.test(options.toolUseID)
+              ? options.toolUseID : undefined
+            const finishApproval = startPhase('approval_wait', { callId })
             try {
               response = await context.peer.request('approval.request', {
                 runId, toolName, input, toolUseId: options?.toolUseID ?? null,
@@ -962,7 +973,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
                 : new WorkerError('APPROVAL_UNAVAILABLE', '审批连接中断')
               controller.abort()
               throw run.problem
-            }
+            } finally { finishApproval() }
             if (!response || (response.behavior !== 'allow' && response.behavior !== 'deny')) {
               if (typeof options?.toolUseID === 'string') toolCalls.forget(options.toolUseID)
               return { behavior: 'deny', message: '审批结果无效' }
@@ -1177,7 +1188,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       } finally {
         controller.abort()
         toolCalls.dispose()
-        await settlement.drain()
+        const finishDrain = startPhase('callback_drain')
+        try { await settlement.drain() }
+        finally { finishDrain() }
         if (run.problem) throw run.problem
       }
     } catch (error) {
@@ -1197,8 +1210,16 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       }
     } finally {
       const finalized = await settlement.finish(candidateOutcome, {
-        save: run?.recoveryCwd ? outcome => runStore.finish(run.recoveryCwd, runId, outcome) : undefined,
-        release: lock ? () => lock.release() : undefined,
+        save: run?.recoveryCwd ? async outcome => {
+          const finishSave = startPhase('recovery_save')
+          try { return await runStore.finish(run.recoveryCwd, runId, outcome) }
+          finally { finishSave() }
+        } : undefined,
+        release: lock ? async () => {
+          const finishRelease = startPhase('lock_release')
+          try { return await lock.release() }
+          finally { finishRelease() }
+        } : undefined,
         onReleaseFailure: () => diagnose('session', 'lock-release-failed', 'LOCK_RELEASE_FAILED'),
       })
       finalOutcome = finalized.outcome
@@ -1213,9 +1234,14 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       }
       if (onAbort) context.signal?.removeEventListener('abort', onAbort)
       if (active) activeSessions.delete(sessionId)
-      if (diagnosticLog) await diagnosticLog.flush().catch(() => {
-        try { context.peer.notify('diagnostic', { event: 'diagnostics.failed', runId, code: 'DIAGNOSTIC_WRITE_FAILED' }) } catch {}
-      })
+      if (diagnosticLog) {
+        const finishFlush = startPhase('diagnostic_flush')
+        try {
+          await diagnosticLog.flush().catch(() => {
+            try { context.peer.notify('diagnostic', { event: 'diagnostics.failed', runId, code: 'DIAGNOSTIC_WRITE_FAILED' }) } catch {}
+          })
+        } finally { finishFlush() }
+      }
     }
     // Optional metadata is read once after durable settlement and lock release.
     // It belongs only to this RPC reply, never to the execution/settle journal.

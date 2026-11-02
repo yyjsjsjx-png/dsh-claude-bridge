@@ -1,6 +1,16 @@
 import { firstOutputKind } from './sdk-output-kind.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 
+/** A local interval, separate from cumulative perf.local entry timestamps.
+ * The caller owns its try/finally; this adds no async business boundary. */
+export function startLocalRunPhase({ runId, stage, callId, onTiming, now = () => performance.now() }) {
+  const started = now()
+  return () => {
+    try { onTiming({ runId, stage, ...(callId === undefined ? {} : { callId }),
+      durationMs: Math.max(0, now() - started) }) } catch {}
+  }
+}
+
 /** Exact at the named local RPC boundaries, including transport/queue waits.
  * This is a run-level observation, never a per-model-request upstream TTFT. */
 export function createLocalRunTiming({ now = () => performance.now(), wall = () => Date.now(), onTiming = () => {} } = {}) {
