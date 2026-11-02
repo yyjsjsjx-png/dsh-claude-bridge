@@ -62,28 +62,31 @@ export function createQuotaController({ rpc, createStore, isBusy = () => false, 
           : { ...UNKNOWN_QUOTA, code: response.error?.code ?? 'QUOTA_READ_FAILED' };
       } catch { value = { ...UNKNOWN_QUOTA, code: 'QUOTA_READ_FAILED' }; }
       if (disposed || revision !== quotaGeneration) return;
-      if (value.status === 'available') {
+      const failureCode = value.code ?? value.sampling?.error?.code;
+      const paused = quotaAuthCodes.has(failureCode) ? 'auth'
+        : failureCode === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported'
+          : quotaVersionCodes.has(failureCode) ? 'version' : undefined;
+      if (value.status === 'available' && !paused) {
         quotaFailures = 0; quotaRetryAt = 0;
         const nextAllowedAt = value.sampling?.nextAllowedAt;
         store.set({ ...value, refreshing: false,
           nextRefreshAt: Number.isFinite(nextAllowedAt) && nextAllowedAt > Date.now() ? nextAllowedAt : 0 });
         return;
       }
-      const paused = quotaAuthCodes.has(value.code) ? 'auth'
-        : value.code === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported'
-          : quotaVersionCodes.has(value.code) ? 'version' : undefined;
       if (paused) {
         quotaRetryAt = 0;
-        store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+        store.set({ ...UNKNOWN_QUOTA, code: failureCode, paused,
           ...(value.sampling ? { sampling: value.sampling } : {}),
           ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
         quotaFailures++;
         quotaRetryAt = Date.now() + [60_000, 120_000, 300_000][Math.min(quotaFailures - 1, 2)];
-        // A reply with no usable plan windows supersedes the old counters.
-        // Transient transport failures may keep a still-fresh snapshot.
+        // Current counters may expire while a separately labelled historical
+        // reading remains. Authoritative no-cache replies still clear it.
+        const lastKnown = value.lastKnown ?? (value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous.lastKnown : undefined);
         store.set({ ...(previous.status === 'available' && value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous : UNKNOWN_QUOTA),
+          ...(lastKnown ? { lastKnown } : {}),
           ...(value.sampling ? { sampling: value.sampling } : {}),
           code: value.code, refreshing: false, paused: undefined,
           nextRefreshAt: Math.max(quotaRetryAt, Number.isFinite(value.sampling?.nextAllowedAt) ? value.sampling.nextAllowedAt : 0) });

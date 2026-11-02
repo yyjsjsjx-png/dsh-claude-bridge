@@ -33,7 +33,7 @@ test('本机计时在RPC通知排队前观察有效思考，排除头帧与重�
   assert.equal(rows.at(-1).model, 'unknown')
 })
 
-test('额度共享缓存区分新鲜度与保留期，不改变读数时间或保留已重置窗口', () => {
+test('额度当前窗口与历史缓存分开，长时间空闲和已重置窗口仍可核对上次读数', () => {
   const observedAt = 1_700_000_000_000
   const snapshot = { status: 'available', source: 'sdk-plan-usage', observedAt, expiresAt: observedAt + 120_000,
     windows: [{ id: 'five_hour', name: '5 小时', scope: 'session', usedPercent: 9.25, resetsAt: observedAt + 180_000 },
@@ -42,7 +42,16 @@ test('额度共享缓存区分新鲜度与保留期，不改变读数时间或�
   assert.equal(view.status, 'available'); assert.equal(view.observedAt, observedAt)
   assert.equal(view.sampling.fresh, false); assert.equal(view.sampling.error.code, 'RATE_LIMITED')
   assert.equal(view.windows.length, 1); assert.equal(view.windows[0].usedPercent, 12.5)
+  assert.deepEqual(view.lastKnown, snapshot)
   assert.equal(retainedPlanUsage({ status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', snapshot, error: null }, observedAt + 240_000).sampling.error, null)
-  assert.equal(retainedPlanUsage({ snapshot }, observedAt + 1_800_001).status, 'unavailable')
+  for (const elapsed of [1_800_001, 3 * 86_400_000]) {
+    const idle = retainedPlanUsage({ snapshot, active: false }, observedAt + elapsed)
+    assert.equal(idle.status, 'unavailable')
+    assert.equal(idle.sampling.active, false)
+    assert.equal(idle.sampling.fresh, false)
+    assert.deepEqual(idle.lastKnown, snapshot)
+    assert.equal(idle.lastKnown.expiresAt, observedAt + 120_000)
+  }
+  assert.equal(retainedPlanUsage({ snapshot: { ...snapshot, source: 'unknown' } }, observedAt + 3 * 86_400_000).lastKnown, undefined)
   assert.equal(retainedPlanUsage({ status: 'unavailable', code: 'OBSERVABILITY_CHANNEL_CLOSED' }).sampling.error.code, 'OBSERVABILITY_CHANNEL_CLOSED')
 })

@@ -287,28 +287,31 @@ function createQuotaController({ rpc, createStore, isBusy = () => false, onAuthe
           : { ...UNKNOWN_QUOTA, code: response.error?.code ?? 'QUOTA_READ_FAILED' };
       } catch { value = { ...UNKNOWN_QUOTA, code: 'QUOTA_READ_FAILED' }; }
       if (disposed || revision !== quotaGeneration) return;
-      if (value.status === 'available') {
+      const failureCode = value.code ?? value.sampling?.error?.code;
+      const paused = quotaAuthCodes.has(failureCode) ? 'auth'
+        : failureCode === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported'
+          : quotaVersionCodes.has(failureCode) ? 'version' : undefined;
+      if (value.status === 'available' && !paused) {
         quotaFailures = 0; quotaRetryAt = 0;
         const nextAllowedAt = value.sampling?.nextAllowedAt;
         store.set({ ...value, refreshing: false,
           nextRefreshAt: Number.isFinite(nextAllowedAt) && nextAllowedAt > Date.now() ? nextAllowedAt : 0 });
         return;
       }
-      const paused = quotaAuthCodes.has(value.code) ? 'auth'
-        : value.code === 'SDK_QUOTA_UNAVAILABLE' ? 'unsupported'
-          : quotaVersionCodes.has(value.code) ? 'version' : undefined;
       if (paused) {
         quotaRetryAt = 0;
-        store.set({ ...UNKNOWN_QUOTA, code: value.code, paused,
+        store.set({ ...UNKNOWN_QUOTA, code: failureCode, paused,
           ...(value.sampling ? { sampling: value.sampling } : {}),
           ...(paused === 'version' ? { minimumClientVersion: value.minimumClientVersion ?? null } : {}) });
         if (paused === 'auth') onAuthenticationRequired();
       } else {
         quotaFailures++;
         quotaRetryAt = Date.now() + [60_000, 120_000, 300_000][Math.min(quotaFailures - 1, 2)];
-        // A reply with no usable plan windows supersedes the old counters.
-        // Transient transport failures may keep a still-fresh snapshot.
+        // Current counters may expire while a separately labelled historical
+        // reading remains. Authoritative no-cache replies still clear it.
+        const lastKnown = value.lastKnown ?? (value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous.lastKnown : undefined);
         store.set({ ...(previous.status === 'available' && value.code !== 'PLAN_LIMITS_UNAVAILABLE' ? previous : UNKNOWN_QUOTA),
+          ...(lastKnown ? { lastKnown } : {}),
           ...(value.sampling ? { sampling: value.sampling } : {}),
           code: value.code, refreshing: false, paused: undefined,
           nextRefreshAt: Math.max(quotaRetryAt, Number.isFinite(value.sampling?.nextAllowedAt) ? value.sampling.nextAllowedAt : 0) });
@@ -665,8 +668,14 @@ function compactTokens(value) {
     if (!remoteSession) return null;
     const versionBlocked = quota.paused === 'version';
     const clientUpdateRequired = quota.code === 'CLIENT_UPDATE_REQUIRED';
-    const rows = !versionBlocked && quota.status === 'available' && quota.expiresAt > currentTime
+    const cacheBlocked = ['version', 'auth', 'unsupported'].includes(quota.paused);
+    const currentRows = !cacheBlocked && quota.status === 'available' && quota.expiresAt > currentTime
       ? quota.windows.filter(row => row.resetsAt === null || row.resetsAt > currentTime) : [];
+    const lastKnown = !cacheBlocked && quota.lastKnown?.status === 'available' ? quota.lastKnown : undefined;
+    const retainedRows = lastKnown?.windows.map(row => currentRows.find(current => current.id === row.id)
+      ?? { ...row, historical: true }) ?? [];
+    const rows = [...retainedRows, ...currentRows.filter(row => !retainedRows.some(retained => retained.id === row.id))];
+    const historical = rows.some(row => row.historical);
     const fiveHour = rows.find(row => row.id === 'five_hour');
     const weekly = rows.find(row => row.id === 'seven_day');
     const remaining = row => {
@@ -675,10 +684,14 @@ function compactTokens(value) {
     };
     const staleFiveHour = quota.status === 'available' && quota.windows.some(row => row.id === 'five_hour');
     const reading = versionBlocked ? (clientUpdateRequired ? '客户端需更新' : '版本校验失败')
-      : [fiveHour && `5h 剩余 ${remaining(fiveHour)}`, weekly && `周剩余 ${remaining(weekly)}`]
+      : [fiveHour && `5h ${fiveHour.historical ? '上次剩余' : '剩余'} ${remaining(fiveHour)}`,
+        weekly && `周${weekly.historical ? '上次剩余' : '剩余'} ${remaining(weekly)}`]
         .filter(Boolean).join(' · ') || (staleFiveHour ? '5h 待刷新' : '5h 额度未知');
     const resetTime = row => {
       if (row.resetsAt === null) return '';
+      if (row.historical) return row.resetsAt <= currentTime
+        ? '原窗口已过重置时间，当前额度待刷新。'
+        : `原重置时间：${new Date(row.resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
       const minutes = Math.max(1, Math.ceil((row.resetsAt - currentTime) / 60_000));
       if (minutes < 60) return `${minutes} 分钟后重置`;
       if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟后重置`;
@@ -689,8 +702,8 @@ function compactTokens(value) {
     const samplingCode = typeof samplingError?.code === 'string'
       && /^[A-Z][A-Z0-9_]{0,63}$/.test(samplingError.code) ? `（${samplingError.code}）` : '';
     const observedAt = Number.isFinite(quota.sampling?.lastObservedAt)
-      ? quota.sampling.lastObservedAt : quota.observedAt;
-    const staleSampling = quota.sampling?.fresh === false
+      ? quota.sampling.lastObservedAt : quota.observedAt ?? lastKnown?.observedAt;
+    const staleSampling = historical || quota.sampling?.fresh === false
       || Number.isFinite(observedAt) && currentTime >= observedAt + 120_000;
     return React.createElement('span', { ref: rootRef, className: 'dsh-claude-meter' },
       React.createElement('style', null, METER_CSS),
@@ -715,14 +728,16 @@ function compactTokens(value) {
             disabled: quota.refreshing || quota.paused === 'offline',
             onClick: () => { void readQuota('manual'); } }, quota.refreshing ? '…' : '↻')),
         samplingPaused && React.createElement('p', { className: 'dsh-claude-quota-reset', style: { margin: '10px 0 0' } },
-          '无运行任务，暂停查询；仅显示缓存读数。'),
+          rows.length ? '无运行任务，暂停查询；仅显示缓存读数。' : '无运行任务，暂停查询。'),
+        historical && React.createElement('p', { className: 'dsh-claude-quota-reset', style: { margin: '10px 0 0' } },
+          '“上次剩余”为历史缓存，不代表当前额度。'),
         ...rows.map(row => React.createElement('div', { key: row.id, className: 'dsh-claude-quota-row' },
           React.createElement('div', { className: 'dsh-claude-quota-line' },
             React.createElement('span', null, row.scope === 'model-weekly' ? `${row.name} · 周额度` : row.name),
             React.createElement('strong', { style: { fontWeight: 500, fontVariantNumeric: 'tabular-nums',
-              color: 'var(--dsw-alias-label-primary, #222)' } }, remaining(row))),
+              color: 'var(--dsw-alias-label-primary, #222)' } }, `${row.historical ? '上次剩余 ' : ''}${remaining(row)}`)),
           React.createElement('div', { className: 'dsh-claude-quota-bar', role: 'meter',
-            'aria-label': `${row.name}剩余额度`, 'aria-valuemin': 0, 'aria-valuemax': 100,
+            'aria-label': `${row.name}${row.historical ? '上次' : ''}剩余额度`, 'aria-valuemin': 0, 'aria-valuemax': 100,
             'aria-valuenow': 100 - row.usedPercent },
             React.createElement('div', { style: { height: '100%', width: `${100 - row.usedPercent}%`,
               borderRadius: 'inherit', background: 'var(--dsw-static-blue-450, #4e8cff)' } })),
@@ -732,7 +747,8 @@ function compactTokens(value) {
             ? '当前客户端低于服务端版本要求，请更新后重试。' : '服务端版本要求无效，请核对版本声明后重试。')
             : quota.paused === 'auth' ? '请在服务器重新登录后刷新。'
             : quota.paused === 'unsupported' ? '当前服务器不支持额度查询。'
-              : quota.paused === 'offline' ? '网络离线，恢复后自动刷新。' : '暂时无法获取有效额度。'),
+              : quota.paused === 'offline' ? '网络离线，恢复后自动刷新。'
+                : samplingPaused ? '尚无缓存读数；运行远程任务后更新。' : '暂时无法获取有效额度。'),
         versionBlocked && quota.minimumClientVersion && React.createElement('p', null,
           `最低客户端版本：${quota.minimumClientVersion}`),
         versionBlocked && React.createElement('a', {
@@ -743,7 +759,9 @@ function compactTokens(value) {
           `额度采样失败${samplingCode}${rows.length ? '，保留上次读数。' : '，请稍后重试。'}`),
         rows.length > 0 && React.createElement('div', { className: 'dsh-claude-quota-reset', style: { marginTop: 10 } },
           quota.refreshing ? (samplingPaused ? '正在读取缓存…' : '正在刷新…')
-            : `${quota.paused === 'offline' ? '离线 · ' : quota.code ? '刷新失败 · ' : ''}更新于 ${new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
+            : `${quota.paused === 'offline' ? '离线 · ' : quota.code && quota.code !== 'PLAN_LIMITS_UNAVAILABLE' ? '刷新失败 · ' : ''}更新于 ${historical
+              ? new Date(observedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+              : new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
   return { SessionMeter, QuotaMeter };
