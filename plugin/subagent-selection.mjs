@@ -2,8 +2,8 @@ import { CLAUDE_PROVIDER } from './policy.mjs';
 
 export const MODEL_DEFAULT_EFFORT = 'model-default';
 
-/** Account catalog, rather than the device's visible-model preference, owns
- * explicit delegation choices. No default effort is inferred from the list. */
+/** Validate and translate the supplied catalog. The remote tool owns applying
+ * device visibility and Session policy; no default effort is inferred here. */
 export function subagentModels(catalog) {
   const rows = Array.isArray(catalog) ? catalog : catalog?.status === 'ok' ? catalog.models : undefined;
   if (!Array.isArray(rows) || !rows.length) throw new Error('远程子任务模型目录尚未就绪。');
