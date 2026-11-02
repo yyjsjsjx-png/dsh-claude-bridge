@@ -229,7 +229,7 @@ const SETTINGS_CSS = `
         h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '显示的模型'),
           state.modelsLoaded && state.models.length > 0
             && h('span', { className: 'dcb-card-meta' }, `已选 ${selectedCount} / ${state.models.length}`)),
-        h('p', { className: 'dcb-card-desc' }, '选择模型列表中显示的模型；隐藏不会停止已有会话，正在使用的模型会暂时保留在原生列表中。'),
+        h('p', { className: 'dcb-card-desc' }, '选择主会话与子代理列表中显示的模型。隐藏不限制显式指定真实可用的型号，也不停止已有会话；正在使用的模型可能暂时保留在原生列表中。'),
         !state.configured && h('p', { className: 'dcb-hint' }, '请先保存连接设置，再读取账号模型。'),
         state.modelsLoading && h('p', { className: 'dcb-hint' }, '正在读取模型…'),
         state.modelCatalog?.status === 'failed' && h('p', { role: 'alert', 'aria-label': '模型目录刷新状态',

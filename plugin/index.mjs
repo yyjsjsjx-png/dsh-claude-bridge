@@ -47,6 +47,7 @@ import { createSessionStatusProjection } from '../src/session-status.mjs';
 import { createRunProgressProjection } from '../src/run-progress.mjs';
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
+import { createModelObservationProjection } from '../src/model-observation.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
@@ -132,6 +133,7 @@ let ClaudeBridgeService = (() => {
             ctx.sessionProjections.register(createRunProgressProjection(z));
             ctx.sessionProjections.register(createResponseUsageProjection(z));
             ctx.sessionProjections.register(createResponseTimingProjection(z));
+            ctx.sessionProjections.register(createModelObservationProjection(z));
             const backend = this.backend;
             const adapter = new ClaudeCatalogAdapter(backend, ctx);
             this.catalogAdapter = adapter;
@@ -231,9 +233,30 @@ let ClaudeBridgeService = (() => {
             if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 160) {
                 throw new RemoteError('claude-bridge/invalid-session', '会话标识无效。', {});
             }
+            // The native ordinary-session resolver deliberately rejects even live
+            // subagents. History reconciliation uses their existing owner; it must
+            // never resume or create a replacement child through that resolver.
+            const live = this.ctx.agents.get(sessionId);
+            if (live?.session.header.agentPreset === CLAUDE_PRESET && live.session.header.origin === 'subagent') {
+                return this.backend.syncSession(live);
+            }
+            const attached = this.ctx.sessions.get(sessionId);
+            if (attached?.header.agentPreset === CLAUDE_PRESET && attached.header.origin === 'subagent') {
+                return { status: 'read-only' };
+            }
             const resolved = await this.ctx.get('sessionController').resolveAgent(sessionId);
-            if (resolved?.error)
+            if (resolved?.error) {
+                // A persisted child can be visible without an attached Session. Only
+                // the native ownership rejection plus our existing remote binding can
+                // identify that case without activating or copying its transcript.
+                if (resolved.error.code === 'session/agent-busy'
+                    && resolved.error.details?.reason === 'use subagent delivery for this child session') {
+                    await this.backend.state.ready;
+                    if (Object.hasOwn(this.backend.state.value.sessions, sessionId))
+                        return { status: 'read-only' };
+                }
                 throw resolved.error;
+            }
             const agent = resolved?.agent;
             if (!agent?.session)
                 throw new RemoteError('claude-bridge/invalid-session', '无法解析会话智能体。', {});

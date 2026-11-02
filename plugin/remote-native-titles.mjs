@@ -70,7 +70,10 @@ export function installRemoteNativeTitles(ctx, { normalizeSessionTitle, report =
         const first = ctx.sessionProjections.stateOf(session, 'titleInput')?.first
         if (!first || !Number.isSafeInteger(first.seq)) return false
         const current = service.get(session)
-        if (current?.source.kind === 'user' || current?.title === title) return false
+        // Matching fallback text still needs one durable confirmation that the
+        // SDK supplied this title. Only our own provider record is idempotent.
+        if (current?.source.kind === 'user' || current?.title === title
+          && current?.source.provider === 'claude-bridge-sdk-title') return false
         session.append('session/title', { title, messageSeqs: [first.seq], source: {
           kind: 'provider', provider: 'claude-bridge-sdk-title',
         } })

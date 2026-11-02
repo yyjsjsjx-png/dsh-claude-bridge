@@ -58,15 +58,30 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     const haiku = { value: 'haiku', displayName: 'Fixture Haiku', supportedEffortLevels: ['low', 'high'] };
     const sonnet = { value: 'sonnet', displayName: 'Fixture Sonnet', supportedEffortLevels: ['medium', 'high'] };
     let catalog = { status: 'ok', models: [haiku, sonnet] };
-    const queries = [];
+    const queries = [], historyReads = [], cloudHistory = new Map();
+    let historyFailure, pauseChild;
     backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers: {
       ...runtime, appendPluginRecord, resolveDshHome: () => directory,
     }, createTransport: async options => ({ peer: {
       async request(method, params) {
-        if (method === 'initialize') return { protocolVersion: 1, authenticated: true };
+        if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { historySync: true } };
         if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false };
+        if (method === 'history') {
+          historyReads.push(params);
+          if (historyFailure) throw historyFailure;
+          return { status: 'ok', sessionId: params.sessionId, records: cloudHistory.get(params.sessionId) ?? [],
+            runs: {}, nextOffset: 1, lastUuid: 'synthetic-history', done: true };
+        }
         assert.equal(method, 'query');
         queries.push(params);
+        if (pauseChild && ctx.agents.get(params.dshSessionId)?.session.header.origin === 'subagent') {
+          const pause = pauseChild; pauseChild = undefined;
+          pause.entered.resolve();
+          await pause.release.promise;
+        }
+        cloudHistory.set(params.sessionId, [{ type: 'assistant', uuid: 'synthetic-history',
+          apiId: `fixture-${queries.length}`, model: params.model,
+          content: [{ type: 'text', text: 'synthetic child answer' }] }]);
         await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'assistant',
           message: { id: `fixture-${queries.length}`, model: params.model, content: [{ type: 'text', text: 'synthetic child answer' }] } } });
         await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'result', subtype: 'success' } });
@@ -74,7 +89,12 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       }, async drainNotifications() {},
     }, async close() {} }) });
     backend.catalog = async () => catalog;
-    backend.displayCatalog = async () => catalog;
+    await backend.saveModelPreferences({ enabledIds: ['haiku', 'sonnet'] });
+    const cachedDisplay = async ({ visible = false } = {}) => {
+      const enabled = new Set(backend.state.value.modelPreferences.enabledIds);
+      return { ...catalog, models: catalog.models.filter(model => !visible || enabled.has(model.value)) };
+    };
+    backend.displayCatalog = cachedDisplay;
     backend.refreshDisplayCatalog = () => {};
     class Bridge extends Service {
       constructor(context) { super(context, 'claudeBridge'); this.backend = backend; }
@@ -94,6 +114,8 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       execute: async () => assert.fail('不执行真实shell') });
     await ctx.plugin(RoutedAgentLoop, { agents: [] });
+    const activations = [], startActivation = ctx.subagents.startActivation;
+    ctx.subagents.startActivation = function(spec) { activations.push(spec); return startActivation.call(this, spec); };
     const create = async (id, reasoningEffort, ordinary = false) => (await ctx.agentLoop.createAgent(ctx, {
       sessionId: id, meta: { agentPreset: ordinary ? 'standard' : 'claude-sdk-remote', cwd: directory },
       agentOptions: { provider: ordinary ? 'ordinary' : 'claude-sdk-remote', model: ordinary ? 'fixture' : 'haiku', reasoningEffort },
@@ -106,13 +128,17 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     // policy must capture its own cached catalog, even when the first read resolves last.
     const firstCatalog = Promise.withResolvers(), firstEntered = Promise.withResolvers();
     let reads = 0;
-    backend.displayCatalog = async () => { if (++reads === 1) { firstEntered.resolve(); return firstCatalog.promise; } return { status: 'ok', models: [haiku] }; };
+    backend.displayCatalog = async options => {
+      assert.equal(options, undefined); // Capture includes hidden routes, using only the cached snapshot.
+      if (++reads === 1) { firstEntered.resolve(); return firstCatalog.promise; }
+      return { status: 'ok', models: [haiku] };
+    };
     const pendingA = create('remote-a', 'high');
     await firstEntered.promise;
     const b = await create('remote-b', 'low');
     firstCatalog.resolve(catalog);
     const a = await pendingA;
-    backend.displayCatalog = async () => catalog;
+    backend.displayCatalog = cachedDisplay;
     const ordinary = await create('ordinary', undefined, true);
     await Promise.all([assemble(a), assemble(b)]);
     await assemble(ordinary);
@@ -180,14 +206,22 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       assert.equal(ctx.agents.list().length, count);
     });
     await t.test('原生深度、不分叉及资源卸载仍保留', async () => {
-      const nested = ctx.agents.list().find(agent => agent.session.header.origin === 'subagent');
-      await assemble(nested);
-      await assert.rejects(definition(nested).execute({ description: 'too deep', prompt: 'synthetic' }, { agent: nested, signal }), /depth|深度/i);
-      assert.equal(ctx.tools.get('subagent_fork', a), undefined);
-      const before = queries.length;
-      ordinary.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'synthetic ordinary' }] }));
-      await ordinary.activityDone;
-      assert.equal(queries.length, before);
+      // A completed child may already be disposing its native scope. Hold one
+      // real fake-transport query so this assertion addresses a live child.
+      const pause = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+      pauseChild = pause;
+      const value = await definition(a).execute({ description: 'live depth fixture', prompt: 'synthetic' }, { agent: a, signal });
+      const nested = ctx.agents.get(value.subagentId);
+      await pause.entered.promise;
+      try {
+        await assemble(nested);
+        await assert.rejects(definition(nested).execute({ description: 'too deep', prompt: 'synthetic' }, { agent: nested, signal }), /depth|深度/i);
+        assert.equal(ctx.tools.get('subagent_fork', a), undefined);
+        const before = queries.filter(row => row.dshSessionId === ordinary.id).length;
+        ordinary.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'synthetic ordinary' }] }));
+        await ordinary.activityDone;
+        assert.equal(queries.filter(row => row.dshSessionId === ordinary.id).length, before);
+      } finally { pause.release.resolve(); await nested.activityDone; }
     });
     await t.test('缺少本机目录快照时只降级显式选择，创建与历史展示不访问live目录', async () => {
       const savedCatalog = backend.catalog;
@@ -201,10 +235,151 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       assert.equal(ctx.tools.get('list_subagent_models', offline), undefined);
       assert.equal(policy(offline), null);
       backend.catalog = savedCatalog;
-      backend.displayCatalog = async () => catalog;
+      backend.displayCatalog = cachedDisplay;
       const inherited = await run(offline);
       assert.equal(inherited.query.effort, 'high');
       const recovered = await create('remote-recovered', 'low');
       assert.ok(definition(recovered).parameters.properties.reasoning_effort);
+    });
+    await t.test('原生ordinary resolver拒绝live子代理，bridge历史同步复用真实owner且不改变续聊入口', async () => {
+      const { SessionController } = await import(resolveDshModule('@deepseek-ai/dsh-api-session-controller'));
+      const { ClaudeBridgeService } = await import('../plugin/index.mjs');
+      // Only inert gateway/file-upload registration is supplied. The actual
+      // installed controller constructs and owns its native Agent resolver.
+      class Typert extends Service {
+        constructor(inner) {
+          super(inner, 'typert');
+          this.resources = { register() {} };
+          this.lookups = { configure() {} };
+          this.contexts = { configureHost() {} };
+        }
+      }
+      class Uploads extends Service {
+        constructor(inner) { super(inner, 'fileUploads'); }
+        registerAgentResolver() { return () => {}; }
+      }
+      class Queries extends Service {
+        constructor(inner) { super(inner, 'sessionQuery'); }
+        async observeSession(sessionId) {
+          assert.equal(sessionId, 'cold-persisted-child');
+          return { header: { id: sessionId, agentPreset: 'claude-sdk-remote', origin: 'subagent',
+            parentSession: a.id, cwd: directory }, [Symbol.dispose]() {} };
+        }
+      }
+      await ctx.plugin(Typert);
+      await ctx.plugin(Uploads);
+      await ctx.plugin(Queries);
+      let controller;
+      const controllerOwner = ctx.plugin({ inject: ['typert', 'sessions', 'agents', 'sessionProjections', 'fileUploads', 'sessionQuery'],
+        apply: inner => { controller = new SessionController(inner, {}); } });
+      await controllerOwner;
+      const child = ctx.agents.list().find(agent => agent.session.header.origin === 'subagent');
+      assert.ok(child);
+      const nativeRejection = await controller.resolveAgent(child.id);
+      assert.equal(nativeRejection.error.code, 'session/agent-busy');
+      assert.equal(nativeRejection.error.details.reason, 'use subagent delivery for this child session');
+      const host = Object.create(ClaudeBridgeService.prototype);
+      Object.defineProperty(host, 'ctx', { value: ctx });
+      host.backend = backend;
+      host.assertOwner = () => {}; // No transport/principal is involved in this fixture.
+      const queryCount = queries.length;
+      const first = await host.syncSession(child.id);
+      assert.equal(first.status, 'ready');
+      assert.equal(first.added, 0);
+      assert.equal(child._bridgeStatus.recovery.status, 'ready');
+      assert.equal(historyReads.at(-1).dshSessionId, child.id);
+      assert.equal(ctx.agents.get(child.id), child);
+      assert.equal((await host.syncSession(child.id)).added, 0);
+      assert.equal(queries.length, queryCount);
+      assert.equal((await controller.resolveAgent(child.id)).error.code, 'session/agent-busy');
+      assert.equal((await host.syncSession(ordinary.id)).status, 'not-remote');
+      assert.equal((await controller.resolveAgent(a.id)).agent, a);
+      historyFailure = Object.assign(new Error('synthetic history failure'), { code: 'FIXTURE_HISTORY_UNAVAILABLE' });
+      await assert.rejects(host.syncSession(child.id), { code: 'FIXTURE_HISTORY_UNAVAILABLE' });
+      assert.equal(child._bridgeStatus.recovery.status, 'unavailable');
+      assert.equal(child._bridgeStatus.recovery.code, 'FIXTURE_HISTORY_UNAVAILABLE');
+      historyFailure = undefined;
+      assert.equal((await host.syncSession(child.id)).status, 'ready');
+      assert.equal(child._bridgeStatus.recovery.code, undefined);
+
+      // An attached cold child has a Session, never a replacement Agent or a
+      // fabricated idle phase. Its existing history is explicitly read-only.
+      const cold = ctx.sessions.create('cold-remote-child', { meta: { agentPreset: 'claude-sdk-remote',
+        origin: 'subagent', parentSession: a.id, cwd: directory, delegationDepth: 1 } });
+      assert.equal(ctx.agents.get(cold.id), undefined);
+      const readsBeforeCold = historyReads.length;
+      assert.deepEqual(await host.syncSession(cold.id), { status: 'read-only' });
+      assert.equal(ctx.agents.get(cold.id), undefined);
+      assert.equal(historyReads.length, readsBeforeCold);
+      await backend.state.binding('cold-persisted-child', directory);
+      assert.equal(ctx.sessions.get('cold-persisted-child'), undefined);
+      assert.deepEqual(await host.syncSession('cold-persisted-child'), { status: 'read-only' });
+      assert.equal(ctx.agents.get('cold-persisted-child'), undefined);
+      assert.equal(historyReads.length, readsBeforeCold);
+      assert.equal((await host.syncSession(a.id)).status, 'ready');
+      await controllerOwner.dispose();
+    });
+    await t.test('用户勾选只过滤列表，隐藏真实型号仍能显式调用，空列表不收窄完整账号策略', async () => {
+      const invoke = args => definition(a).execute({ description: 'catalog validation', prompt: 'synthetic', ...args }, { agent: a, signal });
+      const listModels = args => ctx.tools.get('list_subagent_models', a).execute({ provider: 'claude-sdk-remote', ...args }, { agent: a, signal });
+      assert.deepEqual(policy(a).map(row => row.model), ['haiku', 'sonnet']);
+      await backend.saveModelPreferences({ enabledIds: ['haiku'] });
+      const listed = await listModels({});
+      assert.match(listed, /haiku/);
+      assert.doesNotMatch(listed, /sonnet/);
+      assert.match(await listModels({ model: 'sonnet' }), /sonnet[\s\S]*medium/);
+      const selected = await run(a, { provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' });
+      assert.equal(selected.query.model, 'sonnet');
+      assert.equal(selected.query.effort, 'medium');
+      assert.equal(selected.config.model, 'sonnet');
+      const activationCount = activations.length;
+      for (const args of [{ provider: 'claude-sdk-remote' }, { model: 'sonnet' }]) {
+        await assert.rejects(invoke(args), /must be supplied together/);
+      }
+      await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'missing' }), /not allowed/);
+      await assert.rejects(listModels({ model: 'missing' }), /not allowed/);
+      assert.equal(activations.length, activationCount);
+      // New Sessions capture every cached account route, including hidden ones,
+      // without making a live call or expanding an existing durable policy.
+      const savedCatalog = backend.catalog;
+      backend.catalog = async () => assert.fail('捕获完整账号快照不应读取live目录');
+      const captured = await create('remote-full-capture', 'high');
+      assert.deepEqual(policy(captured).map(row => row.model), ['haiku', 'sonnet']);
+      backend.catalog = savedCatalog;
+      await backend.saveModelPreferences({ enabledIds: [] });
+      assert.match(await listModels({}), /no advertised models/);
+      const allHidden = await create('remote-all-hidden', 'high');
+      assert.deepEqual(policy(allHidden).map(row => row.model), ['haiku', 'sonnet']);
+      assert.ok(definition(allHidden).parameters.properties.reasoning_effort);
+      assert.match(await ctx.tools.get('list_subagent_models', allHidden).execute({ provider: 'claude-sdk-remote' }, { agent: allHidden, signal }), /no advertised models/);
+      const hidden = await run(allHidden, { provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' });
+      assert.equal(hidden.query.model, 'sonnet');
+      assert.equal(hidden.query.effort, 'medium');
+      const defaulted = await run(a, { reasoning_effort: 'model-default' });
+      assert.equal(defaulted.query.model, 'haiku');
+      assert.equal(defaulted.query.effort, undefined);
+      const inherited = await run(a);
+      assert.equal(inherited.query.model, 'haiku');
+      assert.equal(inherited.query.effort, 'high');
+      assert.equal(a.options.model, 'haiku');
+      assert.equal(a.options.reasoningEffort, 'high');
+      await backend.saveModelPreferences({ enabledIds: ['haiku', 'sonnet'] });
+      assert.match(await listModels({}), /sonnet/);
+    });
+    await t.test('目录中已失效的捕获型号和不支持的强度明确拒绝，不创建child或回退其它型号', async () => {
+      const invoke = args => definition(a).execute({ description: 'invalid catalog choice', prompt: 'synthetic', ...args }, { agent: a, signal });
+      const activationCount = activations.length;
+      try {
+        await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'low' }), /effort|强度/);
+        catalog = { status: 'ok', models: [haiku] };
+        await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' }), /目录/);
+        await assert.rejects(ctx.tools.get('list_subagent_models', a).execute({ provider: 'claude-sdk-remote', model: 'sonnet' }, { agent: a, signal }), /目录/);
+        assert.equal(activations.length, activationCount);
+        assert.equal(a.options.model, 'haiku');
+        assert.equal(a.options.reasoningEffort, 'high');
+      } finally {
+        catalog = { status: 'ok', models: [haiku, sonnet] };
+        await backend.saveModelPreferences({ enabledIds: ['haiku', 'sonnet'] });
+      }
     });
   });

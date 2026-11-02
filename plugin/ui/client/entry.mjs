@@ -1,7 +1,7 @@
 /** DSH wiring: mount RPC first, then create one controller set per child scope. */
 export function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientFirstOutput }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -85,7 +85,8 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
 };
 
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
-exports.installUsageProjection = createUsageProjectionBridge({ React });
+exports.installUsageProjection = createUsageProjectionBridge({ React, createClientFirstOutput, createPortal,
+  useAnchoredPosition, useDismissOnOutsidePointer });
 
 exports.apply = async function apply(ctx) {
   ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
@@ -133,7 +134,7 @@ exports.apply = async function apply(ctx) {
     onAuthenticationRequired: settings.authenticationRequired });
   const picker = createPickerController({ rpc, workspaces: ctx.workspaces, sessions: ctx.sessions,
     uiWorkspace: ctx.uiWorkspace, createStore, textError });
-  const { SessionMeter, QuotaMeter } = createMeterViews({ React, createPortal,
+  const { SessionMeter, QuotaMeter, SessionModelBadge } = createMeterViews({ React, createPortal,
     useAnchoredPosition, useDismissOnOutsidePointer });
   const { MenuItem, HeroButton, Picker, Settings } = createFormViews({ React });
   const historyTasks = new Map();
@@ -171,6 +172,16 @@ exports.apply = async function apply(ctx) {
       ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
       quota: quota.store }, readQuota: quota.readPlanUsage }),
   }, QuotaMeter));
+  // Both full and embedded child pages render this same native dock. Read the
+  // pane's standard Session hooks rather than looking up a root binding.
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock', id: 'dsh-claude-child-model', order: 90,
+    inject: sessionId => {
+      let directory;
+      try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
+      return { sessionId, hooks: { modelDirectory: directory ?? ABSENT_STATUS } };
+    },
+  }, SessionModelBadge));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,

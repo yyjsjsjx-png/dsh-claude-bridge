@@ -14,7 +14,14 @@ const { scopeOf, scopeChainOf } = await import(resolveDshModule('@deepseek-ai/ds
 export const Config = native.Config;
 export const inject = [...native.inject, 'agents', 'llm', 'claudeBridge'];
 
-function selectionContext(ctx, readCatalog, allowedModels, toolName) {
+// Hiding every model is a valid display preference, independent of the full
+// account catalog captured by the native Session selection policy.
+function visibleModels(catalog) {
+  if (catalog?.status === 'ok' && Array.isArray(catalog.models) && catalog.models.length === 0) return [];
+  return subagentModels(catalog);
+}
+
+function selectionContext(ctx, readCatalog, readVisibleCatalog, allowedModels, toolName) {
   const settings = { current: () => ({ enabled: true, allowedModels }) };
   const llm = new Proxy(ctx.llm, { get(target, key) {
     if (key === 'listProviders') return () => target.listProviders().filter(row => row.id === CLAUDE_PROVIDER);
@@ -23,7 +30,7 @@ function selectionContext(ctx, readCatalog, allowedModels, toolName) {
       if (key === 'listModels') { signal = model; model = undefined; }
       assertRemoteSubagentRoute({ provider });
       signal?.throwIfAborted();
-      const models = subagentModels(await readCatalog());
+      const models = key === 'listModels' ? visibleModels(await readVisibleCatalog()) : subagentModels(await readCatalog());
       signal?.throwIfAborted();
       if (key === 'listModels') return models;
       const found = models.find(row => row.id === model);
@@ -55,12 +62,12 @@ function selectionContext(ctx, readCatalog, allowedModels, toolName) {
       if (definition.name === toolName && definition.parameters?.properties?.reasoning_effort) {
         definition.parameters.properties.reasoning_effort.description +=
           ` Use the reserved value "${MODEL_DEFAULT_EFFORT}" to explicitly use the selected model's default, even for the parent's current model.`;
-        definition.description += ' Explicit choices are restricted to this Session\'s captured Claude account catalog and revalidated before execution.';
+        definition.description += ' Explicit choices are restricted to this Session\'s captured Claude account routes and revalidated before execution. Model display settings only filter discovery lists; a hidden model can still be selected explicitly if it exists in the account catalog.';
       }
       if (definition.name === toolName && allowedModels === undefined) definition.description +=
         ' The verified Claude account catalog is unavailable. This tool only inherits the parent model and effort; explicit selection becomes available after reloading the session with a verified catalog.';
       if (definition.name === 'list_subagent_models') definition.description =
-        `Inspect Claude account models and reasoning efforts for subagents. Only routes captured for this Session are selectable; actual execution revalidates the live catalog. reasoning_effort="${MODEL_DEFAULT_EFFORT}" explicitly clears an inherited effort. Omitted fields inherit the parent selection.`;
+        `List Claude models enabled in this device's model display settings, or name an exact account model to inspect its reasoning efforts even when hidden. Explicit choices must belong to this Session's captured routes and the live account catalog; display settings do not prohibit a known hidden model. Unknown models and unsupported efforts fail without fallback. reasoning_effort="${MODEL_DEFAULT_EFFORT}" explicitly clears an inherited effort. Omitted fields inherit the parent selection.`;
       return target.register(definition);
     };
     const value = Reflect.get(target, key, target);
@@ -80,7 +87,8 @@ function selectionContext(ctx, readCatalog, allowedModels, toolName) {
 export async function apply(ctx, config) {
   if (config.provider !== 'spawn' || config.agentPreset !== undefined || config.allowedAgentPresets !== undefined
     || typeof native.apply !== 'function' || typeof ctx.llm.prepareCall !== 'function'
-    || typeof ctx.claudeBridge.backend?.displayCatalog !== 'function') {
+    || typeof ctx.claudeBridge.backend?.displayCatalog !== 'function'
+    || typeof ctx.claudeBridge.backend?.visibleCatalog !== 'function') {
     throw new Error('远程子任务只能使用原生独立 spawn 与继承的远程预设。');
   }
   const generation = scopeOf(ctx);
@@ -116,7 +124,8 @@ export async function apply(ctx, config) {
         signal?.throwIfAborted();
         if (disposed) throw new Error('远程子任务预设已卸载。');
         entry.fiber = agent.ctx.inject(native.inject, inner => native.apply(
-          selectionContext(inner, () => ctx.claudeBridge.backend.catalog(), allowedModels, config.toolName ?? 'subagent'),
+          selectionContext(inner, () => ctx.claudeBridge.backend.catalog(), () => ctx.claudeBridge.backend.visibleCatalog(),
+            allowedModels, config.toolName ?? 'subagent'),
           { ...config, modelSelectionSettings: allowedModels !== undefined }, agent.session));
         fibers.add(entry.fiber);
         await entry.fiber;

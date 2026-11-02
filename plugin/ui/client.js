@@ -489,7 +489,7 @@ function compactTokens(value) {
       try { result = await syncSession(); } catch { result = { status: 'unavailable' }; }
       if (bindingRef.current === binding) {
         if (result?.status === 'unavailable') setSyncFailure(binding);
-        else if (['ready', 'empty', 'not-remote'].includes(result?.status)) setSyncFailure(null);
+        else if (['ready', 'empty', 'not-remote', 'read-only'].includes(result?.status)) setSyncFailure(null);
       }
       return result;
     };
@@ -499,14 +499,15 @@ function compactTokens(value) {
     }, [syncSession]);
     React.useEffect(() => {
       if (state == null || !syncSession || ['running', 'compacting', 'stopping'].includes(state.phase)) return;
-      let cancelled = false, timer, failures = 0, inFlight = false;
+      let cancelled = false, readOnly = false, timer, failures = 0, inFlight = false;
       const sync = async () => {
         clearTimeout(timer);
-        if (cancelled || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+        if (cancelled || readOnly || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
         inFlight = true;
         let result;
         try { result = await synchronize(); }
         finally { inFlight = false; }
+        if (result?.status === 'read-only') { readOnly = true; return; }
         if (!cancelled) {
           const retry = ['waiting', 'unavailable', 'active'].includes(result?.status);
           if (!retry) failures = 0;
@@ -602,6 +603,37 @@ function compactTokens(value) {
                 'aria-hidden': true, style: { background: row.color } }), row.name),
               React.createElement('dd', null, `~${compactTokens(row.tokens)}`)))))
           : React.createElement('p', { style: { margin: '8px 0 0' } }, '完成一轮对话后更新。')), document.body));
+  }
+
+  /** Requested selection and per-response SDK evidence are independent. */
+  function SessionModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
+    const bridge = useProjection('claudeBridge');
+    const selected = useProjection('modelSelection')?.lastUsed;
+    const observation = useProjection('claudeBridgeModelObservation')?.current;
+    const session = useSession(value => value);
+    const summary = useSessions(value => value)?.byId?.[sessionId];
+    const directory = useModelDirectory(value => value);
+    if (bridge == null) return null;
+    const child = session?.subagent != null || summary?.origin === 'subagent';
+    const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
+    const actual = known && observation?.requestedModel === selected.model ? observation?.actualModel : null;
+    if (!child && !actual) return null;
+    const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
+      ?.find(row => row.id === selected.model) : undefined;
+    const name = model?.name || (known ? selected.model : '型号待确认');
+    const effort = known ? selected.reasoningEffort || '模型默认' : '强度待确认';
+    const requestTitle = known
+      ? `最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
+      : '此子代理尚无原生 request/header；不会用父选型或待发送选型代替。';
+    const title = `${requestTitle}\n${actual
+      ? `本响应 SDK 返回型号：${actual}；来源：${observation.source}；响应：${observation.responseId ?? '未提供 ID'}。\n型号别名展开或字符串差异不等于降级；SDK 未报告实际思考等级。`
+      : '本响应尚无 SDK 返回型号；不会用请求配置、初始化信息或旧响应代替。'}`;
+    const text = `${child ? `${name} · ${effort}` : ''}${actual ? `${child ? ' ｜ ' : ''}SDK 返回：${actual}` : ''}`;
+    return React.createElement('span', { className: 'dsh-claude-child-model', role: 'status', title,
+      'aria-label': `${child ? `子代理请求型号 ${name}，请求思考强度 ${effort}。` : ''}${actual ? `本响应 SDK 返回型号 ${actual}` : ''}`,
+      style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #666)',
+        minWidth: 0, maxWidth: '320px', flexShrink: 1,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, text);
   }
 
   function QuotaMeter({ useBridgeStatus, useQuota, readQuota }) {
@@ -764,7 +796,7 @@ function compactTokens(value) {
               : new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
-  return { SessionMeter, QuotaMeter };
+  return { SessionMeter, QuotaMeter, SessionModelBadge };
 }
 
 function createFormViews({ React }) {
@@ -997,7 +1029,7 @@ const SETTINGS_CSS = `
         h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '显示的模型'),
           state.modelsLoaded && state.models.length > 0
             && h('span', { className: 'dcb-card-meta' }, `已选 ${selectedCount} / ${state.models.length}`)),
-        h('p', { className: 'dcb-card-desc' }, '选择模型列表中显示的模型；隐藏不会停止已有会话，正在使用的模型会暂时保留在原生列表中。'),
+        h('p', { className: 'dcb-card-desc' }, '选择主会话与子代理列表中显示的模型。隐藏不限制显式指定真实可用的型号，也不停止已有会话；正在使用的模型可能暂时保留在原生列表中。'),
         !state.configured && h('p', { className: 'dcb-hint' }, '请先保存连接设置，再读取账号模型。'),
         state.modelsLoading && h('p', { className: 'dcb-hint' }, '正在读取模型…'),
         state.modelCatalog?.status === 'failed' && h('p', { role: 'alert', 'aria-label': '模型目录刷新状态',
@@ -1092,11 +1124,281 @@ const SETTINGS_CSS = `
   return { MenuItem, HeroButton, Picker, Settings };
 }
 
-function createUsageProjectionBridge({ React }) {
+function createClientFirstOutput(options = {}) {
+  const doc = options.document ?? globalThis.document;
+  const now = options.now ?? (() => globalThis.performance.now());
+  const frame = options.requestFrame ?? (callback => globalThis.requestAnimationFrame(callback));
+  const cancelFrame = options.cancelFrame ?? (id => globalThis.cancelAnimationFrame(id));
+  const canFrame = typeof options.requestFrame === 'function' || typeof globalThis.requestAnimationFrame === 'function';
+  let storage = options.storage;
+  if (storage === undefined) { try { storage = globalThis.localStorage; } catch {} }
+  const maximumMs = 30 * 60 * 1000;
+  const bindings = new Map();
+  let closed = false;
+
+  // A positive Range alone is insufficient: scroll clipping and folded native
+  // work details can leave descendant layout boxes outside the visible region.
+  function visibleText(node, root) {
+    const element = node.parentElement;
+    if (!element || !root.contains(element) || !node.textContent?.trim()) return false;
+    if (element.closest('[hidden],[aria-hidden="true"],[data-turn-process-hidden],[data-turn-process-inline]')) return false;
+    const view = doc.defaultView;
+    const width = view?.innerWidth ?? doc.documentElement?.clientWidth;
+    const height = view?.innerHeight ?? doc.documentElement?.clientHeight;
+    if (!(width > 0 && height > 0)) return false;
+    const clips = [];
+    for (let current = element; current; current = current.parentElement) {
+      const style = view.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse'
+        || style.contentVisibility === 'hidden' || Number(style.opacity) === 0) return false;
+      if (/(hidden|clip|auto|scroll)/.test(`${style.overflowX} ${style.overflowY}`)) {
+        clips.push({ rect: current.getBoundingClientRect(), x: style.overflowX !== 'visible', y: style.overflowY !== 'visible' });
+      }
+    }
+    const range = doc.createRange();
+    range.selectNodeContents(node);
+    return [...range.getClientRects()].some(rect => {
+      let left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+      let right = Math.min(width, rect.right), bottom = Math.min(height, rect.bottom);
+      for (const clip of clips) {
+        if (clip.x) { left = Math.max(left, clip.rect.left); right = Math.min(right, clip.rect.right); }
+        if (clip.y) { top = Math.max(top, clip.rect.top); bottom = Math.min(bottom, clip.rect.bottom); }
+      }
+      return right > left && bottom > top;
+    });
+  }
+
+  function visibleOutput(root, props) {
+    if (!root?.isConnected || !doc?.createTreeWalker || doc.hidden) return false;
+    const blocks = props.node?.data?.blocks ?? [];
+    const text = props.groupPart !== 'reasoning' && blocks.some(block => block.kind === 'text' && block.text?.trim());
+    const inlineHidden = props.turnProcess?.foldable && !props.turnProcess.open
+      && props.turnProcess.spec?.answerStep === props.node.data.step && props.turnProcess.spec.inlineReasoning;
+    const reasoning = props.groupPart !== 'response' && !inlineHidden
+      && blocks.some(block => block.kind === 'reasoning' && block.text?.trim());
+    if (!text && !reasoning) return false;
+    const walker = doc.createTreeWalker(root, 4); // SHOW_TEXT, not labels or tool metadata.
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const element = node.parentElement;
+      const thought = element?.closest('[data-variant="think"]');
+      let content = false;
+      if (thought && reasoning) {
+        // rc.5's expanded reasoning body and its real collapsed text preview;
+        // the standalone “thinking” label is deliberately outside both seats.
+        content = thought.hasAttribute('data-expanded') && !!element.closest('[class$="_thinkBody"]')
+          || thought.hasAttribute('data-preview') && !!element.closest('[class$="_summaryText"]');
+      } else if (!thought && text) {
+        content = !!element?.closest('p,li,pre,code,blockquote,h1,h2,h3,h4,h5,h6,td,th')
+          && !element.closest('button,svg,[role="button"],[class$="_stopped"]');
+      }
+      if (content && visibleText(node, root)) return true;
+    }
+    return false;
+  }
+
+  function bind(sessionId, session, scope = session?.actx) {
+    if (!session || typeof sessionId !== 'string' || closed) return undefined;
+    const previous = bindings.get(sessionId);
+    if (previous?.session === session && previous?.scope === scope) return previous.handle;
+    previous?.dispose();
+    const key = `dsh-claude-bridge:first-output:v1:${encodeURIComponent(sessionId)}`;
+    let snapshot = { version: 1, submissions: 0, samples: 0, totalMs: 0 };
+    try {
+      const saved = JSON.parse(storage?.getItem(key) ?? 'null');
+      if (saved?.version === 1 && ['submissions', 'samples', 'totalMs'].every(name => Number.isSafeInteger(saved[name]) && saved[name] >= 0)
+        && saved.submissions <= 1_000_000 && saved.samples <= saved.submissions && saved.totalMs <= saved.samples * maximumMs) {
+        snapshot = { version: 1, submissions: saved.submissions, samples: saved.samples, totalMs: saved.totalMs };
+      }
+    } catch {}
+    const listeners = new Set(), methods = new Map(), frames = new Set(), outstanding = new Set();
+    let pending, turn, serial = 0, disposed = false;
+    const face = session.projections?.faceOf?.('claudeBridge');
+    const remote = () => face?.getSnapshot?.() != null;
+    const publish = next => {
+      snapshot = next;
+      try { storage?.setItem(key, JSON.stringify(snapshot)); } catch {}
+      for (const listener of listeners) { try { listener(); } catch {} }
+    };
+    const invalidate = () => { pending = undefined; outstanding.clear(); turn = undefined; };
+    const wrap = (name, make) => {
+      const original = session[name];
+      if (typeof original !== 'function') return false;
+      const wrapped = make(original);
+      session[name] = wrapped;
+      methods.set(name, { original, wrapped });
+      return true;
+    };
+    const uninstall = () => {
+      invalidate();
+      for (const [name, { original, wrapped }] of methods) if (session[name] === wrapped) session[name] = original;
+      methods.clear();
+    };
+    const reconcile = () => {
+      if (disposed || !remote()) { uninstall(); return; }
+      if (methods.size) return;
+      if (['beginSubmission', 'appendLive', 'installWindow', 'retireFailedSubmission'].some(name => typeof session[name] !== 'function')) return;
+      wrap('beginSubmission', original => function(...args) {
+        const started = now(), eligible = !session.running && args[0]?.mode !== 'steer'
+          && !doc?.hidden && outstanding.size === 0;
+        const result = original.apply(this, args);
+        if (!remote() || disposed || typeof result?.requestId !== 'string') return result;
+        pending = undefined;
+        outstanding.add(result.requestId);
+        if (snapshot.submissions < 1_000_000) {
+          publish({ ...snapshot, submissions: snapshot.submissions + 1 });
+          if (eligible) pending = { requestId: result.requestId, started, serial, turn: undefined };
+        }
+        return result;
+      });
+      wrap('appendLive', original => function(entry, ...args) {
+        const result = original.call(this, entry, ...args);
+        serial++;
+        const event = entry?.event;
+        if (event?.type === 'turn/start' && Number.isSafeInteger(event.data?.turn)) turn = { number: event.data.turn, serial };
+        if (event?.type === 'user/message' && pending && turn && turn.serial > pending.serial
+          && event.data?.source?.kind === 'user' && event.data.source.rpcId === pending.requestId) pending.turn = turn.number;
+        if (event?.type === 'turn/end') outstanding.clear();
+        return result;
+      });
+      wrap('installWindow', original => function(...args) { invalidate(); return original.apply(this, args); });
+      wrap('retireFailedSubmission', original => function(requestId, ...args) {
+        outstanding.delete(requestId);
+        if (pending?.requestId === requestId) pending = undefined;
+        return original.call(this, requestId, ...args);
+      });
+    };
+    const handle = {
+      getSnapshot: () => snapshot,
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+      observe(props, root) {
+        let latest = props, first, second, canceled = false;
+        const update = next => {
+          latest = next;
+          const sample = pending;
+          if (canceled || disposed || first !== undefined || second !== undefined
+            || !sample || !Number.isSafeInteger(sample.turn) || !remote()
+            || sample.turn !== latest.node?.data?.turn || !doc?.createTreeWalker || !doc?.createRange
+            || !doc?.defaultView?.getComputedStyle || doc.hidden || !canFrame) return;
+          first = frame(() => {
+            frames.delete(first); first = undefined;
+            if (canceled || disposed || pending !== sample || doc.hidden) return;
+            second = frame(() => {
+              frames.delete(second); second = undefined;
+              if (canceled || disposed || pending !== sample || doc.hidden || latest.node?.data?.turn !== sample.turn) return;
+              const elapsed = now() - sample.started;
+              if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > maximumMs) { pending = undefined; return; }
+              if (!visibleOutput(root, latest)) return;
+              pending = undefined;
+              outstanding.delete(sample.requestId);
+              publish({ ...snapshot, samples: snapshot.samples + 1, totalMs: snapshot.totalMs + Math.round(elapsed) });
+            });
+            frames.add(second);
+          });
+          frames.add(first);
+        };
+        update(props);
+        return { update, cancel() {
+          canceled = true;
+          for (const id of [first, second]) if (id !== undefined) { cancelFrame(id); frames.delete(id); }
+        } };
+      },
+    };
+    const unsubscribe = face?.subscribe?.(reconcile);
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true; unsubscribe?.(); uninstall();
+      for (const id of frames) cancelFrame(id);
+      frames.clear(); listeners.clear();
+      if (bindings.get(sessionId) === record) bindings.delete(sessionId);
+    };
+    const record = { session, scope, handle, dispose, invalidate };
+    bindings.set(sessionId, record);
+    // ClientSessions owns this exact generation. Pruning it must release both
+    // instance delegates and our Map entry, without extending native retention.
+    scope?.effect?.(() => dispose, 'claude-bridge:first-output');
+    reconcile();
+    return handle;
+  }
+  const hidden = () => { if (doc.hidden) for (const binding of bindings.values()) binding.invalidate(); };
+  doc?.addEventListener?.('visibilitychange', hidden);
+  return { bind, dispose() {
+    closed = true;
+    doc?.removeEventListener?.('visibilitychange', hidden);
+    for (const binding of bindings.values()) binding.dispose();
+    bindings.clear();
+  } };
+}
+
+function createUsageProjectionBridge({ React, createClientFirstOutput, createPortal,
+  useAnchoredPosition, useDismissOnOutsidePointer }) {
   return function installUsageProjection(ctx) {
     if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return () => {};
     const wrappers = new Set();
+    const firstOutput = createClientFirstOutput?.();
     let closed = false;
+    const duration = value => value == null || !Number.isFinite(value) ? '未知'
+      : value < 1000 ? `${Math.round(value)} ms` : `${Math.round(value / 100) / 10} s`;
+    function RemoteStats({ nativeProps, stats, measured, observer, NativeUsage }) {
+      const mode = nativeProps.usePerformanceUsage?.(value => value);
+      const empty = React.useMemo(() => ({ version: 1, submissions: 0, samples: 0, totalMs: 0 }), []);
+      const client = React.useSyncExternalStore(observer?.subscribe ?? (() => () => {}),
+        observer?.getSnapshot ?? (() => empty));
+      const [open, setOpen] = React.useState(false);
+      const rootRef = React.useRef(null), panelRef = React.useRef(null);
+      const position = useAnchoredPosition({ open, anchorRef: rootRef, panelRef, side: 'top', gap: 8, margin: 12 });
+      useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef);
+      React.useEffect(() => {
+        if (!open) return;
+        const close = event => { if (event.key === 'Escape') setOpen(false); };
+        document.addEventListener('keydown', close);
+        return () => document.removeEventListener('keydown', close);
+      }, [open]);
+      if (mode === 'compact') return React.createElement(NativeUsage, nativeProps);
+      if (!stats.steps && !client.submissions) return null;
+      const count = measured?.responseCount ?? 0, sdkSamples = measured?.ttftSteps ?? 0;
+      const speed = stats.decodeMs > 0 ? `${Math.round(stats.decodeTokens / stats.decodeMs * 10000) / 10} tok/s` : '未知';
+      const counts = nativeProps.t('stats.counts', { turns: stats.turns, steps: stats.steps });
+      const label = speed === '未知' ? counts : `${counts} · ${speed}`;
+      const rows = [
+        ['客户端首字显示（观察）', duration(client.samples ? client.totalMs / client.samples : null),
+          `本窗口客户端提交前开始，原生正文或思考内容实际可见后观察；包括本机准备、网络和渲染等待，不是显示器物理 paint 精确时间。${client.samples}/${client.submissions} 次客户端提交有样本；排队、插话、后台或无法关联时不计，旧历史缺观察为未知。`],
+        ['SDK 首有效输出（估算）', duration(sdkSamples ? measured.ttftMs / sdkSamples : null),
+          `SDK 首帧时长，加上远端同机观察首帧到有效正文、思考或工具参数的间隔；含 SDK 缓冲和调度误差，非精确上游计时。${sdkSamples}/${count} 个响应有样本，与客户端提交的分母独立。`],
+        [nativeProps.t('stats.dialog.llmTime'), duration(stats.llmMs)],
+        [nativeProps.t('stats.dialog.toolTime'), duration(stats.toolMs)],
+        ['接收速度（TPS）', speed,
+          `同一完整响应输出 Token / 本机接收首帧至最后有效内容的时长，包含思考和缓冲影响；${measured?.tpsSamples ?? 0}/${count} 个响应有完整样本。`],
+      ];
+      return React.createElement('span', { ref: rootRef, 'data-composer-stat': 'activity', style: { display: 'inline-flex' } },
+        React.createElement('button', { type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': open,
+          'aria-label': String(label), onClick: () => setOpen(!open),
+          style: { border: 0, background: 'transparent', color: 'var(--dsw-alias-label-tertiary)',
+            font: 'inherit', cursor: 'pointer', padding: '1px 4px', fontVariantNumeric: 'tabular-nums' } }, label),
+        open && createPortal(React.createElement('div', { ref: panelRef, role: 'dialog',
+          'aria-label': '远程会话耗时与速度',
+          style: { position: 'fixed', zIndex: 1100, minWidth: 270, padding: 12, borderRadius: 12,
+            background: 'var(--dsw-specific-menu, #fafafa)', color: 'var(--dsw-alias-label-secondary)',
+            boxShadow: 'var(--dsw-elevation-prominent, 0 4px 20px #0002)',
+            fontSize: 12, ...(position ?? { visibility: 'hidden', left: 0, top: 0 }) } },
+          React.createElement('strong', null, '远程会话耗时与速度'),
+          React.createElement('dl', { 'data-session-stats-details': true,
+            style: { display: 'grid', gridTemplateColumns: '1fr auto', gap: '6px 16px', marginBottom: 0 } },
+          ...rows.flatMap(([name, value, title]) => [React.createElement('dt', { key: `${name}:label`, title }, name),
+            React.createElement('dd', { key: `${name}:value`, title, style: { margin: 0, fontVariantNumeric: 'tabular-nums' } }, value)]))), document.body));
+    }
+    function ObservedAssistant({ nativeProps, NativeAssistant }) {
+      const root = React.useRef(null), seat = React.useRef(null);
+      React.useLayoutEffect(() => {
+        const observed = nativeProps.clientFirstOutput?.observe(nativeProps, root.current);
+        seat.current = observed;
+        return () => { observed?.cancel(); if (seat.current === observed) seat.current = null; };
+      }, [nativeProps.clientFirstOutput, nativeProps.node?.data?.turn]);
+      // Stream commits refresh the candidate without canceling its two frames:
+      // a token every frame must not postpone the first sample until completion.
+      React.useLayoutEffect(() => { seat.current?.update(nativeProps); });
+      return React.createElement('div', { ref: root, style: { display: 'contents' } },
+        React.createElement(NativeAssistant, nativeProps));
+    }
     const mount = (slot, field, id) => {
       let native, dispose, reconciling = false;
       const reconcile = () => {
@@ -1128,6 +1430,10 @@ function createUsageProjectionBridge({ React }) {
                 : typeof selector === 'function' ? selector(stats) : stats;
             };
             if (!remote) return React.createElement(NativeUsage, props);
+            if (firstOutput && createPortal && useAnchoredPosition && useDismissOnOutsidePointer) {
+              return React.createElement(RemoteStats, { nativeProps: { ...props, useProjection: alias },
+                stats, measured, observer: props.clientFirstOutput, NativeUsage });
+            }
             const ttftSamples = measured?.ttftSteps ?? 0, tpsSamples = measured?.tpsSamples ?? 0;
             const count = measured?.responseCount ?? 0;
             // rc.5 renders these two locale values only as <dt> children.
@@ -1139,6 +1445,11 @@ function createUsageProjectionBridge({ React }) {
                 `将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有完整接收样本。` }, '接收速度（TPS）')
                 : props.t(key, ...args);
             return React.createElement(NativeUsage, { ...props, useProjection: alias, t: translate });
+          }
+          function RemoteAssistant(props) {
+            const remote = props.useProjection('claudeBridge') != null;
+            return remote && firstOutput ? React.createElement(ObservedAssistant, { nativeProps: props, NativeAssistant: NativeUsage })
+              : React.createElement(NativeUsage, props);
           }
           function RemoteUsage(props) {
             const remote = props.useProjection('claudeBridge') != null;
@@ -1161,10 +1472,17 @@ function createUsageProjectionBridge({ React }) {
             return React.createElement('span', { title: incomplete,
               style: { display: 'inline-flex', alignItems: 'center' } }, content);
           }
-          const component = id === 'activity' ? RemoteActivity : RemoteUsage;
+          const component = id === 'activity' ? RemoteActivity : id === 'assistant-step' ? RemoteAssistant : RemoteUsage;
           wrappers.add(component);
+          const inject = firstOutput && ['activity', 'assistant-step'].includes(id) ? (...args) => {
+            const original = typeof next.inject === 'function' ? next.inject(...args) : {};
+            const sessionId = args[0];
+            const binding = ctx.sessions?.binding?.(sessionId);
+            const observer = firstOutput.bind(sessionId, binding?.session, binding?.ctx);
+            return observer ? { ...original, clientFirstOutput: observer } : original;
+          } : next.inject;
           dispose = ctx.slots.register({ name: slot, ...next.options,
-            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject: next.inject }, component);
+            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject }, component);
         } finally { reconciling = false; }
     };
     const unsubscribe = ctx.slots.subscribe(slot, reconcile);
@@ -1172,14 +1490,14 @@ function createUsageProjectionBridge({ React }) {
     return () => { unsubscribe(); dispose?.(); };
     };
     const cleanup = [mount('conversation.composer.dock', 'id', 'usage'), mount('conversation.chat.node', 'key', 'turn-tail'),
-      mount('conversation.composer.dock', 'id', 'activity')];
-    return () => { closed = true; for (const dispose of cleanup) dispose(); wrappers.clear(); };
+      mount('conversation.composer.dock', 'id', 'activity'), mount('conversation.chat.node', 'key', 'assistant-step')];
+    return () => { closed = true; for (const dispose of cleanup) dispose(); firstOutput?.dispose(); wrappers.clear(); };
   };
 }
 
 function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientFirstOutput }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -1263,7 +1581,8 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
 };
 
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
-exports.installUsageProjection = createUsageProjectionBridge({ React });
+exports.installUsageProjection = createUsageProjectionBridge({ React, createClientFirstOutput, createPortal,
+  useAnchoredPosition, useDismissOnOutsidePointer });
 
 exports.apply = async function apply(ctx) {
   ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
@@ -1311,7 +1630,7 @@ exports.apply = async function apply(ctx) {
     onAuthenticationRequired: settings.authenticationRequired });
   const picker = createPickerController({ rpc, workspaces: ctx.workspaces, sessions: ctx.sessions,
     uiWorkspace: ctx.uiWorkspace, createStore, textError });
-  const { SessionMeter, QuotaMeter } = createMeterViews({ React, createPortal,
+  const { SessionMeter, QuotaMeter, SessionModelBadge } = createMeterViews({ React, createPortal,
     useAnchoredPosition, useDismissOnOutsidePointer });
   const { MenuItem, HeroButton, Picker, Settings } = createFormViews({ React });
   const historyTasks = new Map();
@@ -1349,6 +1668,16 @@ exports.apply = async function apply(ctx) {
       ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
       quota: quota.store }, readQuota: quota.readPlanUsage }),
   }, QuotaMeter));
+  // Both full and embedded child pages render this same native dock. Read the
+  // pane's standard Session hooks rather than looking up a root binding.
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock', id: 'dsh-claude-child-model', order: 90,
+    inject: sessionId => {
+      let directory;
+      try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
+      return { sessionId, hooks: { modelDirectory: directory ?? ABSENT_STATUS } };
+    },
+  }, SessionModelBadge));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,
@@ -1372,5 +1701,5 @@ return exports;
 }
 
 return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
-  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge });
+  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createClientFirstOutput, createUsageProjectionBridge });
 } });

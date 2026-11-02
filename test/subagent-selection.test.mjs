@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MODEL_DEFAULT_EFFORT, subagentModels, withModelDefault, assertRemoteSubagentRoute } from '../plugin/subagent-selection.mjs';
 
-test('子代理目录包含账号全部模型且不推断默认强度', () => {
+test('子代理目录解析保留传入路由且不推断默认强度', () => {
   const models = subagentModels({ status: 'ok', models: [
     { value: 'haiku', displayName: 'Fixture Haiku', supportedEffortLevels: ['low', 'high'] },
     { value: 'sonnet', displayName: 'Fixture Sonnet' },

@@ -63,7 +63,7 @@ function compactTokens(value) {
       try { result = await syncSession(); } catch { result = { status: 'unavailable' }; }
       if (bindingRef.current === binding) {
         if (result?.status === 'unavailable') setSyncFailure(binding);
-        else if (['ready', 'empty', 'not-remote'].includes(result?.status)) setSyncFailure(null);
+        else if (['ready', 'empty', 'not-remote', 'read-only'].includes(result?.status)) setSyncFailure(null);
       }
       return result;
     };
@@ -73,14 +73,15 @@ function compactTokens(value) {
     }, [syncSession]);
     React.useEffect(() => {
       if (state == null || !syncSession || ['running', 'compacting', 'stopping'].includes(state.phase)) return;
-      let cancelled = false, timer, failures = 0, inFlight = false;
+      let cancelled = false, readOnly = false, timer, failures = 0, inFlight = false;
       const sync = async () => {
         clearTimeout(timer);
-        if (cancelled || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+        if (cancelled || readOnly || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
         inFlight = true;
         let result;
         try { result = await synchronize(); }
         finally { inFlight = false; }
+        if (result?.status === 'read-only') { readOnly = true; return; }
         if (!cancelled) {
           const retry = ['waiting', 'unavailable', 'active'].includes(result?.status);
           if (!retry) failures = 0;
@@ -176,6 +177,37 @@ function compactTokens(value) {
                 'aria-hidden': true, style: { background: row.color } }), row.name),
               React.createElement('dd', null, `~${compactTokens(row.tokens)}`)))))
           : React.createElement('p', { style: { margin: '8px 0 0' } }, '完成一轮对话后更新。')), document.body));
+  }
+
+  /** Requested selection and per-response SDK evidence are independent. */
+  function SessionModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
+    const bridge = useProjection('claudeBridge');
+    const selected = useProjection('modelSelection')?.lastUsed;
+    const observation = useProjection('claudeBridgeModelObservation')?.current;
+    const session = useSession(value => value);
+    const summary = useSessions(value => value)?.byId?.[sessionId];
+    const directory = useModelDirectory(value => value);
+    if (bridge == null) return null;
+    const child = session?.subagent != null || summary?.origin === 'subagent';
+    const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
+    const actual = known && observation?.requestedModel === selected.model ? observation?.actualModel : null;
+    if (!child && !actual) return null;
+    const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
+      ?.find(row => row.id === selected.model) : undefined;
+    const name = model?.name || (known ? selected.model : '型号待确认');
+    const effort = known ? selected.reasoningEffort || '模型默认' : '强度待确认';
+    const requestTitle = known
+      ? `最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
+      : '此子代理尚无原生 request/header；不会用父选型或待发送选型代替。';
+    const title = `${requestTitle}\n${actual
+      ? `本响应 SDK 返回型号：${actual}；来源：${observation.source}；响应：${observation.responseId ?? '未提供 ID'}。\n型号别名展开或字符串差异不等于降级；SDK 未报告实际思考等级。`
+      : '本响应尚无 SDK 返回型号；不会用请求配置、初始化信息或旧响应代替。'}`;
+    const text = `${child ? `${name} · ${effort}` : ''}${actual ? `${child ? ' ｜ ' : ''}SDK 返回：${actual}` : ''}`;
+    return React.createElement('span', { className: 'dsh-claude-child-model', role: 'status', title,
+      'aria-label': `${child ? `子代理请求型号 ${name}，请求思考强度 ${effort}。` : ''}${actual ? `本响应 SDK 返回型号 ${actual}` : ''}`,
+      style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #666)',
+        minWidth: 0, maxWidth: '320px', flexShrink: 1,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, text);
   }
 
   function QuotaMeter({ useBridgeStatus, useQuota, readQuota }) {
@@ -338,5 +370,5 @@ function compactTokens(value) {
               : new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
-  return { SessionMeter, QuotaMeter };
+  return { SessionMeter, QuotaMeter, SessionModelBadge };
 }
