@@ -88,6 +88,54 @@ exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'r
 exports.installUsageProjection = createUsageProjectionBridge({ React, createClientFirstOutput, createPortal,
   useAnchoredPosition, useDismissOnOutsidePointer });
 
+// Full pages and embedded child sidepanes share this native Chat view; the
+// latter intentionally omit conversation.session.header. Keep its own binding.
+exports.installChildModelView = function installChildModelView(ctx, ChildModelBadge) {
+  if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return () => {};
+  const slot = 'conversation.view', wrappers = new Set();
+  let native, dispose, closed = false, reconciling = false;
+  const reconcile = () => {
+    if (closed || reconciling) return;
+    const next = ctx.slots.entries(slot).find(entry => entry.options.id === 'chat'
+      && entry.locale === 'chat' && !wrappers.has(entry.component));
+    if (next === native) return;
+    reconciling = true;
+    try {
+      native = next;
+      dispose?.(); dispose = undefined;
+      if (!next) return;
+      const NativeChat = next.component;
+      function ChildModelChat(props) {
+        const bridge = props.useProjection('claudeBridge');
+        const session = props.useSession(value => value);
+        const summary = props.useSessions(value => value.byId?.[props.sessionId]);
+        const child = session?.subagent != null || summary?.origin === 'subagent';
+        if (bridge == null || !child) return React.createElement(NativeChat, props);
+        return React.createElement('div', { className: 'dsh-claude-child-chat',
+          style: { display: 'flex', flexDirection: 'column', flex: 1, height: '100%', minHeight: 0 } },
+          React.createElement('div', { style: { flex: 'none', padding: '6px 12px' } },
+            React.createElement(ChildModelBadge, { sessionId: props.sessionId, isSubagent: true,
+              useBridgeStatus: select => props.useProjection('claudeBridge', select),
+              useModelSelection: select => props.useProjection('modelSelection', select),
+              useSessionList: props.useSessions, useModelDirectory: props.useChildModelDirectory ?? (() => undefined) })),
+          React.createElement('div', { style: { flex: 1, minHeight: 0 } }, React.createElement(NativeChat, props)));
+      }
+      wrappers.add(ChildModelChat);
+      dispose = ctx.slots.register({ name: slot, ...next.options,
+        priority: (next.options.priority ?? 0) - 1, locale: next.locale,
+        inject: (sessionId, ...args) => {
+          const inherited = next.inject?.(sessionId, ...args) ?? {};
+          let directory;
+          try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
+          return { ...inherited, hooks: { ...inherited.hooks, childModelDirectory: directory ?? ABSENT_STATUS } };
+        } }, ChildModelChat);
+    } finally { reconciling = false; }
+  };
+  const unsubscribe = ctx.slots.subscribe(slot, reconcile);
+  reconcile();
+  return () => { closed = true; unsubscribe(); dispose?.(); wrappers.clear(); };
+};
+
 exports.apply = async function apply(ctx) {
   ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
   ctx.inject(['uiConversation'], ctx => {
@@ -136,6 +184,7 @@ exports.apply = async function apply(ctx) {
     uiWorkspace: ctx.uiWorkspace, createStore, textError });
   const { SessionMeter, QuotaMeter, ChildModelBadge } = createMeterViews({ React, createPortal,
     useAnchoredPosition, useDismissOnOutsidePointer });
+  ctx.effect(() => exports.installChildModelView(ctx, ChildModelBadge), '远程子代理型号展示');
   const { MenuItem, HeroButton, Picker, Settings } = createFormViews({ React });
   const historyTasks = new Map();
   async function synchronize(sessionId) {
@@ -172,21 +221,6 @@ exports.apply = async function apply(ctx) {
       ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
       quota: quota.store }, readQuota: quota.readPlanUsage }),
   }, QuotaMeter));
-  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
-    name: 'conversation.session.header.utilities', id: 'dsh-claude-child-model', order: 20,
-    inject: sessionId => {
-      const session = ctx.sessions.binding?.(sessionId)?.session;
-      let directory;
-      // directoryFor subscribes to the native shared catalog. Never call load
-      // from this label: opening a child must not fetch models or change them.
-      try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
-      return { sessionId, isSubagent: ctx.sessions.subagentAddress?.(sessionId) !== undefined, hooks: {
-        bridgeStatus: session?.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
-        modelSelection: session?.projections.faceOf('modelSelection') ?? ABSENT_STATUS,
-        sessionList: ctx.sessions.list ?? ABSENT_STATUS, modelDirectory: directory ?? ABSENT_STATUS,
-      } };
-    },
-  }, ChildModelBadge));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,
