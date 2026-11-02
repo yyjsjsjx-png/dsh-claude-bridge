@@ -17,6 +17,7 @@ import { createRunObservations } from './run-observations.mjs'
 import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { createPromptInput } from './prompt-input.mjs'
+import { createToolCalls } from './tool-calls.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
 const defaultBridgeRelease = { serverVersion: bridgeManifest.version,
@@ -50,20 +51,6 @@ function requireString(value, name, maximum = 4096) {
     throw new WorkerError('INVALID_REQUEST', `${name} 无效`)
   }
   return value
-}
-
-function canonicalJson(value) {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
-  if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  if (value && typeof value === 'object' && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
-  }
-  throw new WorkerError('INVALID_TOOL_ARGUMENTS', '工具参数不是有效的 JSON 值')
-}
-
-function toolKey(name, args) {
-  return `${name}\0${canonicalJson(args)}`
 }
 
 function throwIfAborted(signal) {
@@ -734,6 +721,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       await runStore.begin(cwd, runId, compact ? 'compact' : 'query')
       run.recoveryCwd = cwd
 
+      const toolCalls = createToolCalls({ signal: controller.signal, eventTimeoutMs: toolEventTimeoutMs,
+        createError: (code, message, details) => new WorkerError(code, message, details) })
       try {
         let contextSampler
         const trackCallback = (promise) => {
@@ -741,57 +730,21 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           promise.finally(() => run.callbacks.delete(promise)).catch(() => {})
           return promise
         }
-        // MCP handlers do not receive the SDK's tool-use ID. The SDK's
-        // PreToolUse hook does; match it by the exact canonical input and fail
-        // closed if an identical call is still waiting for its handler.
-        const pendingToolIds = new Map()
-        const pendingToolKeys = new Map()
-        const pendingToolEffects = new Map()
-        const completedToolIds = new Set()
-        const batchedToolIds = new Set()
-        const forwardedToolIds = new Set()
-        const toolEventWaiters = new Map()
-        let appliedConclusion = false
+        // PreToolUse supplies the ID that MCP handlers lack. Only the per-run
+        // registry can bind it to canonical arguments or advance tool facts.
         const qualifiedNames = new Set(definitions.map(({ name }) => `mcp__dsh__${name}`))
         const definitionsByName = new Map(definitions.map((definition) => [`mcp__dsh__${definition.name}`, definition]))
         const markForwardedToolEvents = (message) => {
           if (message?.type !== 'assistant' || message.error || !Array.isArray(message.message?.content)) return
           for (const block of message.message.content) {
             if (block?.type !== 'tool_use' || typeof block.id !== 'string' || !qualifiedNames.has(block.name)) continue
-            forwardedToolIds.add(block.id)
-            toolEventWaiters.get(block.id)?.()
-          }
-        }
-        const waitForToolEvent = async (id) => {
-          if (forwardedToolIds.has(id)) return
-          if (controller.signal.aborted) throw new WorkerError('CANCELLED', '请求已取消')
-          let timer, onAbort
-          try {
-            await new Promise((resolve, reject) => {
-              const ready = () => resolve()
-              toolEventWaiters.set(id, ready)
-              onAbort = () => reject(new WorkerError('CANCELLED', '请求已取消'))
-              controller.signal.addEventListener('abort', onAbort, { once: true })
-              timer = setTimeout(() => reject(new WorkerError('TOOL_EVENT_ORDER_UNAVAILABLE',
-                'SDK 未及时转发对应工具调用，未派发本机工具')), toolEventTimeoutMs)
-              if (forwardedToolIds.has(id)) ready()
-              else if (controller.signal.aborted) onAbort()
-            })
-          } finally {
-            clearTimeout(timer)
-            controller.signal.removeEventListener('abort', onAbort)
-            toolEventWaiters.delete(id)
+            toolCalls.markForwarded(block.id)
           }
         }
         const hasUnexpectedKeys = (name, input) => {
           const definition = definitionsByName.get(name)
           return !definition || !input || typeof input !== 'object' || Array.isArray(input)
             || Object.keys(input).some((key) => !Object.hasOwn(definition.schema.properties, key))
-        }
-        const forgetToolId = (id) => {
-          const key = pendingToolKeys.get(id)
-          if (key !== undefined && pendingToolIds.get(key) === id) pendingToolIds.delete(key)
-          pendingToolKeys.delete(id)
         }
         const denyTool = (reason) => ({
           hookSpecificOutput: {
@@ -804,29 +757,24 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           if (hasUnexpectedKeys(input.tool_name, input.tool_input)) return denyTool('工具参数包含未声明的字段')
           const id = input.tool_use_id ?? toolUseId
           if (typeof id !== 'string' || !id) return denyTool('无法关联工具调用标识')
-          let key
-          try { key = toolKey(input.tool_name, input.tool_input) } catch { return denyTool('工具参数无效') }
-          if (pendingToolIds.has(key) || pendingToolKeys.has(id)) {
-            return denyTool('相同工具参数已有待处理调用，请等待该调用完成')
-          }
-          pendingToolIds.set(key, id)
-          pendingToolKeys.set(id, key)
+          try {
+            if (!toolCalls.register(input.tool_name, input.tool_input, id)) {
+              return denyTool('相同工具参数已有待处理调用，请等待该调用完成')
+            }
+          } catch { return denyTool('工具参数无效') }
           return {}
         }
         const postToolUse = async (input, toolUseId) => {
           const id = input?.tool_use_id ?? toolUseId
           if (typeof id !== 'string') return {}
-          forgetToolId(id)
-          const effects = pendingToolEffects.get(id)
-          if (!effects) return {}
-          pendingToolEffects.delete(id)
           const hookEventName = input?.hook_event_name
-          if (hookEventName !== 'PostToolUse' && hookEventName !== 'PostToolUseFailure') {
-            run.problem = new WorkerError('TOOL_EFFECT_UNCONFIRMED', '无法确认工具后处理类型', { toolMayHaveExecuted: true })
+          let effects
+          try { effects = toolCalls.confirmEffects(id, hookEventName) } catch (error) {
+            run.problem = error
             controller.abort()
             throw run.problem
           }
-          if (effects.concludesTurn) appliedConclusion = true
+          if (!effects) return {}
           diagnose('tool', 'post-hook-applied')
           return {
             ...(effects.concludesTurn ? { continue: false, stopReason: 'DSH 工具已结束本轮。' } : {}),
@@ -843,11 +791,10 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           }
           // A per-tool conclusion already instructed the SDK to stop. Do not
           // create a new DSH step if the batch callback still fires afterward.
-          if (appliedConclusion) return { continue: false, stopReason: 'DSH 工具已结束本轮。' }
+          if (toolCalls.concluded) return { continue: false, stopReason: 'DSH 工具已结束本轮。' }
           const batchIds = new Set(input.tool_calls.map((call) => call?.tool_use_id).filter((id) => typeof id === 'string'))
-          if ([...completedToolIds].some((id) => !batchedToolIds.has(id) && !batchIds.has(id))
-            || [...batchIds].some((id) => pendingToolEffects.has(id))) {
-            run.problem = new WorkerError('STEP_BOUNDARY_UNCONFIRMED', 'SDK 工具批次与本机执行结果不一致', { toolMayHaveExecuted: true })
+          try { toolCalls.assertBatch(batchIds) } catch (error) {
+            run.problem = error
             controller.abort()
             throw run.problem
           }
@@ -884,7 +831,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             controller.abort()
             throw run.problem
           }
-          if (response.continue === false) appliedConclusion = true
+          if (response.continue === false) toolCalls.conclude()
           if (response.userMessages?.length) {
             const messages = response.userMessages.map(item => ({ type: 'user', uuid: item.id.toLowerCase(),
               session_id: sessionId, message: { role: 'user', content: item.content },
@@ -908,7 +855,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             throwIfAborted(signal)
             diagnose('input', 'submitted')
           }
-          for (const id of batchIds) if (completedToolIds.has(id)) batchedToolIds.add(id)
+          toolCalls.confirmBatch(batchIds)
           diagnose('step', response.continue === false ? 'stopped' : 'prepared')
           contextSampler?.request()
           return {
@@ -920,18 +867,16 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         })())
         const mcpTools = convertedDefinitions.map((definition) => {
           return sdk.tool(definition.name, definition.description, definition.shape, (args) => trackCallback((async () => {
-            const key = toolKey(`mcp__dsh__${definition.name}`, args)
-            const callId = pendingToolIds.get(key)
+            const callId = toolCalls.take(`mcp__dsh__${definition.name}`, args)
             if (!callId) {
               run.problem = new WorkerError('TOOL_ID_UNAVAILABLE', '无法关联 SDK 工具调用，已停止执行')
               controller.abort()
               throw run.problem
             }
-            forgetToolId(callId)
             // The real SDK callback and its yielded assistant message can race.
             // Only dispatch after the original matching assistant event has
             // entered the same ordered RPC output stream as the tool request.
-            try { await waitForToolEvent(callId) } catch (error) {
+            try { await toolCalls.waitForEvent(callId) } catch (error) {
               if (!run.problem) run.problem = error instanceof WorkerError ? error
                 : new WorkerError('TOOL_EVENT_ORDER_UNAVAILABLE', 'SDK 工具调用顺序无法确认，未派发本机工具')
               diagnose('tool', 'event-order-failed', run.problem.code)
@@ -947,8 +892,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
               }, { signal: controller.signal })
               const { mcpResult, effects } = asMcpResult(response)
               await runStore.receipt(cwd, runId, callId, definition.name, args)
-              completedToolIds.add(callId)
-              if (effects.concludesTurn || effects.additionalContexts.length) pendingToolEffects.set(callId, effects)
+              toolCalls.recordResult(callId, effects)
               diagnose('tool', 'complete')
               return mcpResult
             } catch (error) {
@@ -990,7 +934,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             PostToolBatch: [{ hooks: [postToolBatch] }],
             PermissionDenied: [{ hooks: [async (input, toolUseId) => {
               const id = input?.tool_use_id ?? toolUseId
-              if (typeof id === 'string') forgetToolId(id)
+              if (typeof id === 'string') toolCalls.forget(id)
               return {}
             }] }],
           },
@@ -1021,31 +965,26 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
               throw run.problem
             }
             if (!response || (response.behavior !== 'allow' && response.behavior !== 'deny')) {
-              if (typeof options?.toolUseID === 'string') forgetToolId(options.toolUseID)
+              if (typeof options?.toolUseID === 'string') toolCalls.forget(options.toolUseID)
               return { behavior: 'deny', message: '审批结果无效' }
             }
             if (response.updatedInput !== undefined
               && (response.updatedInput === null || typeof response.updatedInput !== 'object' || Array.isArray(response.updatedInput))) {
-              if (typeof options?.toolUseID === 'string') forgetToolId(options.toolUseID)
+              if (typeof options?.toolUseID === 'string') toolCalls.forget(options.toolUseID)
               return { behavior: 'deny', message: '审批结果无效' }
             }
-            if (response.behavior === 'deny' && typeof options?.toolUseID === 'string') forgetToolId(options.toolUseID)
+            if (response.behavior === 'deny' && typeof options?.toolUseID === 'string') toolCalls.forget(options.toolUseID)
             if (response.behavior === 'allow' && qualifiedNames.has(toolName) && response.updatedInput !== undefined) {
               if (hasUnexpectedKeys(toolName, response.updatedInput)) {
-                if (typeof options?.toolUseID === 'string') forgetToolId(options.toolUseID)
+                if (typeof options?.toolUseID === 'string') toolCalls.forget(options.toolUseID)
                 return { behavior: 'deny', message: '审批后的工具参数包含未声明的字段' }
               }
               const id = options?.toolUseID
-              const previous = typeof id === 'string' ? pendingToolKeys.get(id) : undefined
-              let next
-              try { next = toolKey(toolName, response.updatedInput) } catch { return { behavior: 'deny', message: '审批参数无效' } }
-              if (previous === undefined || (next !== previous && pendingToolIds.has(next))) {
-                if (typeof id === 'string') forgetToolId(id)
+              let rebound
+              try { rebound = toolCalls.rebind(toolName, response.updatedInput, id) } catch { return { behavior: 'deny', message: '审批参数无效' } }
+              if (!rebound) {
                 return { behavior: 'deny', message: '无法关联审批后的工具调用' }
               }
-              pendingToolIds.delete(previous)
-              pendingToolIds.set(next, id)
-              pendingToolKeys.set(id, next)
             }
             diagnose('approval', 'resolved')
             return response.behavior === 'allow'
@@ -1153,7 +1092,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             contextSampler.invalidate()
           }
           if (message?.type === 'stream_event' && message.event?.type === 'message_start'
-            && !appliedConclusion && [...completedToolIds].some((id) => !batchedToolIds.has(id))) {
+            && !toolCalls.concluded && toolCalls.hasUnconfirmedBatch) {
             run.problem = new WorkerError('STEP_BOUNDARY_UNCONFIRMED', 'SDK 未确认工具批次已更新本机上下文', { toolMayHaveExecuted: true })
             controller.abort()
             throw run.problem
@@ -1223,16 +1162,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         if (result.subtype === 'success' && !toolsetVerified) {
           throw new WorkerError('SDK_TOOLSET_UNVERIFIED', 'SDK 未提供可验证的工具清单')
         }
-        if (pendingToolEffects.size) {
-          throw new WorkerError('TOOL_EFFECT_UNCONFIRMED', 'SDK 未确认工具后处理已执行', { toolMayHaveExecuted: true })
-        }
-        if (appliedConclusion && result.terminal_reason !== 'hook_stopped') {
-          throw new WorkerError('TOOL_CONCLUSION_UNCONFIRMED', 'SDK 未确认工具结束了本轮', { toolMayHaveExecuted: true })
-        }
-        if (result.subtype === 'success' && !appliedConclusion
-          && [...completedToolIds].some((id) => !batchedToolIds.has(id))) {
-          throw new WorkerError('STEP_BOUNDARY_UNCONFIRMED', 'SDK 未确认工具批次已更新本机上下文', { toolMayHaveExecuted: true })
-        }
+        toolCalls.assertComplete({ successful: result.subtype === 'success', terminalReason: result.terminal_reason })
         if (result.subtype !== 'success' || result.is_error === true) {
           const detail = failureDetail(result, assistantError, authFlowFailed)
           diagnose('sdk', 'failed', detail.code)
@@ -1248,6 +1178,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         return run.outcome
       } finally {
         controller.abort()
+        toolCalls.dispose()
         await Promise.allSettled([...run.callbacks])
         if (run.problem) throw run.problem
       }
