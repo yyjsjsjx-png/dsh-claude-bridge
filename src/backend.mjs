@@ -19,7 +19,8 @@ import { contextSnapshot, initialSessionStatus, reconcileSessionStatus, SESSION_
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { retainedPlanUsage } from './observability-plan-usage.mjs'
 import { createLocalRunTiming } from './local-run-timing.mjs'
-import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult,
+  verifiedCloudToolResult, recoveryToolUpdate, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
 import { readHistoryPages } from './history-reader.mjs'
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
@@ -619,27 +620,20 @@ export class BridgeBackend {
         for (const run of pending) {
           const tools = {}
           for (const [callId, tool] of Object.entries(run.tools)) {
-            if (tool.status === 'not-sent') { tools[callId] = { status: 'not-sent' }; continue }
             let result = local.results.get(callId)
-            if (!knownToolResult(result)) {
+            if (tool.status !== 'not-sent' && !knownToolResult(result)) {
               const receipt = cloudRuns[run.runId]?.tools?.[callId]
-              const cloud = cloudResults.get(callId)
               const call = local.calls.get(callId)
-              let expectedHash
-              try { expectedHash = createHash('sha256').update(JSON.stringify(JSON.parse(call?.data.arguments))).digest('hex') } catch {}
-              if (cloud?.content && call?.seq === tool.callSeq && call.data.name === tool.name
-                && receipt?.name === tool.name && receipt.argumentsSha256 === expectedHash) {
+              const cloud = verifiedCloudToolResult(tool, call, receipt, cloudResults.get(callId))
+              if (cloud) {
                 result = appendHistoryRecord(agent.session, HISTORY_TOOL_RESULT, { turn: call.data.turn, step: call.data.step,
                   message: this.helpers.createToolResultMessage({ callId, content: cloud.content, isError: cloud.isError }),
                   meta: { claudeBridgeRecovered: true }, callSeq: call.seq }, this.helpers)
                 local.results.set(callId, result)
               }
             }
-            if (knownToolResult(result) && (result.data.message.toolCallId ?? result.data.message.source?.callId) === callId) {
-              tools[callId] = { status: 'completed', resultSeq: result.seq }
-            }
-            else if (tool.status === 'prepared') tools[callId] = { status: 'not-sent' }
-            else { tools[callId] = { status: 'unknown' }; unresolvedTools++ }
+            tools[callId] = recoveryToolUpdate(callId, tool, result)
+            if (tools[callId].status === 'unknown') unresolvedTools++
           }
           const observed = cloudRuns[run.runId]?.status
           updates.push({ runId: run.runId, status: ['completed', 'cancelled', 'failed'].includes(observed)

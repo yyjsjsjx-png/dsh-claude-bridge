@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { localHistory, coalesceHistory, restoreAssistant, assistantIdentity, knownToolResult, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
+import { createHash } from 'node:crypto'
+import { localHistory, coalesceHistory, restoreAssistant, assistantIdentity, knownToolResult,
+  verifiedCloudToolResult, recoveryToolUpdate, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
 
 function fixture() {
   const events = []
@@ -10,6 +12,29 @@ function fixture() {
     createAssistantMessage({ content, source }) { return { id: 'generated', role: 'assistant', source: { kind: 'model', ...source }, content } } }
   return { session, helpers, events }
 }
+
+test('云端工具回执仅在本机调用位置、名称和原参数hash均匹配时核实', () => {
+  const tool = { name: 'shell', callSeq: 4 }
+  const call = { seq: 4, data: { name: 'shell', arguments: '{ "command": "synthetic" }' } }
+  const receipt = { name: 'shell', argumentsSha256: createHash('sha256').update('{"command":"synthetic"}').digest('hex') }
+  const cloud = { content: [{ type: 'text', text: '合成结果' }] }
+  assert.equal(verifiedCloudToolResult(tool, call, receipt, cloud), cloud)
+  assert.equal(verifiedCloudToolResult(tool, { ...call, seq: 5 }, receipt, cloud), undefined)
+  assert.equal(verifiedCloudToolResult(tool, call, { ...receipt, name: 'other' }, cloud), undefined)
+  assert.equal(verifiedCloudToolResult(tool, call, { ...receipt, argumentsSha256: 'different' }, cloud), undefined)
+  assert.equal(verifiedCloudToolResult(tool, call, undefined, cloud), undefined)
+})
+
+test('恢复状态保留not-sent和未知边界，只有对应已落盘结果可标记完成', () => {
+  const result = { seq: 8, type: 'tool/result', data: {
+    message: { toolCallId: 'call', content: [{ type: 'text', text: '合成结果' }] },
+  } }
+  assert.deepEqual(recoveryToolUpdate('call', { status: 'not-sent' }, result), { status: 'not-sent' })
+  assert.deepEqual(recoveryToolUpdate('call', { status: 'prepared' }, undefined), { status: 'not-sent' })
+  assert.deepEqual(recoveryToolUpdate('call', { status: 'dispatched' }, undefined), { status: 'unknown' })
+  assert.deepEqual(recoveryToolUpdate('other', { status: 'dispatched' }, result), { status: 'unknown' })
+  assert.deepEqual(recoveryToolUpdate('call', { status: 'dispatched' }, result), { status: 'completed', resultSeq: 8 })
+})
 
 test('恢复合并 SDK 同消息分段，补齐中断尾部且重复同步不重复展示', () => {
   const f = fixture(), content = [{ type: 'text', text: '合成开头' }]

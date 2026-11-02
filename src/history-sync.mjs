@@ -145,3 +145,21 @@ export function knownToolResult(event) {
     && !['TOOL_OUTCOME_UNKNOWN', 'TOOL_NOT_STARTED'].includes(event.data.error?.code)
     && !event.data.message.content.some(block => block.type === 'text' && block.text === UNKNOWN_TOOL_TEXT)
 }
+
+/** Cloud text alone is not execution evidence: match the durable local call
+ * position, tool name and the receipt's existing argument-hash convention. */
+export function verifiedCloudToolResult(tool, call, receipt, cloud) {
+  let expectedHash
+  try { expectedHash = createHash('sha256').update(JSON.stringify(JSON.parse(call?.data.arguments))).digest('hex') } catch {}
+  return cloud?.content && call?.seq === tool.callSeq && call.data.name === tool.name
+    && receipt?.name === tool.name && receipt.argumentsSha256 === expectedHash ? cloud : undefined
+}
+
+/** Candidate journal update, applied only after native history checkpoint. */
+export function recoveryToolUpdate(callId, tool, result) {
+  if (tool.status === 'not-sent') return { status: 'not-sent' }
+  if (knownToolResult(result) && (result.data.message.toolCallId ?? result.data.message.source?.callId) === callId) {
+    return { status: 'completed', resultSeq: result.seq }
+  }
+  return { status: tool.status === 'prepared' ? 'not-sent' : 'unknown' }
+}
