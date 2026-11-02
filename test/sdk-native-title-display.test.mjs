@@ -50,6 +50,22 @@ test('同步前再次检查手动命名；事件写入失败只报告诊断', ()
   assert.deepEqual(failed.codes, ['SDK_TITLE_SYNC_FAILED'])
 })
 
+test('SDK 标题与 fallback 同名仍确认来源一次，同名手动标题始终保留', () => {
+  const f = fixture(), session = f.create('same-title')
+  session.title = { title: '你好', source: { kind: 'fallback' } }
+  assert.equal(f.titles.sync(session, '你好'), true)
+  assert.deepEqual(session.title.source, { kind: 'provider', provider: 'claude-bridge-sdk-title' })
+  assert.equal(f.titles.sync(session, '你好'), false)
+  assert.equal(f.records.length, 1)
+  session.title = { title: '你好', source: { kind: 'provider', provider: 'other-provider' } }
+  assert.equal(f.titles.sync(session, '你好'), true)
+  assert.equal(f.records.length, 2)
+  session.title = { title: '你好', source: { kind: 'user' } }
+  assert.equal(f.titles.sync(session, '你好'), false)
+  assert.deepEqual(session.title.source, { kind: 'user' })
+  assert.equal(f.records.length, 2)
+})
+
 test('ordinary方法保留this及参数；远程refresh仅fallback且不解锁，卸载仅恢复自己安装的方法', async () => {
   const f = fixture(), owner = {}, marker = {}, ordinary = f.create('ordinary', 'standard'), remote = f.create('remote')
   f.titles.dispose()
