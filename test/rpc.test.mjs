@@ -261,3 +261,66 @@ test('RPC耗时按运行和阶段聚合流帧，等待通知尾部但不阻塞qu
   }
   assert.doesNotMatch(JSON.stringify(metrics), /PRIVATE|中文|prompt|message\":/)
 })
+
+test('仅onTraffic也保留query及反向工具/准备响应origin，收到response从pending恢复白名单元数据', async t => {
+  const rows = []
+  const pair = peers({
+    'tool.execute': async () => ({ content: 'PRIVATE_TOOL_RESULT' }),
+    'step.prepare': async () => ({ prepared: true }),
+  }, { query: async (_params, { peer }) => {
+    await peer.request('tool.execute', { runId: 'run-origin', callId: 'toolu_first', text: 'PRIVATE_TOOL_INPUT' })
+    await peer.request('step.prepare', { runId: 'run-origin', callId: 'toolu_last', text: 'PRIVATE_STEP_INPUT' })
+    return { status: 'completed' }
+  } }, { left: { onTraffic: row => { rows.push(row); throw new Error('观察失败不可改变RPC') } } })
+  t.after(() => pair.close())
+  assert.deepEqual(await pair.left.request('query', { runId: 'run-origin', callId: 'toolu_query', prompt: 'PRIVATE_PROMPT' }),
+    { status: 'completed' })
+  assert.equal(rows.length, 6)
+  for (const method of ['query', 'tool.execute', 'step.prepare']) {
+    const same = rows.filter(row => row.origin.method === method)
+    assert.equal(same.length, 2)
+    assert.deepEqual(same[0].origin, same[1].origin)
+    assert.match(same[0].origin.id, /^[0-9a-f-]{36}:[1-9][0-9]*$/i)
+    assert.equal(same[0].origin.runId, 'run-origin')
+    assert.equal(same[0].origin.callId, { query: 'toolu_query', 'tool.execute': 'toolu_first', 'step.prepare': 'toolu_last' }[method])
+    assert.deepEqual(Object.keys(same[0].origin).sort(), ['callId', 'id', 'method', 'runId'])
+  }
+  assert.equal(rows.filter(row => row.direction === 'sent').length, 3)
+  assert.ok(rows.every(row => Number.isFinite(row.at) && row.at >= 0))
+  assert.doesNotMatch(JSON.stringify(rows.map(row => row.origin)), /PRIVATE|prompt|content|text/)
+})
+
+test('sent仅在逻辑write接受后通知，false是背压仍接受，抛错不通知且at保留写入前时刻', async t => {
+  for (const throws of [false, true]) {
+    const input = new PassThrough(), output = new PassThrough(), rows = []
+    const nativeWrite = output.write
+    let sent, writingAt, writtenAt
+    output.on('data', frame => { sent = JSON.parse(frame) })
+    output.write = function(frame) {
+      writingAt = performance.now()
+      assert.equal(rows.length, 0)
+      if (throws) throw new Error('PRIVATE_WRITE_FAILURE')
+      nativeWrite.call(this, frame); writtenAt = performance.now()
+      return false
+    }
+    const peer = createRpcPeer({ input, output, onTraffic: row => rows.push(row) })
+    t.after(() => { peer.close(); input.destroy(); output.destroy() })
+    const pending = peer.request('query', { runId: 'run-write', callId: 'secret-REDACTED', prompt: 'PRIVATE_PROMPT' })
+    if (throws) {
+      await assert.rejects(pending, { code: 'RPC_CLOSED' })
+      assert.equal(rows.length, 0)
+    } else {
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].message.id, sent.id)
+      assert.ok(rows[0].at <= writingAt && writingAt <= writtenAt)
+      assert.deepEqual(rows[0].origin, { id: sent.id, method: 'query', runId: 'run-write' })
+      const beforeReceive = performance.now()
+      input.write(JSON.stringify({ jsonrpc: '2.0', id: sent.id, result: { ok: true } }) + '\n')
+      const afterReceive = performance.now()
+      assert.deepEqual(await pending, { ok: true })
+      assert.equal(rows.length, 2)
+      assert.ok(rows[1].at >= beforeReceive && rows[1].at <= afterReceive)
+      assert.deepEqual(rows[1].origin, rows[0].origin)
+    }
+  }
+})
