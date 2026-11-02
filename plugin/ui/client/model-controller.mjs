@@ -62,7 +62,7 @@ export function createModelController({ rpc, store, updateSettings, textError,
       const response = await rpc.saveModelPreferences({ enabledIds: state.selectedModelIds });
       if (!response.ok) throw new Error(response.error.message);
       await loadModelPreferences(true);
-      updateSettings({ message: '模型显示设置已保存。' });
+      updateSettings({ message: '模型设置已保存。' });
     } catch (error) { updateSettings({ modelError: textError(error) }); }
     finally { updateSettings({ busy: false }); }
   }
