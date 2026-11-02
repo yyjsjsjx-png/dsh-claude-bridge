@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { BridgeBackend } from '../src/backend.mjs'
+import { ConnectionContext } from '../src/connection-context.mjs'
 import { planUsageSnapshot } from '../src/plan-usage.mjs'
 import { BridgeState } from '../src/state.mjs'
 import { assistantIdentity, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
@@ -106,7 +107,7 @@ test('上下文默认值仅本设备持久保存，下轮透传且旧服务器�
   await assert.rejects(f.backend.saveContextPreferences({ autoCompactWindowTokens: 99999 }), { code: 'INVALID_CONTEXT_PREFERENCES' })
   await f.backend.runStep(f.agent, f.decision)
   assert.deepEqual(requests[0].contextPreferences, { autoCompactWindowTokens: 200000 })
-  f.backend.initialized = { capabilities: {} }
+  f.backend.initialized.capabilities.autoCompactWindow = false
   assert.throws(() => f.backend.contextRequestPreferences(), { code: 'CONTEXT_SETTINGS_UNSUPPORTED' })
   await f.backend.saveContextPreferences({ autoCompactWindowTokens: null })
   assert.deepEqual(f.backend.contextRequestPreferences(), {})
@@ -191,8 +192,12 @@ test('清除以后旧目录、额度和登录响应不会恢复缓存或登录�
 
 test('WebSocket 关闭超时仍保存本机台账和诊断，重复卸载不再执行清理', async () => {
   const saved = []
+  const connectionContext = new ConnectionContext()
+  connectionContext.bind(connectionContext.capture(), {
+    async close() { saved.push('close'); throw Object.assign(new Error('关闭超时'), { code: 'CLOSE_TIMEOUT' }) },
+  })
   const backend = Object.assign(Object.create(BridgeBackend.prototype), { lifetime: new AbortController(), runs: new Map(),
-    connection: { async close() { saved.push('close'); throw Object.assign(new Error('关闭超时'), { code: 'CLOSE_TIMEOUT' }) } },
+    connectionContext,
     state: { async flush() { saved.push('state') } }, diagnostics: { async flush() { saved.push('diagnostics') } } })
   await assert.rejects(backend.dispose(), { code: 'CLOSE_TIMEOUT' })
   await assert.rejects(backend.dispose(), { code: 'CLOSE_TIMEOUT' })

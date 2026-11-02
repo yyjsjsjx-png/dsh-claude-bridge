@@ -8,6 +8,7 @@ import { createDiagnostics } from './diagnostics.mjs'
 import { createSshTransport } from './ssh-transport.mjs'
 import { createWebSocketTransport } from './websocket-transport.mjs'
 import { createConnectionSettings } from './connection-settings.mjs'
+import { ConnectionContext } from './connection-context.mjs'
 import { toMcpToolDefinitions, toSdkPrompt, toMcpContent } from './dsh-content.mjs'
 import { SdkProjection, dshUsage } from './sdk-projection.mjs'
 import { CLAUDE_PROVIDER, CLAUDE_PRESET } from '../plugin/policy.mjs'
@@ -78,17 +79,17 @@ export class BridgeBackend {
     this.bridgeCompatibility = uncheckedBridgeCompatibility()
     this.remoteCapabilities = { status: 'unchecked', shell: requiredShellName(), reason: '尚未检查远程会话的基础执行能力。' }
     this.shellFailures = new WeakMap()
-    this.connection = undefined
-    this.connecting = undefined
-    this.connectionRevision = 0
+    this.connectionContext = new ConnectionContext()
     this.historyGeneration = 0
     this.verifiedHistory = new WeakMap()
-    this.connectionAbort = new AbortController()
     this.connectionUsers = 0
     this.connectionChanging = false
     this.disposed = false
     this.lifetime = new AbortController()
   }
+
+  get connection() { return this.connectionContext.transport }
+  get initialized() { return this.connectionContext.initialized }
 
   async settings() {
     await this.state.ready
@@ -113,15 +114,8 @@ export class BridgeBackend {
       throw failure('BRIDGE_BUSY', '请等待当前任务或历史同步结束后更改连接。')
     }
     this.connectionChanging = true
-    this.connectionRevision++
     this.historyGeneration++
-    this.connectionAbort.abort()
-    this.connectionAbort = new AbortController()
-    const transport = this.connection
-    const connecting = this.connecting
-    this.connection = undefined
-    this.connecting = undefined
-    this.initialized = undefined
+    const { transport, pending: connecting } = this.connectionContext.invalidate()
     this.bridgeCompatibility = uncheckedBridgeCompatibility()
     this.authentication = 'unknown'
     this.catalogCache = undefined
@@ -209,11 +203,11 @@ export class BridgeBackend {
 
   async refreshAuthentication() {
     this.planUsageCache = undefined
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const transport = await this.connect()
     try {
       const status = await transport.peer.request('authStatus', { refresh: true }, { timeoutMs: 30000 })
-      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (status.status === 'failed' || typeof status.loggedIn !== 'boolean') {
         throw failure(status.code ?? 'AUTH_STATUS_UNAVAILABLE', status.message ?? '无法验证服务器上的 Claude 登录状态。')
       }
@@ -221,7 +215,7 @@ export class BridgeBackend {
       if (status.loggedIn !== true) throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
       return status
     } catch (error) {
-      if (revision === this.connectionRevision) this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
+      if (this.connectionContext.current(identity)) this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
       throw error
     }
   }
@@ -230,15 +224,14 @@ export class BridgeBackend {
     if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
     if (this.connectionChanging) throw failure('BRIDGE_BUSY', '连接设置正在更改，请稍后重试。')
     if (this.connection) return this.connection
-    if (this.connecting) return this.connecting
+    if (this.connectionContext.pending) return this.connectionContext.pending
     this.historyGeneration++
-    const revision = this.connectionRevision
-    const connectionSignal = this.connectionAbort.signal
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       await this.state.ready
       let transport
       const options = {
-        signal: AbortSignal.any([signal, this.lifetime.signal, connectionSignal].filter(Boolean)),
+        signal: AbortSignal.any([signal, this.lifetime.signal, identity.signal].filter(Boolean)),
         handlers: {
           'tool.execute': (params, context) => this.dispatchTool(params, context),
           'approval.request': (params, context) => this.dispatchApproval(params, context),
@@ -247,13 +240,13 @@ export class BridgeBackend {
         onNotification: (method, params) => this.notification(method, params),
         onTraffic: event => this.localTiming.observe(event),
         onClose: () => {
-          if (revision === this.connectionRevision && (!this.connection || this.connection === transport)) {
+          if (this.connectionContext.disconnected(identity, transport)) {
             this.historyGeneration++
-            this.connection = undefined; this.planUsageCache = undefined
+            this.planUsageCache = undefined
           }
         },
         onConnectionState: connection => {
-          if (revision !== this.connectionRevision || (this.connection && this.connection !== transport)) return
+          if (!this.connectionContext.accepts(identity, transport)) return
           if (connection !== 'connected') this.historyGeneration++
           for (const run of this.runs.values()) {
             try { this.sessionStatus(run.agent, { connection }) }
@@ -275,10 +268,9 @@ export class BridgeBackend {
         transport = await createWebSocketTransport({ ...options, ...configured, initialConnectWindowMs: 60_000 })
       }
       try {
-        if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
-        this.initialized = undefined
+        if (!this.connectionContext.beginInitialization(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         const initialized = await transport.peer.request('initialize', { protocolVersion: 1, clientVersion }, { timeoutMs: 30000 })
-        if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+        if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         if (initialized.protocolVersion !== 1) throw failure('PROTOCOL_MISMATCH', '服务器协议不兼容。')
         this.bridgeCompatibility = evaluateBridgeCompatibility({ clientVersion,
           serverVersion: initialized.serverVersion, minimumClientVersion: initialized.minimumClientVersion })
@@ -290,15 +282,15 @@ export class BridgeBackend {
           throw failure(this.bridgeCompatibility.status === 'update-required' ? 'CLIENT_UPDATE_REQUIRED' : 'SERVER_COMPATIBILITY_INVALID',
             this.bridgeCompatibility.message)
         }
-        this.initialized = initialized
+        this.connectionContext.completeInitialization(identity, initialized)
         this.authentication = initialized.authenticated === true ? 'logged-in' : initialized.authenticated === false ? 'login-required' : 'unknown'
         if (initialized.authenticated === false) throw failure('AUTH_REQUIRED', '请在服务器上完成 Claude 官方登录。')
-        this.connection = transport
+        this.connectionContext.bind(identity, transport)
         return transport
       } catch (error) { await transport.close(); throw error }
     })()
-    this.connecting = pending
-    try { return await pending } finally { if (this.connecting === pending) this.connecting = undefined }
+    this.connectionContext.track(pending)
+    try { return await pending } finally { this.connectionContext.untrack(pending) }
   }
 
   async catalog({ refresh = false } = {}) {
@@ -306,23 +298,23 @@ export class BridgeBackend {
     if (!refresh && this.catalogCache && Date.now() - this.catalogCache.time < 30000) return structuredClone(this.catalogCache.reply)
     if (this.catalogPending) {
       if (!refresh || this.catalogPendingRefresh) return this.catalogPending
-      const revision = this.connectionRevision
+      const identity = this.connectionContext.capture()
       await this.catalogPending.catch(() => {})
-      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       return this.catalog({ refresh: true })
     }
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       const transport = await this.connect()
       // Automatic model resolution may call this once for every catalog row.
       // Only the explicit refresh action forces a fresh CLI auth check.
       if (refresh) await this.refreshAuthentication()
       const reply = await transport.peer.request('catalog', { refresh }, { timeoutMs: 45000 })
-      if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (reply.status !== 'ok') throw failure(reply.code ?? 'CATALOG_UNAVAILABLE', reply.message ?? '无法获取当前账号模型目录。')
       this.catalogCache = { time: Date.now(), reply: structuredClone(reply) }
-      await this.rememberDisplayCatalog(reply.models, revision, transport)
-      if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      await this.rememberDisplayCatalog(reply.models, identity, transport)
+      if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       this.displayCatalogStatus = { status: 'ready' }
       return reply
     })()
@@ -335,16 +327,16 @@ export class BridgeBackend {
 
   async displayCatalogIdentity() {
     if (this.displayIdentityPending) return this.displayIdentityPending
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       await this.state.ready
       const transport = this.createTransport ? 'custom' : this.config.transport ?? 'wss'
-      const identity = transport === 'wss'
+      const configured = transport === 'wss'
         ? { transport, ...(await (await this.settings()).resolve()) }
         : { transport, deviceId: this.state.value.deviceId,
           worker: this.config.remoteWorkerPath, node: this.config.remoteNodePath }
-      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
-      return catalogConnectionIdentity(identity)
+      if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      return catalogConnectionIdentity(configured)
     })()
     this.displayIdentityPending = pending
     try { return await pending } finally {
@@ -356,10 +348,10 @@ export class BridgeBackend {
   async displayCatalog({ visible = false } = {}) {
     await this.state.ready
     if (this.disposed || this.connectionChanging) return { status: 'ok', models: [] }
-    const revision = this.connectionRevision
+    const context = this.connectionContext.capture()
     let identity
     try { identity = await this.displayCatalogIdentity() } catch { return { status: 'ok', models: [] } }
-    if (revision !== this.connectionRevision || this.connectionChanging) return { status: 'ok', models: [] }
+    if (!this.connectionContext.current(context) || this.connectionChanging) return { status: 'ok', models: [] }
     const cached = readDisplayCatalog(this.state.value.displayCatalog, identity)
     let models = cached?.models ?? []
     if (visible) {
@@ -371,13 +363,13 @@ export class BridgeBackend {
     return { status: 'ok', models, ...(cached ? { updatedAt: cached.updatedAt } : {}) }
   }
 
-  async rememberDisplayCatalog(input, revision, transport) {
+  async rememberDisplayCatalog(input, context, transport) {
     let changed = false
     try {
       const models = catalogDisplayModels(input)
       const identity = await this.displayCatalogIdentity()
       await this.state.update(state => {
-        if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) return
+        if (!this.connectionContext.current(context, transport)) return
         const previous = readDisplayCatalog(state.displayCatalog, identity)
         changed = !previous || !isDeepStrictEqual(previous.models, models)
         state.displayCatalog = { version: 1, identity, updatedAt: Date.now(), models }
@@ -387,7 +379,7 @@ export class BridgeBackend {
       // required persistence, and a cache failure never authorizes execution.
       this.diagnostics.event('catalog.cache_unavailable', { code: 'DISPLAY_CACHE_UNAVAILABLE' })
     }
-    if (changed && !this.disposed && revision === this.connectionRevision && this.connection === transport) {
+    if (changed && this.connectionContext.current(context, transport)) {
       try { this.onDisplayCatalogChanged?.() }
       catch { this.diagnostics.event('catalog.notification_failed', { code: 'CATALOG_NOTIFICATION_FAILED' }) }
     }
@@ -397,12 +389,12 @@ export class BridgeBackend {
   refreshDisplayCatalog() {
     if (this.disposed || this.connectionChanging || this.displayCatalogRefreshPending
       || Date.now() < (this.displayCatalogRefreshAfter ?? 0)) return
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     this.displayCatalogStatus = { status: 'refreshing' }
     const pending = this.catalog().then(() => {
-      if (revision === this.connectionRevision && !this.disposed) this.displayCatalogStatus = { status: 'ready' }
+      if (this.connectionContext.current(identity)) this.displayCatalogStatus = { status: 'ready' }
     }).catch(error => {
-      if (revision !== this.connectionRevision || this.disposed) return
+      if (!this.connectionContext.current(identity)) return
       const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'CATALOG_UNAVAILABLE'
       this.displayCatalogStatus = { status: 'failed', code }
       this.diagnostics.event('catalog.refresh_failed', { code })
@@ -419,7 +411,7 @@ export class BridgeBackend {
     if (typeof refresh !== 'boolean') return { status: 'unavailable', code: 'INVALID_REQUEST' }
     if (!refresh && this.planUsageCache?.until > Date.now()) return structuredClone(this.planUsageCache.value)
     if (this.planUsagePending) return this.planUsagePending
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       let value
       try {
@@ -432,7 +424,7 @@ export class BridgeBackend {
         value = this.initialized?.capabilities?.observability === true
           ? retainedPlanUsage(reply) : sanitizePlanUsage(reply)
       } catch (error) { value = sanitizePlanUsage({ status: 'unavailable', code: error.code ?? 'QUOTA_READ_FAILED' }) }
-      if (revision !== this.connectionRevision) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
+      if (!this.connectionContext.current(identity)) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
       if (['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID'].includes(value.code)) {
         value = { ...value, minimumClientVersion: this.bridgeCompatibility.minimumClientVersion }
       }
@@ -1296,6 +1288,7 @@ export class BridgeBackend {
   async dispose() {
     if (this.disposing) return this.disposing
     this.disposed = true
+    this.connectionContext.retire()
     this.lifetime.abort()
     this.disposing = (async () => {
       try { if (this.connection) await this.connection.close() }
