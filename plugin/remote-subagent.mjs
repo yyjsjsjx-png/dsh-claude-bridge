@@ -14,21 +14,14 @@ const { scopeOf, scopeChainOf } = await import(resolveDshModule('@deepseek-ai/ds
 export const Config = native.Config;
 export const inject = [...native.inject, 'agents', 'llm', 'claudeBridge'];
 
-// No enabled models is a valid live preference. Native rc5 cannot persist an
-// empty selection policy, so initial capture below still degrades to inherit.
+// Hiding every model is a valid display preference, independent of the full
+// account catalog captured by the native Session selection policy.
 function visibleModels(catalog) {
   if (catalog?.status === 'ok' && Array.isArray(catalog.models) && catalog.models.length === 0) return [];
   return subagentModels(catalog);
 }
 
-function requireVisibleModel(models, model) {
-  const found = models.find(row => row.id === model);
-  if (!found) throw Object.assign(new Error('该远程模型不在当前启用的型号中；请先在模型设置中勾选。'),
-    { code: 'SUBAGENT_MODEL_DISABLED' });
-  return found;
-}
-
-function selectionContext(ctx, readCatalog, allowedModels, toolName) {
+function selectionContext(ctx, readCatalog, readVisibleCatalog, allowedModels, toolName) {
   const settings = { current: () => ({ enabled: true, allowedModels }) };
   const llm = new Proxy(ctx.llm, { get(target, key) {
     if (key === 'listProviders') return () => target.listProviders().filter(row => row.id === CLAUDE_PROVIDER);
@@ -37,22 +30,18 @@ function selectionContext(ctx, readCatalog, allowedModels, toolName) {
       if (key === 'listModels') { signal = model; model = undefined; }
       assertRemoteSubagentRoute({ provider });
       signal?.throwIfAborted();
-      const models = visibleModels(await readCatalog());
+      const models = key === 'listModels' ? visibleModels(await readVisibleCatalog()) : subagentModels(await readCatalog());
       signal?.throwIfAborted();
       if (key === 'listModels') return models;
-      return requireVisibleModel(models, model);
+      const found = models.find(row => row.id === model);
+      if (!found) throw new Error('该远程模型不在当前账号的官方目录中。');
+      return found;
     };
     if (key === 'resolveCallConfig') return async (options, signal) => {
       assertRemoteSubagentRoute(options);
       // Resolve against the real adapter on every explicit selection. The
       // durable native allowlist cannot authorize a removed model or effort.
-      const prepared = await target.prepareCall(withModelDefault(options), signal);
-      // Check device preferences after the adapter's await, so a model disabled
-      // while preflight was pending cannot be admitted by its old policy/cache.
-      signal?.throwIfAborted();
-      requireVisibleModel(visibleModels(await readCatalog()), options.model);
-      signal?.throwIfAborted();
-      return prepared.config;
+      return (await target.prepareCall(withModelDefault(options), signal)).config;
     };
     const value = Reflect.get(target, key, target);
     return typeof value === 'function' ? value.bind(target) : value;
@@ -73,12 +62,12 @@ function selectionContext(ctx, readCatalog, allowedModels, toolName) {
       if (definition.name === toolName && definition.parameters?.properties?.reasoning_effort) {
         definition.parameters.properties.reasoning_effort.description +=
           ` Use the reserved value "${MODEL_DEFAULT_EFFORT}" to explicitly use the selected model's default, even for the parent's current model.`;
-        definition.description += ' Explicit choices are restricted to this Session\'s captured routes and Claude models currently enabled in this device\'s model settings; execution revalidates the catalog and settings.';
+        definition.description += ' Explicit choices are restricted to this Session\'s captured Claude account routes and revalidated before execution. Model display settings only filter discovery lists; a hidden model can still be selected explicitly if it exists in the account catalog.';
       }
       if (definition.name === toolName && allowedModels === undefined) definition.description +=
-        ' No verified enabled Claude model snapshot is available. This tool only inherits the parent model and effort; explicit selection becomes available after enabling models and reloading the session with a verified snapshot.';
+        ' The verified Claude account catalog is unavailable. This tool only inherits the parent model and effort; explicit selection becomes available after reloading the session with a verified catalog.';
       if (definition.name === 'list_subagent_models') definition.description =
-        `Inspect Claude models currently enabled in this device's model settings and their reasoning efforts for subagents. Only routes also captured for this Session are selectable; execution revalidates the live catalog and settings. reasoning_effort="${MODEL_DEFAULT_EFFORT}" explicitly clears an inherited effort. Omitted fields inherit the parent selection.`;
+        `List Claude models enabled in this device's model display settings, or name an exact account model to inspect its reasoning efforts even when hidden. Explicit choices must belong to this Session's captured routes and the live account catalog; display settings do not prohibit a known hidden model. Unknown models and unsupported efforts fail without fallback. reasoning_effort="${MODEL_DEFAULT_EFFORT}" explicitly clears an inherited effort. Omitted fields inherit the parent selection.`;
       return target.register(definition);
     };
     const value = Reflect.get(target, key, target);
@@ -129,13 +118,14 @@ export async function apply(ctx, config) {
         // Attaching/resuming a session must not depend on a live remote call.
         // A missing display snapshot degrades only explicit child selection.
         try {
-          allowedModels = subagentModels(await ctx.claudeBridge.backend.displayCatalog({ visible: true }))
+          allowedModels = subagentModels(await ctx.claudeBridge.backend.displayCatalog())
             .map(model => ({ provider: CLAUDE_PROVIDER, model: model.id }));
         } catch {}
         signal?.throwIfAborted();
         if (disposed) throw new Error('远程子任务预设已卸载。');
         entry.fiber = agent.ctx.inject(native.inject, inner => native.apply(
-          selectionContext(inner, () => ctx.claudeBridge.backend.visibleCatalog(), allowedModels, config.toolName ?? 'subagent'),
+          selectionContext(inner, () => ctx.claudeBridge.backend.catalog(), () => ctx.claudeBridge.backend.visibleCatalog(),
+            allowedModels, config.toolName ?? 'subagent'),
           { ...config, modelSelectionSettings: allowedModels !== undefined }, agent.session));
         fibers.add(entry.fiber);
         await entry.fiber;

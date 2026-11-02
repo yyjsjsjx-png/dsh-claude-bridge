@@ -129,7 +129,7 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     const firstCatalog = Promise.withResolvers(), firstEntered = Promise.withResolvers();
     let reads = 0;
     backend.displayCatalog = async options => {
-      assert.deepEqual(options, { visible: true });
+      assert.equal(options, undefined); // Capture includes hidden routes, using only the cached snapshot.
       if (++reads === 1) { firstEntered.resolve(); return firstCatalog.promise; }
       return { status: 'ok', models: [haiku] };
     };
@@ -319,39 +319,45 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       assert.equal((await host.syncSession(a.id)).status, 'ready');
       await controllerOwner.dispose();
     });
-    await t.test('用户勾选同时约束工具列表和显式调用，旧allowlist不能授权已禁用型号，默认仍继承', async () => {
-      const invoke = args => definition(a).execute({ description: 'visibility rejection', prompt: 'synthetic', ...args }, { agent: a, signal });
+    await t.test('用户勾选只过滤列表，隐藏真实型号仍能显式调用，空列表不收窄完整账号策略', async () => {
+      const invoke = args => definition(a).execute({ description: 'catalog validation', prompt: 'synthetic', ...args }, { agent: a, signal });
       const listModels = args => ctx.tools.get('list_subagent_models', a).execute({ provider: 'claude-sdk-remote', ...args }, { agent: a, signal });
-      const activationCount = activations.length;
       assert.deepEqual(policy(a).map(row => row.model), ['haiku', 'sonnet']);
       await backend.saveModelPreferences({ enabledIds: ['haiku'] });
       const listed = await listModels({});
       assert.match(listed, /haiku/);
       assert.doesNotMatch(listed, /sonnet/);
-      await assert.rejects(listModels({ model: 'sonnet' }), { code: 'SUBAGENT_MODEL_DISABLED' });
-      await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' }), { code: 'SUBAGENT_MODEL_DISABLED' });
+      assert.match(await listModels({ model: 'sonnet' }), /sonnet[\s\S]*medium/);
+      const selected = await run(a, { provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' });
+      assert.equal(selected.query.model, 'sonnet');
+      assert.equal(selected.query.effort, 'medium');
+      assert.equal(selected.config.model, 'sonnet');
+      const activationCount = activations.length;
       for (const args of [{ provider: 'claude-sdk-remote' }, { model: 'sonnet' }]) {
         await assert.rejects(invoke(args), /must be supplied together/);
       }
+      await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'missing' }), /not allowed/);
+      await assert.rejects(listModels({ model: 'missing' }), /not allowed/);
       assert.equal(activations.length, activationCount);
-      // A new Session captures only cached enabled routes, with no live read.
+      // New Sessions capture every cached account route, including hidden ones,
+      // without making a live call or expanding an existing durable policy.
       const savedCatalog = backend.catalog;
-      backend.catalog = async () => assert.fail('捕获当前勾选快照不应读取live目录');
-      const filtered = await create('remote-filtered', 'high');
-      assert.deepEqual(policy(filtered).map(row => row.model), ['haiku']);
+      backend.catalog = async () => assert.fail('捕获完整账号快照不应读取live目录');
+      const captured = await create('remote-full-capture', 'high');
+      assert.deepEqual(policy(captured).map(row => row.model), ['haiku', 'sonnet']);
       backend.catalog = savedCatalog;
-      const afterRootCreation = activations.length;
       await backend.saveModelPreferences({ enabledIds: [] });
       assert.match(await listModels({}), /no advertised models/);
-      await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'haiku' }), { code: 'SUBAGENT_MODEL_DISABLED' });
-      await assert.rejects(invoke({ reasoning_effort: 'model-default' }), { code: 'SUBAGENT_MODEL_DISABLED' });
-      assert.equal(activations.length, afterRootCreation);
       const allHidden = await create('remote-all-hidden', 'high');
-      assert.equal(policy(allHidden), null); // rc5 does not support an empty durable policy.
-      assert.equal(definition(allHidden).parameters.properties.reasoning_effort, undefined);
-      assert.equal(ctx.tools.get('list_subagent_models', allHidden), undefined);
-      await assert.rejects(definition(allHidden).execute({ description: 'disabled selection', prompt: 'synthetic',
-        provider: 'claude-sdk-remote', model: 'haiku' }, { agent: allHidden, signal }), /disabled/);
+      assert.deepEqual(policy(allHidden).map(row => row.model), ['haiku', 'sonnet']);
+      assert.ok(definition(allHidden).parameters.properties.reasoning_effort);
+      assert.match(await ctx.tools.get('list_subagent_models', allHidden).execute({ provider: 'claude-sdk-remote' }, { agent: allHidden, signal }), /no advertised models/);
+      const hidden = await run(allHidden, { provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' });
+      assert.equal(hidden.query.model, 'sonnet');
+      assert.equal(hidden.query.effort, 'medium');
+      const defaulted = await run(a, { reasoning_effort: 'model-default' });
+      assert.equal(defaulted.query.model, 'haiku');
+      assert.equal(defaulted.query.effort, undefined);
       const inherited = await run(a);
       assert.equal(inherited.query.model, 'haiku');
       assert.equal(inherited.query.effort, 'high');
@@ -360,26 +366,19 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       await backend.saveModelPreferences({ enabledIds: ['haiku', 'sonnet'] });
       assert.match(await listModels({}), /sonnet/);
     });
-    await t.test('预检await期间取消勾选时再次核对当前偏好，拒绝发生于创建child之前', async () => {
-      const savedPrepare = ctx.llm.prepareCall, entered = Promise.withResolvers(), release = Promise.withResolvers();
+    await t.test('目录中已失效的捕获型号和不支持的强度明确拒绝，不创建child或回退其它型号', async () => {
+      const invoke = args => definition(a).execute({ description: 'invalid catalog choice', prompt: 'synthetic', ...args }, { agent: a, signal });
       const activationCount = activations.length;
-      ctx.llm.prepareCall = async function(options, ...args) {
-        const prepared = await savedPrepare.call(this, options, ...args);
-        entered.resolve();
-        await release.promise;
-        return prepared;
-      };
       try {
-        const pending = definition(a).execute({ description: 'disable during preflight', prompt: 'synthetic',
-          provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' }, { agent: a, signal });
-        await entered.promise;
-        await backend.saveModelPreferences({ enabledIds: ['haiku'] });
-        release.resolve();
-        await assert.rejects(pending, { code: 'SUBAGENT_MODEL_DISABLED' });
+        await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'low' }), /effort|强度/);
+        catalog = { status: 'ok', models: [haiku] };
+        await assert.rejects(invoke({ provider: 'claude-sdk-remote', model: 'sonnet', reasoning_effort: 'medium' }), /目录/);
+        await assert.rejects(ctx.tools.get('list_subagent_models', a).execute({ provider: 'claude-sdk-remote', model: 'sonnet' }, { agent: a, signal }), /目录/);
         assert.equal(activations.length, activationCount);
+        assert.equal(a.options.model, 'haiku');
+        assert.equal(a.options.reasoningEffort, 'high');
       } finally {
-        release.resolve();
-        ctx.llm.prepareCall = savedPrepare;
+        catalog = { status: 'ok', models: [haiku, sonnet] };
         await backend.saveModelPreferences({ enabledIds: ['haiku', 'sonnet'] });
       }
     });
