@@ -202,3 +202,134 @@ test('新 Host 只回收已断开且同设备的旧 worker，新 worker 不伪�
   assert.equal(reply.recovery.resumed, false)
   assert.notEqual(reply.recovery.id, oldId)
 })
+
+test('连续恢复后旧 socket 事件和旧握手截止时间不停止新连接或释放设备', async t => {
+  const { wss, workers, token, diagnostics } = await setup(t, { serverOptions: { authTimeoutMs: 100 } })
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 })
+  const deviceId = randomUUID(), first = authenticate(wss, token, deviceId)
+  const id = JSON.parse(first.sent[0]).recovery.id
+  const negotiate = async socket => {
+    const sent = new Promise(resolve => socket.once('sent', resolve))
+    socket.message(JSON.stringify({ type: 'recovery.negotiate', protocol: 1, id, ack: 0, cancelIds: [] }))
+    await sent
+    assert.equal(JSON.parse(socket.sent.at(-1)).type, 'recovery.ready')
+  }
+  const resume = () => {
+    const socket = new FakeSocket()
+    wss.connect(socket)
+    socket.message(JSON.stringify({ type: 'auth', protocol: 1, token, deviceId, resume: { id, ack: 0 } }))
+    assert.equal(JSON.parse(socket.sent[0]).recovery.resumed, true)
+    return socket
+  }
+  await negotiate(first)
+  first.close(1006)
+  const superseded = resume()
+  // The first resumed socket has not negotiated yet. Its handshake deadline
+  // remains earlier than the newer attempt's deadline.
+  t.mock.timers.tick(50)
+  const current = resume()
+  for (const socket of [first, superseded]) {
+    socket.emit('close', 1006)
+    socket.emit('error', new Error('synthetic late socket error'))
+  }
+  t.mock.timers.tick(50)
+  assert.equal(current.readyState, 1)
+  assert.equal(workers[0].finished, false)
+  assert.equal(workers[0].stdin.writableEnded, false)
+  const duplicate = authenticate(wss, token, deviceId)
+  assert.equal(duplicate.closeCode, 1013)
+  assert.equal(workers.length, 1)
+  await negotiate(current)
+  t.mock.timers.tick(100)
+  current.message(JSON.stringify({ type: 'recovery.ping', protocol: 1 }))
+  assert.equal(JSON.parse(current.sent.at(-1)).type, 'recovery.pong')
+  assert.equal(current.readyState, 1)
+  assert.equal(workers[0].finished, false)
+  assert.equal(diagnostics.some(entry => entry.event === 'server_recovery_handshake_expired'), false)
+})
+
+test('worker 停止超时仍占用设备，重复停止不重复发信号，真实退出后才允许替换', async t => {
+  const signals = []
+  const { wss, workers, token, diagnostics } = await setup(t, {
+    workerOptions: { exitOnEof: false }, serverOptions: { stopGraceMs: 10, forceKillMs: 20, stopTimeoutMs: 30,
+      killGroup(pid, signal) { signals.push([pid, signal]) } },
+  })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const deviceId = randomUUID(), first = authenticate(wss, token, deviceId)
+  const worker = workers[0], end = t.mock.method(worker.stdin, 'end')
+  first.close(1000)
+  first.emit('close', 1006)
+  first.emit('error', new Error('synthetic repeated stop'))
+  worker.emit('error', new Error('synthetic worker error during stop'))
+  await new Promise(resolve => setImmediate(resolve))
+  t.mock.timers.tick(10)
+  assert.deepEqual(signals, [[93210, 'SIGTERM']])
+  first.emit('error', new Error('synthetic late stop'))
+  t.mock.timers.tick(20)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(signals, [[93210, 'SIGTERM'], [93210, 'SIGKILL']])
+  assert.equal(end.mock.callCount(), 1)
+  assert.equal(worker.finished, false)
+  assert.equal(diagnostics.filter(entry => entry.event === 'server_worker_stop_timeout').length, 1)
+  const refused = new FakeSocket()
+  wss.connect(refused)
+  const refusedClosed = new Promise(resolve => refused.once('close', resolve))
+  refused.message(JSON.stringify({ type: 'auth', protocol: 1, token, deviceId }))
+  await refusedClosed
+  assert.equal(refused.closeCode, 1013)
+  assert.equal(workers.length, 1)
+  t.mock.timers.tick(100)
+  assert.equal(end.mock.callCount(), 1)
+  assert.equal(signals.length, 2)
+  const closed = new Promise(resolve => worker.once('close', resolve))
+  worker.finish(0)
+  await closed
+  const replacement = authenticate(wss, token, deviceId)
+  assert.equal(replacement.readyState, 1)
+  assert.equal(JSON.parse(replacement.sent[0]).recovery.resumed, false)
+  assert.equal(workers.length, 2)
+})
+
+test('统计接管失败仍收尾已启动 worker，关闭服务等待真实退出且不放行同设备并发', async t => {
+  const signals = []
+  let attachments = 0, observationCloses = 0, end
+  const { wss, workers, token, server } = await setup(t, {
+    workerOptions: { exitOnEof: false }, serverOptions: { stopGraceMs: 10, forceKillMs: 20, stopTimeoutMs: 30,
+      killGroup(pid, signal) { signals.push([pid, signal]) },
+      observability: {
+        attach(worker) {
+          if (++attachments === 1) {
+            end = t.mock.method(worker.stdin, 'end')
+            throw new Error('synthetic observability attach failure')
+          }
+        },
+        async close() { observationCloses++ },
+      },
+    },
+  })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const deviceId = randomUUID(), failed = authenticate(wss, token, deviceId)
+  assert.equal(failed.closeCode, 1011)
+  const duplicate = authenticate(wss, token, deviceId)
+  assert.equal(workers.length, 1, '统计接管失败后必须先确认旧 worker 退出，不能启动同设备新 worker')
+  assert.equal(duplicate.sent.length, 0)
+  assert.equal(end.mock.callCount(), 1)
+  let closed = false
+  const closing = server.close()
+  assert.equal(server.close(), closing)
+  void closing.then(() => { closed = true })
+  await new Promise(resolve => setImmediate(resolve))
+  t.mock.timers.tick(10)
+  assert.equal(closed, false)
+  assert.equal(observationCloses, 0)
+  assert.deepEqual(signals, [[93210, 'SIGTERM']])
+  const workerClosed = new Promise(resolve => workers[0].once('close', resolve))
+  workers[0].finish(0)
+  await workerClosed
+  await closing
+  assert.equal(closed, true)
+  assert.equal(observationCloses, 1)
+  assert.equal(workers.length, 1)
+  assert.equal(end.mock.callCount(), 1)
+  assert.equal(duplicate.readyState, 3)
+})

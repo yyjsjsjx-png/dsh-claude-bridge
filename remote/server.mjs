@@ -9,6 +9,7 @@ import { validateConnectionToken, validateDeviceId } from '../src/connection-set
 import { COMPRESSION, encodeFrame, decodeFrame, compressedFrameSize } from '../src/websocket-compression.mjs'
 import { RECOVERY_PROTOCOL, createReplayBuffer, validatePriorityCancels } from '../src/replay-buffer.mjs'
 import { createObservabilityHost } from './observability-host.mjs'
+import { SocketAttempt, WorkerSocketLease } from './socket-lifecycle.mjs'
 
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
@@ -166,19 +167,14 @@ export async function createBridgeServer({
   }
 
   function release(state) {
-    clearTimeout(state.retentionTimer)
-    clearTimeout(state.recoveryHandshakeTimer)
-    clearInterval(state.heartbeatTimer)
+    state.lease.dispose()
     states.delete(state)
     if (state.deviceId && devices.get(state.deviceId) === state) devices.delete(state.deviceId)
   }
 
   function stop(state) {
     if (state.stopPromise) return state.stopPromise
-    clearTimeout(state.authTimer)
-    clearTimeout(state.retentionTimer)
-    clearTimeout(state.recoveryHandshakeTimer)
-    clearInterval(state.heartbeatTimer)
+    state.lease.dispose()
     state.stopPromise = (async () => {
       const child = state.child
       if (!child) { release(state); return }
@@ -217,28 +213,23 @@ export async function createBridgeServer({
     void stop(state).catch(() => {})
   }
 
-  function detach(state, socket) {
-    if (state.socket !== socket || state.stopPromise) return
+  function detach(state, attempt) {
+    if (!state.lease.isCurrent(attempt) || state.stopPromise) return
     if (!state.recoverable) { void stop(state).catch(() => {}); return }
     state.recoveryReady = false
-    clearTimeout(state.recoveryHandshakeTimer)
-    clearInterval(state.heartbeatTimer)
-    if (!state.retentionTimer) {
-      diagnose('server_connection_waiting', { code: 'RECOVERY_WAIT' })
-      state.retentionTimer = setTimeout(() => {
-        if (state.socket !== socket || state.recoveryReady) return
-        diagnose('server_recovery_expired', { code: 'RECOVERY_EXPIRED' })
-        disconnect(state, 4004)
-      }, recoveryGraceMs)
-      state.retentionTimer.unref?.()
-    }
+    state.lease.detach(attempt)
+    if (state.lease.retain(recoveryGraceMs, () => {
+      if (state.recoveryReady || state.stopPromise) return
+      diagnose('server_recovery_expired', { code: 'RECOVERY_EXPIRED' })
+      disconnect(state, 4004)
+    })) diagnose('server_connection_waiting', { code: 'RECOVERY_WAIT' })
   }
 
   function sendControl(state, message) {
-    const socket = state.socket
-    if (socket.readyState !== 1 || state.stopPromise) return
+    const attempt = state.lease.attempt, socket = attempt.socket
+    if (!state.lease.isCurrent(attempt) || socket.readyState !== 1 || state.stopPromise) return
     try { socket.send(JSON.stringify(message)) }
-    catch { detach(state, socket); socketClose(socket, 1011) }
+    catch { detach(state, attempt); socketClose(socket, 1011) }
   }
 
   function authReply(state, resumed = false) {
@@ -280,12 +271,12 @@ export async function createBridgeServer({
   }
 
   function flushReplay(state) {
-    const socket = state.socket
+    const attempt = state.lease.attempt, socket = attempt.socket
     state.outputQueue = state.outputQueue.then(async () => {
-      if (state.stopPromise || !state.recoveryReady || state.socket !== socket || socket.readyState !== 1) return
+      if (state.stopPromise || !state.recoveryReady || !state.lease.isCurrent(attempt) || socket.readyState !== 1) return
       for (const frame of state.replay.frames(state.outputWireSeq)) {
         const data = await encodeFrame(frame.line, { enabled: state.compressed, maxLineBytes })
-        if (state.stopPromise || !state.recoveryReady || state.socket !== socket || socket.readyState !== 1) return
+        if (state.stopPromise || !state.recoveryReady || !state.lease.isCurrent(attempt) || socket.readyState !== 1) return
         const size = typeof data === 'string' ? Buffer.byteLength(data) : data.length
         if (socket.bufferedAmount + size > maxLineBytes * 4) throw new Error('发送缓冲已满')
         state.replay.markTransmitted(frame.id)
@@ -295,10 +286,10 @@ export async function createBridgeServer({
           socket.once('close', closed)
           try { socket.send(data, finish) } catch (error) { finish(error) }
         })
-        if (state.socket !== socket) return
+        if (!state.lease.isCurrent(attempt)) return
         state.outputWireSeq = frame.id
       }
-    }).catch(() => { detach(state, socket); socketClose(socket, 1011) })
+    }).catch(() => { detach(state, attempt); socketClose(socket, 1011) })
   }
 
   function priorityCancel(state, values) {
@@ -345,12 +336,13 @@ export async function createBridgeServer({
     const bytes = Buffer.byteLength(line, 'utf8')
     if (state.outputBytes + bytes > maxLineBytes * 4) return disconnect(state, 1009)
     state.outputBytes += bytes
+    const attempt = state.lease.attempt, socket = attempt.socket
     state.outputQueue = state.outputQueue.then(async () => {
-      if (state.stopPromise || state.socket.readyState !== 1) return
+      if (state.stopPromise || !state.lease.isCurrent(attempt) || socket.readyState !== 1) return
       const frame = await encodeFrame(line, { enabled: state.compressed, maxLineBytes })
-      if (state.stopPromise || state.socket.readyState !== 1) return
+      if (state.stopPromise || !state.lease.isCurrent(attempt) || socket.readyState !== 1) return
       const frameBytes = typeof frame === 'string' ? Buffer.byteLength(frame, 'utf8') : frame.length
-      if (typeof state.socket.bufferedAmount === 'number' && state.socket.bufferedAmount + frameBytes > maxLineBytes * 4) {
+      if (typeof socket.bufferedAmount === 'number' && socket.bufferedAmount + frameBytes > maxLineBytes * 4) {
         throw new Error('发送队列已满')
       }
       await new Promise((resolve, reject) => {
@@ -358,16 +350,16 @@ export async function createBridgeServer({
         const finish = (error) => {
           if (settled) return
           settled = true
-          state.socket.removeListener('close', closed)
+          socket.removeListener('close', closed)
           if (error) reject(error)
           else resolve()
         }
         const closed = () => finish(new Error('连接已关闭'))
-        state.socket.once('close', closed)
-        if (state.socket.readyState !== 1) return closed()
-        try { state.socket.send(frame, finish) } catch { finish(new Error('消息发送失败')) }
+        socket.once('close', closed)
+        if (socket.readyState !== 1) return closed()
+        try { socket.send(frame, finish) } catch { finish(new Error('消息发送失败')) }
       })
-    }).catch(() => disconnect(state, 1011)).finally(() => { state.outputBytes -= bytes })
+    }).catch(() => { detach(state, attempt); socketClose(socket, 1011) }).finally(() => { state.outputBytes -= bytes })
   }
 
   function startWorker(state, deviceId) {
@@ -390,7 +382,6 @@ export async function createBridgeServer({
         },
       })
       if (!child?.stdin || !child?.stdout || !child?.stderr || typeof child.once !== 'function') throw new Error('worker')
-      observability?.attach(child, deviceId)
     } catch {
       diagnose('server_worker_start_failed', { code: 'WORKER_START_FAILED' })
       release(state)
@@ -454,6 +445,12 @@ export async function createBridgeServer({
       }
     })
     child.stdout.once('end', () => { if (lineBytes !== 0) disconnect(state, 1002) })
+    // From this point the lease owns the spawned child and its exit listeners.
+    // Optional observer setup must not release a still-running worker/device.
+    try { observability?.attach(child, deviceId) } catch {
+      diagnose('server_worker_start_failed', { code: 'WORKER_START_FAILED' })
+      return disconnect(state, 1011)
+    }
     authReply(state)
     diagnose('server_authenticated')
   }
@@ -462,16 +459,19 @@ export async function createBridgeServer({
     if (stopping || states.size >= maxConnections) return socketClose(socket, 1013)
     const address = typeof request?.socket?.remoteAddress === 'string' ? request.socket.remoteAddress : 'unknown'
     if (blocked(address)) return socketClose(socket, 1008)
-    let state = { socket, address, deviceId: undefined, child: undefined, exited: false, stopPromise: undefined,
+    const attempt = new SocketAttempt(socket, address)
+    const lease = new WorkerSocketLease()
+    lease.bind(attempt)
+    let state = { lease, get socket() { return lease.socket }, get address() { return lease.attempt?.address },
+      deviceId: undefined, child: undefined, exited: false, stopPromise: undefined,
       negotiable: true, compressed: false, inputQueue: Promise.resolve(), outputQueue: Promise.resolve(), inputBytes: 0, outputBytes: 0 }
     states.add(state)
-    state.authTimer = setTimeout(() => { if (!state.child) failAuth(state) }, authTimeoutMs)
-    state.authTimer.unref?.()
-    socket.on('error', () => { if (state.socket === socket) { detach(state, socket); socketClose(socket, 1011) } })
-    socket.on('close', () => { if (state.socket === socket) detach(state, socket) })
+    attempt.authenticateWithin(authTimeoutMs, () => { if (!state.child) failAuth(state) })
+    socket.on('error', () => { if (state.lease.isCurrent(attempt)) { detach(state, attempt); socketClose(socket, 1011) } })
+    socket.on('close', () => detach(state, attempt))
     socket.on('message', (data, isBinary) => {
-      if (state.stopPromise || state.socket !== socket) return
-      state.lastHeard = Date.now()
+      if (state.stopPromise || !state.lease.isCurrent(attempt)) return
+      attempt.heard()
       let bytes
       try { bytes = Buffer.isBuffer(data) ? data : Buffer.from(data) }
       catch { if (state.child) disconnect(state, 1002); else failAuth(state); return }
@@ -494,7 +494,7 @@ export async function createBridgeServer({
         const suppliedDigest = createHash('sha256').update(token).digest()
         token = undefined
         if (!timingSafeEqual(expectedDigest, suppliedDigest)) return failAuth(state)
-        clearTimeout(state.authTimer)
+        attempt.authenticated()
         if (auth.resume !== undefined) {
           const existing = devices.get(deviceId)
           if (!existing || existing.stopPromise || existing.exited || !existing.recoverable
@@ -503,19 +503,17 @@ export async function createBridgeServer({
             || Object.keys(auth.resume).some(key => !['id', 'ack'].includes(key))) return disconnect(state, 4004)
           try { existing.replay.acknowledge(auth.resume.ack) } catch { return disconnect(state, 4004) }
           states.delete(state)
-          const previous = existing.socket
+          const previous = existing.lease.bind(attempt)
           state = existing
-          state.socket = socket; state.address = address; state.negotiable = true; state.compressed = false
+          state.negotiable = true; state.compressed = false
           state.recoveryReady = false; state.outputWireSeq = state.replay.acknowledged
-          clearTimeout(state.retentionTimer); state.retentionTimer = undefined
           socketClose(previous, 1000)
           authReply(state, true)
-          state.recoveryHandshakeTimer = setTimeout(() => {
-            if (state.socket !== socket || state.recoveryReady || state.stopPromise) return
+          attempt.recoverWithin(authTimeoutMs, () => {
+            if (state.recoveryReady || state.stopPromise) return
             diagnose('server_recovery_handshake_expired', { code: 'RECOVERY_EXPIRED' })
             disconnect(state, 4004)
-          }, authTimeoutMs)
-          state.recoveryHandshakeTimer.unref?.()
+          })
           diagnose('server_connection_resumed')
           return
         }
@@ -526,7 +524,7 @@ export async function createBridgeServer({
         if (previous && previous.socket.readyState !== 1 && !previous.exited) {
           state.authenticating = true
           void stop(previous).then(() => {
-            if (stopping || state.socket !== socket || socket.readyState !== 1) { release(state); return }
+            if (stopping || !state.lease.isCurrent(attempt) || socket.readyState !== 1) { release(state); return }
             state.authenticating = false
             startWorker(state, deviceId)
           }).catch(() => disconnect(state, 1013))
@@ -543,22 +541,17 @@ export async function createBridgeServer({
             if (state.recoveryReady || control.id !== state.recoveryId) return disconnect(state, 1002)
             state.recoverable = true
             state.inputQueue = state.inputQueue.then(() => {
-              if (state.socket !== socket || state.stopPromise) return
+              if (!state.lease.isCurrent(attempt) || state.stopPromise) return
               if (control.ack < state.replay.acknowledged) throw new Error('恢复游标已过期')
               state.replay.acknowledge(control.ack)
               priorityCancel(state, control.cancelIds)
               state.recoveryReady = true
-              clearTimeout(state.recoveryHandshakeTimer)
-              clearInterval(state.heartbeatTimer)
-              state.lastHeard = Date.now()
-              state.heartbeatTimer = setInterval(() => {
-                if (state.stopPromise || !state.recoveryReady || state.socket !== socket) return
-                if (Date.now() - state.lastHeard < heartbeatTimeoutMs) return
+              attempt.recoveryReady({ intervalMs: heartbeatMs, timeoutMs: heartbeatTimeoutMs, onTimeout: () => {
+                if (state.stopPromise || !state.recoveryReady) return
                 diagnose('server_heartbeat_expired', { code: 'HEARTBEAT_TIMEOUT' })
-                detach(state, socket)
+                detach(state, attempt)
                 socketClose(socket, 4000)
-              }, heartbeatMs)
-              state.heartbeatTimer.unref?.()
+              } })
               sendControl(state, { type: 'recovery.ready', protocol: 1, id: state.recoveryId, ack: state.replay.received })
               flushReplay(state)
             }).catch(() => disconnect(state, 1002))

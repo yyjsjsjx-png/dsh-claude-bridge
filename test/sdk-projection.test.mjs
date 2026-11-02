@@ -1,7 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import { RESPONSE_USAGE_RECORD, RUN_USAGE_RECORD, initialResponseUsage,
@@ -132,12 +134,12 @@ test('实际 rc5 helper：工具使用最终 SDK 参数登记，Unicode 流式�
   await projection.accept({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
   await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 12 } } })
   await projection.accept({ type: 'stream_event', event: { type: 'message_stop' } })
-  assert.equal(projection.committedToolCalls.has('toolu_unicode'), false)
+  assert.equal(projection.getCommittedToolCall('toolu_unicode'), undefined)
   assert.equal(records.filter(record => record.type === 'assistant/message').length, 0)
   await projection.accept({ type: 'assistant', message: { id: 'canonical-tool', content: [
     { type: 'tool_use', id: 'toolu_unicode', name: 'mcp__dsh__local_command', input: canonical },
   ] } })
-  assert.deepEqual(JSON.parse(projection.committedToolCalls.get('toolu_unicode').arguments), canonical)
+  assert.deepEqual(JSON.parse(projection.getCommittedToolCall('toolu_unicode').arguments), canonical)
   const committed = records.find(record => record.type === 'assistant/message')
   assert.deepEqual(JSON.parse(committed.data.message.content[0].arguments), canonical)
   assert.deepEqual(committed.data.stream, [])
@@ -157,6 +159,111 @@ async function fixture() {
   const projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'haiku', async onUsage() {} })
   return { records, frames, projection, agent, helpers }
 }
+
+test('实际 rc5 Backend：批次预准备步骤复用同 ID 流和完整快照，最终步骤由原生循环闭合后可严格重载',
+  { skip: !available }, async t => {
+    const [{ BridgeBackend }, { requiredShellName }, native, runtime] = await Promise.all([
+      import('../src/backend.mjs'), import('../src/remote-capabilities.mjs'),
+      import(resolveDshModule('@deepseek-ai/dsh-session')), import('../plugin/compat/runtime.mjs'),
+    ])
+    const parent = resolve(tmpdir())
+    const directory = await mkdtemp(join(parent, 'dsh-native-backend-step-'))
+    let backend
+    t.after(async () => {
+      await backend?.dispose()
+      assert.equal(dirname(resolve(directory)), parent)
+      assert.ok(basename(directory).startsWith('dsh-native-backend-step-'))
+      await rm(directory, { recursive: true, force: true })
+    })
+    const provider = 'claude-sdk-remote', id = 'native-backend-step'
+    const session = native.Session.create(id, undefined, { version: native.SESSION_FORMAT_VERSION,
+      id, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: provider, cwd: directory })
+    // The native loop owns the initial opening and final closing; Backend only
+    // moves the intermediate response/preparation boundary.
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    const frames = [], selection = { provider, model: 'fixture' }
+    const agent = { id, session, phase: { kind: 'running', turn: 1, step: 1, abort: new AbortController() },
+      _bridgeStepOpen: true, options: selection,
+      dispatch: { emit(_type, value) { frames.push(value.frame) } },
+      systemPrompt: { project() { return [] } }, runtimeContext: { project() { return undefined } },
+      inbox: { nextStep: [], splice() { assert.fail('成功准备不应回填消息') } } }
+    const ctx = { sessionProjections: { stateOf(_session, name) { return name === 'modelSelection' ? { pending: selection } : null } },
+      systemPrompt: { refreshContext() { return [] } }, attachments: {},
+      fs: { processPathFromHostPath(path) { return path } },
+      tools: { execute() { assert.fail('原生步骤验收不执行命令') } },
+      approval: { request() { assert.fail('原生步骤验收不请求审批') } },
+      agents: { withInitiator(_agent, operation) { return operation() } }, sessions: { async flush() { return true } } }
+    const helpers = { ...runtime, appendPluginRecord: native.appendPluginRecord, resolveDshHome() { return directory },
+      // Prompt/context assembly is unrelated to the native step seam. Keep the
+      // same narrow substitutes as Backend's existing offline fixture.
+      renderPrompt() { return '合成原生步骤验收' }, assembleContextFor() { return {} },
+      renderContextSections() { return [] }, joinContextSections() { return '' } }
+    const decision = { assembly: { tools: [{ name: requiredShellName(), description: '仅声明，不执行',
+      parameters: { type: 'object', additionalProperties: false, properties: {
+        command: { type: 'string' }, workdir: { type: 'string' }, timeoutMs: { type: 'number' },
+      }, required: ['command'] } }] }, messages: [{ id: 'native-step-user', role: 'user', source: { kind: 'user' },
+      content: [{ type: 'text', text: '合成步骤输入' }] }] }
+    let preparations = 0, queries = 0
+    agent.preStep = async (target, position) => {
+      preparations++
+      assert.equal(target, 'next-step')
+      assert.deepEqual(position, { turn: 1, step: 2 })
+      assert.equal(agent._bridgeStepOpen, false)
+      assert.deepEqual(session.snapshotEvents().filter(event => event.type === 'step/end').map(event => event.data.step), [1])
+      return { ...decision, messages: [] }
+    }
+    backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers,
+      createTransport: async options => ({ peer: { async request(method, params) {
+        if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+        assert.equal(method, 'query')
+        queries++
+        const notify = message => options.onNotification('sdk.message', { runId: params.runId, message })
+        const response = async (responseId, text) => {
+          const stream = event => notify({ type: 'stream_event', event })
+          await stream({ type: 'message_start', message: { id: responseId } })
+          await stream({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
+          await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })
+          await notify({ type: 'assistant', message: { id: responseId, model: 'fixture', content: [{ type: 'text', text }] } })
+          await stream({ type: 'content_block_stop', index: 0 })
+          await stream({ type: 'message_delta', usage: { output_tokens: 1 } })
+          await stream({ type: 'message_stop' })
+        }
+        await response('native-first', '合成首响应')
+        assert.deepEqual(await options.handlers['step.prepare']({ runId: params.runId },
+          { signal: new AbortController().signal }), {})
+        await response('native-second', '合成最终响应')
+        assert.equal(agent.phase.step, 2)
+        assert.equal(agent._bridgeStepOpen, true)
+        await notify({ type: 'result', subtype: 'success', usage: { input_tokens: 1, output_tokens: 2 } })
+        return { status: 'completed' }
+      }, async drainNotifications() {} }, async close() {} }) })
+    let outcome
+    try { outcome = await backend.runStep(agent, decision) }
+    finally {
+      // Mirror the shipped loop's _bridgeStepOpen guard, using its current
+      // phase rather than the initial step captured by the native loop.
+      if (agent._bridgeStepOpen !== false) {
+        session.append('step/end', { turn: 1, step: agent.phase.step })
+        agent._bridgeStepOpen = false
+      }
+    }
+    assert.deepEqual(outcome, { kind: 'completed' })
+    assert.equal(queries, 1)
+    assert.equal(preparations, 1)
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    const events = session.snapshotEvents()
+    for (const type of ['step/start', 'step/end']) {
+      assert.deepEqual(events.filter(event => event.type === type).map(event => event.data.step), [1, 2])
+    }
+    assert.deepEqual(events.filter(event => event.type === 'assistant/message').map(event => ({
+      step: event.data.step, text: event.data.message.content[0].text,
+    })), [{ step: 1, text: '合成首响应' }, { step: 2, text: '合成最终响应' }])
+    assert.deepEqual(frames.filter(frame => frame.type === 'start').map(frame => frame.step), [1, 2])
+    const artifact = await strictSession(session)
+    const restored = native.Session.create(id, artifact.events, artifact.header)
+    assert.equal(restored.firstLiveSeq, session.seq)
+  })
 
 test('实际 rc5 helper：整轮停止保留已收到文本，冻结后续流和完整消息', { skip: !available }, async () => {
   const { records, frames, projection } = await fixture()
@@ -314,7 +421,7 @@ test('实际 rc5 helper：SDK tool_use 投影为可关联的 assistant tool-call
   assert.equal(call?.id, 'toolu_test')
   assert.equal(call?.name, 'local_smoke')
   assert.deepEqual(JSON.parse(call.arguments), { command: 'pwd' })
-  assert.deepEqual(projection.committedToolCalls.get('toolu_test'), { name: 'local_smoke', arguments: call.arguments })
+  assert.deepEqual(projection.getCommittedToolCall('toolu_test'), { name: 'local_smoke', arguments: call.arguments })
 })
 
 test('实际 rc5 helper：流式文本与工具参数共同形成有序 assistant 块', { skip: !available }, async () => {
@@ -679,6 +786,6 @@ test('实际rc5：权威工具消息补齐残缺或改变的原始参数时，�
     assert.equal(view.tpsSamples, 0)
     assert.equal(view.incompleteCaptures, 1)
     assert.equal(f.records.filter(e => e.type === 'assistant/message').length, 1)
-    assert.deepEqual(JSON.parse(projection.committedToolCalls.get('input-call').arguments), { command: 'complete' })
+    assert.deepEqual(JSON.parse(projection.getCommittedToolCall('input-call').arguments), { command: 'complete' })
   }
 })

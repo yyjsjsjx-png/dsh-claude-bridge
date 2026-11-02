@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { getEventListeners } from 'node:events'
 import { BridgeBackend } from '../src/backend.mjs'
+import { ConnectionContext } from '../src/connection-context.mjs'
 import { planUsageSnapshot } from '../src/plan-usage.mjs'
 import { BridgeState } from '../src/state.mjs'
 import { assistantIdentity, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
@@ -106,7 +108,7 @@ test('上下文默认值仅本设备持久保存，下轮透传且旧服务器�
   await assert.rejects(f.backend.saveContextPreferences({ autoCompactWindowTokens: 99999 }), { code: 'INVALID_CONTEXT_PREFERENCES' })
   await f.backend.runStep(f.agent, f.decision)
   assert.deepEqual(requests[0].contextPreferences, { autoCompactWindowTokens: 200000 })
-  f.backend.initialized = { capabilities: {} }
+  f.backend.initialized.capabilities.autoCompactWindow = false
   assert.throws(() => f.backend.contextRequestPreferences(), { code: 'CONTEXT_SETTINGS_UNSUPPORTED' })
   await f.backend.saveContextPreferences({ autoCompactWindowTokens: null })
   assert.deepEqual(f.backend.contextRequestPreferences(), {})
@@ -191,8 +193,12 @@ test('清除以后旧目录、额度和登录响应不会恢复缓存或登录�
 
 test('WebSocket 关闭超时仍保存本机台账和诊断，重复卸载不再执行清理', async () => {
   const saved = []
+  const connectionContext = new ConnectionContext()
+  connectionContext.bind(connectionContext.capture(), {
+    async close() { saved.push('close'); throw Object.assign(new Error('关闭超时'), { code: 'CLOSE_TIMEOUT' }) },
+  })
   const backend = Object.assign(Object.create(BridgeBackend.prototype), { lifetime: new AbortController(), runs: new Map(),
-    connection: { async close() { saved.push('close'); throw Object.assign(new Error('关闭超时'), { code: 'CLOSE_TIMEOUT' }) } },
+    connectionContext,
     state: { async flush() { saved.push('state') } }, diagnostics: { async flush() { saved.push('diagnostics') } } })
   await assert.rejects(backend.dispose(), { code: 'CLOSE_TIMEOUT' })
   await assert.rejects(backend.dispose(), { code: 'CLOSE_TIMEOUT' })
@@ -229,6 +235,22 @@ async function prepareCompact(f) {
   const binding = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
   await f.backend.state.markStarted(f.agent.id)
   return binding
+}
+
+async function lifecycleFixture(t, kind, request) {
+  const f = await fixture(t, async () => ({ peer: { async request(method, params, options) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { manualCompact: true } }
+    return request(method, params, options)
+  } }, async close() {} }))
+  const controller = kind === 'query' ? f.phaseAbort : new AbortController()
+  if (kind === 'compact') await prepareCompact(f)
+  return { ...f, controller, start: () => kind === 'query'
+    ? f.backend.runStep(f.agent, f.decision) : f.backend.compact(f.agent, controller.signal) }
+}
+
+async function assertLifecycleFailure(f, kind, expected) {
+  if (kind === 'query') await assert.rejects(f.start(), expected)
+  else assert.equal((await f.start()).kind, 'error')
 }
 
 test('/compact 使用维护门禁和已有绑定，不发送 DSH 历史，成功后更新 SDK 快照', async t => {
@@ -289,6 +311,170 @@ test('/compact 取消后迟到成功不覆盖未知状态，不自动重试或�
   assert.equal(queries, 1)
   assert.equal(settlements, 1)
   assert.equal(f.backend.runs.size, 0)
+})
+
+test('query 与 compact 登记后 setup 失败均收尾，beginRun 本身失败不结束未建台账', async t => {
+  for (const kind of ['query', 'compact']) {
+    for (const stage of kind === 'query' ? ['begin', 'header', 'status', 'started'] : ['begin', 'status', 'started']) {
+      let requests = 0, finishes = 0, stopRequests = 0, runId, runSignal, failed = false
+      const f = await lifecycleFixture(t, kind, async () => { requests++; throw new Error('不应发送请求') })
+      const synthetic = Object.assign(new Error('合成 setup 失败'), { code: 'SETUP_FAILED' })
+      const begin = f.backend.state.beginRun.bind(f.backend.state)
+      f.backend.state.beginRun = async (...args) => {
+        runId = args[1]
+        if (stage === 'begin') throw synthetic
+        return begin(...args)
+      }
+      const finish = f.backend.state.finishRun.bind(f.backend.state)
+      f.backend.state.finishRun = async (...args) => { finishes++; return finish(...args) }
+      const stop = f.backend.state.requestStop.bind(f.backend.state)
+      f.backend.state.requestStop = async (...args) => { stopRequests++; return stop(...args) }
+      const append = f.agent.session.append.bind(f.agent.session)
+      f.agent.session.append = (type, ...args) => {
+        if (!failed && stage === 'header' && type === 'request/header') { failed = true; throw synthetic }
+        return append(type, ...args)
+      }
+      const status = f.backend.sessionStatus.bind(f.backend)
+      f.backend.sessionStatus = (agent, patch) => {
+        if (patch.phase === (kind === 'query' ? 'running' : 'compacting')) {
+          runSignal = f.backend.runs.get(runId).signal
+          if (!failed && stage === 'status') { failed = true; throw synthetic }
+        }
+        return status(agent, patch)
+      }
+      const event = f.backend.diagnostics.event
+      f.backend.diagnostics.event = (name, fields) => {
+        if (!failed && stage === 'started' && name === (kind === 'query' ? 'run.started' : 'compact.started')) {
+          assert.equal(getEventListeners(runSignal, 'abort').length, 1)
+          failed = true; throw synthetic
+        }
+        return event(name, fields)
+      }
+      await assertLifecycleFailure(f, kind, { code: 'SETUP_FAILED' })
+      assert.equal(requests, 0)
+      assert.equal(f.backend.runs.size, 0)
+      assert.equal(finishes, stage === 'begin' ? 0 : 1)
+      const saved = f.backend.state.value.sessions[f.agent.id].runs?.[runId]
+      if (stage === 'begin') assert.equal(saved, undefined)
+      else {
+        assert.equal(saved.status, 'not-sent')
+        assert.equal(saved.requiresReview, false)
+        assert.equal(f.backend.retiredRuns.has(runId), true)
+      }
+      if (runSignal) assert.equal(getEventListeners(runSignal, 'abort').length, 0)
+      f.controller.abort()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(stopRequests, 0, '收尾后的 signal 不再修改台账')
+    }
+  }
+})
+
+test('query 与 compact 在 markRunSent 返回前取消均不发送 query，最终记 not-sent', async t => {
+  for (const kind of ['query', 'compact']) {
+    let entered, release, runId, requests = 0
+    const marked = new Promise(resolve => { entered = resolve })
+    const pending = new Promise(resolve => { release = resolve })
+    const f = await lifecycleFixture(t, kind, async () => { requests++; throw new Error('不应发送请求') })
+    const mark = f.backend.state.markRunSent.bind(f.backend.state)
+    f.backend.state.markRunSent = async (...args) => {
+      await mark(...args)
+      runId = args[1]; entered()
+      await pending
+    }
+    const running = kind === 'query'
+      ? assert.rejects(f.start(), { name: 'AbortError' })
+      : f.start().then(result => assert.equal(result.kind, 'error'))
+    await marked
+    const run = f.backend.runs.get(runId)
+    assert.equal(f.backend.state.value.sessions[f.agent.id].runs[runId].status, 'sent')
+    f.controller.abort()
+    await run.stopPersistence
+    release()
+    await running
+    assert.equal(requests, 0)
+    assert.equal(run.requestStarted, undefined)
+    assert.equal(f.backend.runs.size, 0)
+    assert.equal(getEventListeners(run.signal, 'abort').length, 0)
+    const saved = f.backend.state.value.sessions[f.agent.id].runs[runId]
+    assert.equal(saved.status, 'not-sent')
+    assert.equal(saved.requiresReview, false)
+    assert.ok(saved.stopRequestedAt)
+  }
+})
+
+test('发送意图助手返回与调用方续段之间取消时，query 与 compact 均不派发或记为已发送', async t => {
+  for (const kind of ['query', 'compact']) {
+    let stopped, releaseStop, run, requests = 0
+    const stoppedBeforeDispatch = new Promise(resolve => { stopped = resolve })
+    const stopGate = new Promise(resolve => { releaseStop = resolve })
+    const f = await lifecycleFixture(t, kind, async method => {
+      if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false }
+      assert.equal(method, 'query'); requests++
+      return { status: 'completed', compaction: { status: 'compacted' } }
+    })
+    const stop = f.backend.state.requestStop.bind(f.backend.state)
+    f.backend.state.requestStop = async (...args) => { await stopGate; return stop(...args) }
+    const mark = f.backend.state.markRunSent.bind(f.backend.state)
+    f.backend.state.markRunSent = async (...args) => {
+      await mark(...args)
+      run = f.backend.runs.get(args[1])
+      // First microtask precedes the helper's await continuation; the second
+      // follows it but precedes the caller's await continuation and RPC.
+      queueMicrotask(() => queueMicrotask(() => { f.controller.abort(); stopped() }))
+    }
+    const running = kind === 'query'
+      ? assert.rejects(f.start(), { name: 'AbortError' })
+      : f.start().then(result => assert.equal(result.kind, 'error'))
+    await stoppedBeforeDispatch
+    await new Promise(resolve => setImmediate(resolve))
+    const beforeStopSaved = { requests, started: run.requestStarted, aborted: run.queryAbort.signal.aborted }
+    releaseStop()
+    await running
+    assert.deepEqual(beforeStopSaved, { requests: 0, started: undefined, aborted: false })
+    assert.equal(requests, 0)
+    assert.equal(f.backend.runs.size, 0)
+    assert.equal(getEventListeners(run.signal, 'abort').length, 0)
+    const saved = f.backend.state.value.sessions[f.agent.id].runs[run.runId]
+    assert.equal(saved.status, 'not-sent')
+    assert.equal(saved.requiresReview, false)
+  }
+})
+
+test('query 与 compact 的停止保存失败先记 journalError 再 abort，收尾保留 review', async t => {
+  for (const kind of ['query', 'compact']) {
+    let started, failStop, run, aborts = 0, stops = 0, requests = 0
+    const ready = new Promise(resolve => { started = resolve })
+    const saveStop = new Promise((_resolve, reject) => { failStop = reject })
+    const synthetic = new Error('合成 stop 保存失败')
+    const f = await lifecycleFixture(t, kind, async (method, params, options) => {
+      if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false }
+      assert.equal(method, 'query'); requests++
+      run = f.backend.runs.get(params.runId)
+      started()
+      return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => {
+        aborts++
+        assert.equal(run.journalError, synthetic)
+        reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }))
+      }, { once: true }))
+    })
+    f.backend.state.requestStop = () => { stops++; return saveStop }
+    const running = kind === 'query'
+      ? assert.rejects(f.start(), { name: 'AbortError' })
+      : f.start().then(result => assert.equal(result.kind, 'error'))
+    await ready
+    f.controller.abort()
+    assert.equal(stops, 1)
+    assert.equal(run.queryAbort.signal.aborted, false, '停止持久化尚未结算时不提前 abort')
+    failStop(synthetic)
+    await running
+    assert.equal(aborts, 1)
+    assert.equal(requests, 1)
+    assert.equal(f.backend.runs.size, 0)
+    assert.equal(getEventListeners(run.signal, 'abort').length, 0)
+    const saved = f.backend.state.value.sessions[f.agent.id].runs[run.runId]
+    assert.equal(saved.status, kind === 'query' ? 'cancelled' : 'unknown')
+    assert.equal(saved.requiresReview, true)
+  }
 })
 
 test('已确认视觉型号开放原生 read_image，并把校验后的图片工具结果送到 MCP', async (t) => {
@@ -1025,6 +1211,45 @@ test('Host 崩溃窗口自动核实本机已落盘结果，补齐云端尾部，
   assert.equal((await f.backend.state.recoveryStatus(f.agent.id)).length, 0)
   assert.equal(f.backend.state.value.sessions[f.agent.id].runs['interrupted-run'].tools['old-call'].resultSeq, binding.resultSeq)
   assert.equal(queries, 0); assert.equal(executed, 0)
+})
+
+test('恢复历史已checkpoint而台账提交失败后，重入不重复投影或云端工具结果', async t => {
+  let binding, executed = 0
+  const f = await fixture(t, async () => ({ peer: { async request(method) {
+    if (method === 'initialize') return { protocolVersion: 1, capabilities: { historySync: true } }
+    assert.equal(method, 'history')
+    return { status: 'ok', sessionId: binding.sdkSessionId, records: [
+      { type: 'assistant', uuid: 'cloud-answer', apiId: 'old-api', model: 'fixture',
+        content: [{ type: 'text', text: '合成输出开头以及漏收尾部' }, binding.content[1]] },
+      { type: 'tool-result', uuid: 'cloud-result', callId: 'old-call', isError: false,
+        content: [{ type: 'text', text: '合成工具回执' }] },
+    ], runs: { 'interrupted-run': { status: 'completed', tools: { 'old-call': {
+      name: 'local_command', argumentsSha256: createHash('sha256').update(binding.argumentsText).digest('hex'),
+    } } } }, nextOffset: 2, lastUuid: 'cloud-result', done: true }
+  } }, async close() {} }), async () => { executed++; return { content: [] } })
+  binding = await interruptedTool(f)
+  let checkpointed = false, failCommit = true
+  f.ctx.sessions.flush = async () => { checkpointed = true; return true }
+  const reconcile = f.backend.state.reconcileRecovery.bind(f.backend.state)
+  f.backend.state.reconcileRecovery = async (...args) => {
+    assert.equal(checkpointed, true)
+    if (failCommit) {
+      failCommit = false
+      throw Object.assign(new Error('合成台账提交失败'), { code: 'FIXTURE_COMMIT_FAILED' })
+    }
+    return reconcile(...args)
+  }
+  await assert.rejects(f.backend.syncSession(f.agent), { code: 'FIXTURE_COMMIT_FAILED' })
+  assert.equal(f.backend.verifiedHistory.has(f.agent.session), false)
+  assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor, undefined)
+  assert.equal(f.records.filter(record => record.type === HISTORY_ASSISTANT).length, 1)
+  assert.equal(f.records.filter(record => record.type === HISTORY_TOOL_RESULT).length, 1)
+  assert.equal((await f.backend.syncSession(f.agent)).added, 0)
+  assert.equal(f.records.filter(record => record.type === HISTORY_ASSISTANT).length, 1)
+  assert.equal(f.records.filter(record => record.type === HISTORY_TOOL_RESULT).length, 1)
+  assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor.offset, 2)
+  assert.equal((await f.backend.state.recoveryStatus(f.agent.id)).length, 0)
+  assert.equal(executed, 0)
 })
 
 test('未知工具仅用匹配的云端回执核实，未核实说明随下一条用户输入送达原生会话', async t => {

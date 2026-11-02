@@ -8,6 +8,7 @@ import { createDiagnostics } from './diagnostics.mjs'
 import { createSshTransport } from './ssh-transport.mjs'
 import { createWebSocketTransport } from './websocket-transport.mjs'
 import { createConnectionSettings } from './connection-settings.mjs'
+import { ConnectionContext } from './connection-context.mjs'
 import { toMcpToolDefinitions, toSdkPrompt, toMcpContent } from './dsh-content.mjs'
 import { SdkProjection, dshUsage } from './sdk-projection.mjs'
 import { CLAUDE_PROVIDER, CLAUDE_PRESET } from '../plugin/policy.mjs'
@@ -18,7 +19,9 @@ import { contextSnapshot, initialSessionStatus, reconcileSessionStatus, SESSION_
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { retainedPlanUsage } from './observability-plan-usage.mjs'
 import { createLocalRunTiming } from './local-run-timing.mjs'
-import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult,
+  verifiedCloudToolResult, recoveryToolUpdate, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { readHistoryPages } from './history-reader.mjs'
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
@@ -29,6 +32,7 @@ import { prepareRequestAssembly, prepareRequestMessages } from './request-prepar
 import { evaluateBridgeCompatibility, bridgeCompatibilityAllowed } from './bridge-compatibility.mjs'
 import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } from './catalog-display.mjs'
 import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.mjs'
+import { RunStepLifecycle } from './step-lifecycle.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const USER_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -78,17 +82,17 @@ export class BridgeBackend {
     this.bridgeCompatibility = uncheckedBridgeCompatibility()
     this.remoteCapabilities = { status: 'unchecked', shell: requiredShellName(), reason: '尚未检查远程会话的基础执行能力。' }
     this.shellFailures = new WeakMap()
-    this.connection = undefined
-    this.connecting = undefined
-    this.connectionRevision = 0
+    this.connectionContext = new ConnectionContext()
     this.historyGeneration = 0
     this.verifiedHistory = new WeakMap()
-    this.connectionAbort = new AbortController()
     this.connectionUsers = 0
     this.connectionChanging = false
     this.disposed = false
     this.lifetime = new AbortController()
   }
+
+  get connection() { return this.connectionContext.transport }
+  get initialized() { return this.connectionContext.initialized }
 
   async settings() {
     await this.state.ready
@@ -113,15 +117,8 @@ export class BridgeBackend {
       throw failure('BRIDGE_BUSY', '请等待当前任务或历史同步结束后更改连接。')
     }
     this.connectionChanging = true
-    this.connectionRevision++
     this.historyGeneration++
-    this.connectionAbort.abort()
-    this.connectionAbort = new AbortController()
-    const transport = this.connection
-    const connecting = this.connecting
-    this.connection = undefined
-    this.connecting = undefined
-    this.initialized = undefined
+    const { transport, pending: connecting } = this.connectionContext.invalidate()
     this.bridgeCompatibility = uncheckedBridgeCompatibility()
     this.authentication = 'unknown'
     this.catalogCache = undefined
@@ -209,11 +206,11 @@ export class BridgeBackend {
 
   async refreshAuthentication() {
     this.planUsageCache = undefined
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const transport = await this.connect()
     try {
       const status = await transport.peer.request('authStatus', { refresh: true }, { timeoutMs: 30000 })
-      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (status.status === 'failed' || typeof status.loggedIn !== 'boolean') {
         throw failure(status.code ?? 'AUTH_STATUS_UNAVAILABLE', status.message ?? '无法验证服务器上的 Claude 登录状态。')
       }
@@ -221,7 +218,7 @@ export class BridgeBackend {
       if (status.loggedIn !== true) throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
       return status
     } catch (error) {
-      if (revision === this.connectionRevision) this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
+      if (this.connectionContext.current(identity)) this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
       throw error
     }
   }
@@ -230,15 +227,14 @@ export class BridgeBackend {
     if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
     if (this.connectionChanging) throw failure('BRIDGE_BUSY', '连接设置正在更改，请稍后重试。')
     if (this.connection) return this.connection
-    if (this.connecting) return this.connecting
+    if (this.connectionContext.pending) return this.connectionContext.pending
     this.historyGeneration++
-    const revision = this.connectionRevision
-    const connectionSignal = this.connectionAbort.signal
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       await this.state.ready
       let transport
       const options = {
-        signal: AbortSignal.any([signal, this.lifetime.signal, connectionSignal].filter(Boolean)),
+        signal: AbortSignal.any([signal, this.lifetime.signal, identity.signal].filter(Boolean)),
         handlers: {
           'tool.execute': (params, context) => this.dispatchTool(params, context),
           'approval.request': (params, context) => this.dispatchApproval(params, context),
@@ -247,13 +243,13 @@ export class BridgeBackend {
         onNotification: (method, params) => this.notification(method, params),
         onTraffic: event => this.localTiming.observe(event),
         onClose: () => {
-          if (revision === this.connectionRevision && (!this.connection || this.connection === transport)) {
+          if (this.connectionContext.disconnected(identity, transport)) {
             this.historyGeneration++
-            this.connection = undefined; this.planUsageCache = undefined
+            this.planUsageCache = undefined
           }
         },
         onConnectionState: connection => {
-          if (revision !== this.connectionRevision || (this.connection && this.connection !== transport)) return
+          if (!this.connectionContext.accepts(identity, transport)) return
           if (connection !== 'connected') this.historyGeneration++
           for (const run of this.runs.values()) {
             try { this.sessionStatus(run.agent, { connection }) }
@@ -275,10 +271,9 @@ export class BridgeBackend {
         transport = await createWebSocketTransport({ ...options, ...configured, initialConnectWindowMs: 60_000 })
       }
       try {
-        if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
-        this.initialized = undefined
+        if (!this.connectionContext.beginInitialization(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         const initialized = await transport.peer.request('initialize', { protocolVersion: 1, clientVersion }, { timeoutMs: 30000 })
-        if (revision !== this.connectionRevision || this.disposed) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+        if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
         if (initialized.protocolVersion !== 1) throw failure('PROTOCOL_MISMATCH', '服务器协议不兼容。')
         this.bridgeCompatibility = evaluateBridgeCompatibility({ clientVersion,
           serverVersion: initialized.serverVersion, minimumClientVersion: initialized.minimumClientVersion })
@@ -290,15 +285,15 @@ export class BridgeBackend {
           throw failure(this.bridgeCompatibility.status === 'update-required' ? 'CLIENT_UPDATE_REQUIRED' : 'SERVER_COMPATIBILITY_INVALID',
             this.bridgeCompatibility.message)
         }
-        this.initialized = initialized
+        this.connectionContext.completeInitialization(identity, initialized)
         this.authentication = initialized.authenticated === true ? 'logged-in' : initialized.authenticated === false ? 'login-required' : 'unknown'
         if (initialized.authenticated === false) throw failure('AUTH_REQUIRED', '请在服务器上完成 Claude 官方登录。')
-        this.connection = transport
+        this.connectionContext.bind(identity, transport)
         return transport
       } catch (error) { await transport.close(); throw error }
     })()
-    this.connecting = pending
-    try { return await pending } finally { if (this.connecting === pending) this.connecting = undefined }
+    this.connectionContext.track(pending)
+    try { return await pending } finally { this.connectionContext.untrack(pending) }
   }
 
   async catalog({ refresh = false } = {}) {
@@ -306,23 +301,23 @@ export class BridgeBackend {
     if (!refresh && this.catalogCache && Date.now() - this.catalogCache.time < 30000) return structuredClone(this.catalogCache.reply)
     if (this.catalogPending) {
       if (!refresh || this.catalogPendingRefresh) return this.catalogPending
-      const revision = this.connectionRevision
+      const identity = this.connectionContext.capture()
       await this.catalogPending.catch(() => {})
-      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       return this.catalog({ refresh: true })
     }
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       const transport = await this.connect()
       // Automatic model resolution may call this once for every catalog row.
       // Only the explicit refresh action forces a fresh CLI auth check.
       if (refresh) await this.refreshAuthentication()
       const reply = await transport.peer.request('catalog', { refresh }, { timeoutMs: 45000 })
-      if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       if (reply.status !== 'ok') throw failure(reply.code ?? 'CATALOG_UNAVAILABLE', reply.message ?? '无法获取当前账号模型目录。')
       this.catalogCache = { time: Date.now(), reply: structuredClone(reply) }
-      await this.rememberDisplayCatalog(reply.models, revision, transport)
-      if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      await this.rememberDisplayCatalog(reply.models, identity, transport)
+      if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
       this.displayCatalogStatus = { status: 'ready' }
       return reply
     })()
@@ -335,16 +330,16 @@ export class BridgeBackend {
 
   async displayCatalogIdentity() {
     if (this.displayIdentityPending) return this.displayIdentityPending
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       await this.state.ready
       const transport = this.createTransport ? 'custom' : this.config.transport ?? 'wss'
-      const identity = transport === 'wss'
+      const configured = transport === 'wss'
         ? { transport, ...(await (await this.settings()).resolve()) }
         : { transport, deviceId: this.state.value.deviceId,
           worker: this.config.remoteWorkerPath, node: this.config.remoteNodePath }
-      if (revision !== this.connectionRevision) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
-      return catalogConnectionIdentity(identity)
+      if (!this.connectionContext.current(identity)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      return catalogConnectionIdentity(configured)
     })()
     this.displayIdentityPending = pending
     try { return await pending } finally {
@@ -356,10 +351,10 @@ export class BridgeBackend {
   async displayCatalog({ visible = false } = {}) {
     await this.state.ready
     if (this.disposed || this.connectionChanging) return { status: 'ok', models: [] }
-    const revision = this.connectionRevision
+    const context = this.connectionContext.capture()
     let identity
     try { identity = await this.displayCatalogIdentity() } catch { return { status: 'ok', models: [] } }
-    if (revision !== this.connectionRevision || this.connectionChanging) return { status: 'ok', models: [] }
+    if (!this.connectionContext.current(context) || this.connectionChanging) return { status: 'ok', models: [] }
     const cached = readDisplayCatalog(this.state.value.displayCatalog, identity)
     let models = cached?.models ?? []
     if (visible) {
@@ -371,13 +366,13 @@ export class BridgeBackend {
     return { status: 'ok', models, ...(cached ? { updatedAt: cached.updatedAt } : {}) }
   }
 
-  async rememberDisplayCatalog(input, revision, transport) {
+  async rememberDisplayCatalog(input, context, transport) {
     let changed = false
     try {
       const models = catalogDisplayModels(input)
       const identity = await this.displayCatalogIdentity()
       await this.state.update(state => {
-        if (this.disposed || revision !== this.connectionRevision || this.connection !== transport) return
+        if (!this.connectionContext.current(context, transport)) return
         const previous = readDisplayCatalog(state.displayCatalog, identity)
         changed = !previous || !isDeepStrictEqual(previous.models, models)
         state.displayCatalog = { version: 1, identity, updatedAt: Date.now(), models }
@@ -387,7 +382,7 @@ export class BridgeBackend {
       // required persistence, and a cache failure never authorizes execution.
       this.diagnostics.event('catalog.cache_unavailable', { code: 'DISPLAY_CACHE_UNAVAILABLE' })
     }
-    if (changed && !this.disposed && revision === this.connectionRevision && this.connection === transport) {
+    if (changed && this.connectionContext.current(context, transport)) {
       try { this.onDisplayCatalogChanged?.() }
       catch { this.diagnostics.event('catalog.notification_failed', { code: 'CATALOG_NOTIFICATION_FAILED' }) }
     }
@@ -397,12 +392,12 @@ export class BridgeBackend {
   refreshDisplayCatalog() {
     if (this.disposed || this.connectionChanging || this.displayCatalogRefreshPending
       || Date.now() < (this.displayCatalogRefreshAfter ?? 0)) return
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     this.displayCatalogStatus = { status: 'refreshing' }
     const pending = this.catalog().then(() => {
-      if (revision === this.connectionRevision && !this.disposed) this.displayCatalogStatus = { status: 'ready' }
+      if (this.connectionContext.current(identity)) this.displayCatalogStatus = { status: 'ready' }
     }).catch(error => {
-      if (revision !== this.connectionRevision || this.disposed) return
+      if (!this.connectionContext.current(identity)) return
       const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'CATALOG_UNAVAILABLE'
       this.displayCatalogStatus = { status: 'failed', code }
       this.diagnostics.event('catalog.refresh_failed', { code })
@@ -419,7 +414,7 @@ export class BridgeBackend {
     if (typeof refresh !== 'boolean') return { status: 'unavailable', code: 'INVALID_REQUEST' }
     if (!refresh && this.planUsageCache?.until > Date.now()) return structuredClone(this.planUsageCache.value)
     if (this.planUsagePending) return this.planUsagePending
-    const revision = this.connectionRevision
+    const identity = this.connectionContext.capture()
     const pending = (async () => {
       let value
       try {
@@ -432,7 +427,7 @@ export class BridgeBackend {
         value = this.initialized?.capabilities?.observability === true
           ? retainedPlanUsage(reply) : sanitizePlanUsage(reply)
       } catch (error) { value = sanitizePlanUsage({ status: 'unavailable', code: error.code ?? 'QUOTA_READ_FAILED' }) }
-      if (revision !== this.connectionRevision) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
+      if (!this.connectionContext.current(identity)) return { status: 'unavailable', code: 'CONNECTION_CHANGED' }
       if (['CLIENT_UPDATE_REQUIRED', 'SERVER_COMPATIBILITY_INVALID'].includes(value.code)) {
         value = { ...value, minimumClientVersion: this.bridgeCompatibility.minimumClientVersion }
       }
@@ -588,45 +583,20 @@ export class BridgeBackend {
           local = localHistory(agent.session)
           local.turn = pending.findLast(run => Number.isSafeInteger(run.turn))?.turn
             ?? Math.max(1, local.turn - (withinRun ? 1 : 0))
-          let bytes = 0, reset = false, done = false, readStart = cursor, lastApi
-          const assistantPages = new Map()
-          const records = []
-          for (let page = 0; page < 3200; page++) {
-            combined.throwIfAborted()
-            const pageCursor = cursor
-            const reply = await transport.peer.request('history', { deviceId: binding.deviceId,
+          const history = await readHistoryPages({ sessionId: binding.sdkSessionId, cursor, signal: combined,
+            readPage: cursor => transport.peer.request('history', { deviceId: binding.deviceId,
               dshSessionId: agent.id, sessionId: binding.sdkSessionId, projectPath: binding.projectPath,
-              offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 })
-            if (reply.status === 'busy') {
-              this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
-                interrupted: true, updatedAt: Date.now() } })
-              return { status: 'waiting' }
-            }
-            if (reply.status === 'cursor-reset' && !reset) {
-              cursor = readStart = { offset: 0, lastUuid: null }; records.length = 0; bytes = 0
-              assistantPages.clear(); lastApi = undefined; reset = true; continue
-            }
-            if (reply.status !== 'ok' || reply.sessionId !== binding.sdkSessionId || !Array.isArray(reply.records)
-              || !Number.isSafeInteger(reply.nextOffset) || reply.nextOffset < cursor.offset
-              || (reply.nextOffset === cursor.offset && reply.done !== true)
-              || (reply.lastUuid !== null && typeof reply.lastUuid !== 'string')) {
-              throw failure(reply.code ?? 'HISTORY_INVALID', '云端记录尚未同步，未继续执行。')
-            }
-            bytes += Buffer.byteLength(JSON.stringify(reply.records))
-            if (bytes > 64 * 1024 * 1024) throw failure('HISTORY_TOO_LARGE', '本次恢复内容过大，已保留已同步记录。')
-            cloudRuns = reply.runs ?? {}
-            for (const record of reply.records) if (record.type === 'assistant') {
-              if (!assistantPages.has(record.apiId)) assistantPages.set(record.apiId, pageCursor)
-              lastApi = record.apiId
-            }
-            records.push(...reply.records)
-            cursor = { offset: reply.nextOffset, lastUuid: reply.lastUuid }
-            if (reply.done) { done = true; break }
+              offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 }) })
+          if (history.status === 'busy') {
+            this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
+              interrupted: true, updatedAt: Date.now() } })
+            return { status: 'waiting' }
           }
-          if (!done) throw failure('HISTORY_TOO_LARGE', '云端记录超过本次同步上限，未静默省略。')
+          cursor = history.cursor
+          cloudRuns = history.runs
           cloudResults.clear()
           try {
-            for (const record of coalesceHistory(records)) {
+            for (const record of coalesceHistory(history.records)) {
               if (record.type === 'prompt' && binding.runs?.[record.uuid]?.turn) {
                 local.turn = binding.runs[record.uuid].turn; local.step = binding.runs[record.uuid].step
               } else if (record.type === 'assistant') {
@@ -639,10 +609,10 @@ export class BridgeBackend {
                 local.step++
               } else if (record.type === 'tool-result') cloudResults.set(record.callId, record)
             }
-            replay = assistantPages.get(lastApi) ?? readStart
+            replay = history.replay
             break
           } catch (error) {
-            if (error.code !== 'HISTORY_FRAGMENT_INCOMPLETE' || readStart.offset === 0 || attempt > 0) throw error
+            if (error.code !== 'HISTORY_FRAGMENT_INCOMPLETE' || history.readStart.offset === 0 || attempt > 0) throw error
             cursor = { offset: 0, lastUuid: null }
           }
         }
@@ -651,27 +621,20 @@ export class BridgeBackend {
         for (const run of pending) {
           const tools = {}
           for (const [callId, tool] of Object.entries(run.tools)) {
-            if (tool.status === 'not-sent') { tools[callId] = { status: 'not-sent' }; continue }
             let result = local.results.get(callId)
-            if (!knownToolResult(result)) {
+            if (tool.status !== 'not-sent' && !knownToolResult(result)) {
               const receipt = cloudRuns[run.runId]?.tools?.[callId]
-              const cloud = cloudResults.get(callId)
               const call = local.calls.get(callId)
-              let expectedHash
-              try { expectedHash = createHash('sha256').update(JSON.stringify(JSON.parse(call?.data.arguments))).digest('hex') } catch {}
-              if (cloud?.content && call?.seq === tool.callSeq && call.data.name === tool.name
-                && receipt?.name === tool.name && receipt.argumentsSha256 === expectedHash) {
+              const cloud = verifiedCloudToolResult(tool, call, receipt, cloudResults.get(callId))
+              if (cloud) {
                 result = appendHistoryRecord(agent.session, HISTORY_TOOL_RESULT, { turn: call.data.turn, step: call.data.step,
                   message: this.helpers.createToolResultMessage({ callId, content: cloud.content, isError: cloud.isError }),
                   meta: { claudeBridgeRecovered: true }, callSeq: call.seq }, this.helpers)
                 local.results.set(callId, result)
               }
             }
-            if (knownToolResult(result) && (result.data.message.toolCallId ?? result.data.message.source?.callId) === callId) {
-              tools[callId] = { status: 'completed', resultSeq: result.seq }
-            }
-            else if (tool.status === 'prepared') tools[callId] = { status: 'not-sent' }
-            else { tools[callId] = { status: 'unknown' }; unresolvedTools++ }
+            tools[callId] = recoveryToolUpdate(callId, tool, result)
+            if (tools[callId].status === 'unknown') unresolvedTools++
           }
           const observed = cloudRuns[run.runId]?.status
           updates.push({ runId: run.runId, status: ['completed', 'cancelled', 'failed'].includes(observed)
@@ -709,6 +672,34 @@ export class BridgeBackend {
       run.journalError = error
       this.diagnostics.event('run.stop_record_failed', { runId: run.runId, code: 'STOP_RECORD_FAILED' })
     }).finally(() => run.queryAbort.abort())
+  }
+
+  listenForRunStop(run, onStop) {
+    run.signal.addEventListener('abort', onStop, { once: true })
+    if (run.signal.aborted) onStop()
+  }
+
+  async markRunSent(run) {
+    run.signal.throwIfAborted()
+    await this.state.markRunSent(run.agent.id, run.runId)
+    // The caller checks cancellation and marks requestStarted in the same
+    // continuation as the RPC call; returning here adds an async boundary.
+  }
+
+  async detachRun(run, onStop) {
+    await run.stopPersistence
+    if (onStop) run.signal.removeEventListener('abort', onStop)
+    this.runs.delete(run.runId)
+  }
+
+  async finishRunResources(run, requiresReview) {
+    this.retiredRuns.add(run.runId)
+    if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
+    // A saved send intent is not proof of an RPC dispatch: cancellation can
+    // arrive while markRunSent is still being persisted.
+    const status = run.requestStarted ? (run.journalStatus ?? 'unknown') : 'not-sent'
+    await this.state.finishRun(run.agent.id, run.runId, status, requiresReview)
+    await this.diagnostics.flush()
   }
 
   async recover(agent, confirm, signal) {
@@ -753,24 +744,23 @@ export class BridgeBackend {
         }
         const contextPreferences = this.contextRequestPreferences()
         const runId = randomUUID()
-        await this.state.beginRun(agent.id, runId, 'compact')
-        this.verifiedHistory.delete(agent.session)
         const run = { runId, kind: 'compact', agent, signal, queryAbort: new AbortController(), toolQueue: Promise.resolve() }
-        this.runs.set(runId, run)
-        this.sessionStatus(agent, { model: selected.model, runId, phase: 'compacting', connection: 'connected', toolMayHaveExecuted: false })
-        const onStop = () => {
-          this.requestRunStop(run)
-          this.diagnostics.event('compact.stop_requested', { runId, sessionId: agent.id })
-          try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
-          catch { this.diagnostics.event('compact.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
-        }
-        signal.addEventListener('abort', onStop, { once: true })
-        if (signal.aborted) onStop()
-        this.diagnostics.event('compact.started', { runId, sessionId: agent.id })
+        let onStop
+        await this.state.beginRun(agent.id, runId, 'compact')
         try {
+          this.verifiedHistory.delete(agent.session)
+          this.runs.set(runId, run)
+          this.sessionStatus(agent, { model: selected.model, runId, phase: 'compacting', connection: 'connected', toolMayHaveExecuted: false })
+          onStop = () => {
+            this.requestRunStop(run)
+            this.diagnostics.event('compact.stop_requested', { runId, sessionId: agent.id })
+            try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
+            catch { this.diagnostics.event('compact.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
+          }
+          this.listenForRunStop(run, onStop)
+          this.diagnostics.event('compact.started', { runId, sessionId: agent.id })
           await this.checkpoint(agent.session)
-          signal.throwIfAborted()
-          await this.state.markRunSent(agent.id, runId)
+          await this.markRunSent(run)
           signal.throwIfAborted()
           run.requestStarted = true
           const result = await transport.peer.request('query', { action: 'compact', runId,
@@ -806,13 +796,8 @@ export class BridgeBackend {
           this.diagnostics.event('compact.failed', { runId, code: error.code ?? 'COMPACT_FAILED' })
           throw error
         } finally {
-          await run.stopPersistence
-          signal.removeEventListener('abort', onStop)
-          this.runs.delete(runId)
-          this.retiredRuns.add(runId)
-          if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
-          await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'), Boolean(run.journalError))
-          await this.diagnostics.flush()
+          await this.detachRun(run, onStop)
+          await this.finishRunResources(run, Boolean(run.journalError))
         }
       }))
     } catch (error) {
@@ -955,73 +940,62 @@ export class BridgeBackend {
     signal.throwIfAborted()
     const systemPrompt = prepared.renderSystemPrompt()
     timing('prompt_prepared')
-    await this.state.beginRun(agent.id, runId, 'query', { turn, step })
-    this.verifiedHistory.delete(agent.session)
-    timing('journal_prepared')
-    const header = { config: { provider: selected.provider, model: selected.model,
-      ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
-    tools: assembly.tools }
-    agent.session.append('request/header', { header, reason: binding.started ? 'resume' : 'initial' })
-    for (const { message, intent } of agent.systemPrompt.project(systemPrompt, { inHistory: false, startsSeries: true })) {
-      agent.session.append('system/message', { turn, step, message }, intent)
-    }
-    for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-    const run = { runId, agent, turn, step, signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
+    const steps = new RunStepLifecycle({ agent, phase, turn, step })
+    const run = { runId, agent, turn, steps, get step() { return steps.current },
+      signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
       compatibility: converted.compatibility,
-      historyGeneration: this.historyGeneration,
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
-    run.progress = createRunProgressReporter({ runId, model: selected.model,
-      isActive: () => this.runs.get(runId) === run && !signal.aborted,
-      readStatus: () => agent._bridgeStatus,
-      writeStatus: patch => this.sessionStatus(agent, patch),
-      writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
-    run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
-      onStarted: () => this.state.markStarted(agent.id),
-      onProgress: event => run.progress.accept(event),
-      onFirstToken: type => timing('first_token', type),
-      onFirstText: () => timing('first_text'),
-      onModelStart: async () => {
-        if (signal.aborted) return
-        if (!run.modelStarted) { run.modelStarted = true; return run.step }
-        if (run.stepPrepared) { run.stepPrepared = false; return run.step }
-        await run.toolQueue
-        if (signal.aborted) return
-        agent.session.append('step/end', { turn, step: run.step })
-        agent._bridgeStepOpen = false
-        run.step++
-        phase.step = run.step
-        agent.session.append('step/start', { turn, step: run.step })
-        agent._bridgeStepOpen = true
-        return run.step
-      },
-      onUsage: async message => {
-        const report = { usage: message.usage, usageScope: 'current-turn-main-agent',
-          modelUsage: message.modelUsage, modelUsageScope: 'session-cumulative',
-          total_cost_usd: message.total_cost_usd, costScope: 'session-cumulative-estimate' }
-        await this.state.recordUsage(agent.id, runId, report)
-      } })
-    this.runs.set(runId, run)
-    this.sessionStatus(agent, { model: selected.model, runId, phase: 'running', connection: 'connected', toolMayHaveExecuted: false,
-      compatibility: { model: selected.model, version: 1, tools: converted.compatibility } })
-    run.progress.start()
-    const onStop = () => {
-      this.requestRunStop(run)
-      this.diagnostics.event('run.stop_requested', { runId, sessionId: agent.id })
-      try { run.projection.interrupt() }
-      catch { this.diagnostics.event('run.stop_projection_failed', { runId, code: 'STOP_PROJECTION_FAILED' }) }
-      try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
-      catch { this.diagnostics.event('run.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
-    }
-    signal.addEventListener('abort', onStop, { once: true })
-    if (signal.aborted) onStop()
-    this.diagnostics.event('run.started', { runId, sessionId: agent.id, deviceId: binding.deviceId, stage: 'query' })
-    const startedAt = Date.now()
+    let onStop, startedAt
+    await this.state.beginRun(agent.id, runId, 'query', { turn, step })
     try {
+      this.verifiedHistory.delete(agent.session)
+      timing('journal_prepared')
+      const header = { config: { provider: selected.provider, model: selected.model,
+        ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
+      tools: assembly.tools }
+      agent.session.append('request/header', { header, reason: binding.started ? 'resume' : 'initial' })
+      for (const { message, intent } of agent.systemPrompt.project(systemPrompt, { inHistory: false, startsSeries: true })) {
+        agent.session.append('system/message', { turn, step, message }, intent)
+      }
+      for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
+      run.historyGeneration = this.historyGeneration
+      run.progress = createRunProgressReporter({ runId, model: selected.model,
+        isActive: () => this.runs.get(runId) === run && !signal.aborted,
+        readStatus: () => agent._bridgeStatus,
+        writeStatus: patch => this.sessionStatus(agent, patch),
+        writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
+      run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
+        onStarted: () => this.state.markStarted(agent.id),
+        onProgress: event => run.progress.accept(event),
+        onFirstToken: type => timing('first_token', type),
+        onFirstText: () => timing('first_text'),
+        onModelStart: () => steps.modelStart({ signal, tools: run.toolQueue }),
+        onUsage: async message => {
+          const report = { usage: message.usage, usageScope: 'current-turn-main-agent',
+            modelUsage: message.modelUsage, modelUsageScope: 'session-cumulative',
+            total_cost_usd: message.total_cost_usd, costScope: 'session-cumulative-estimate' }
+          await this.state.recordUsage(agent.id, runId, report)
+        } })
+      this.runs.set(runId, run)
+      this.sessionStatus(agent, { model: selected.model, runId, phase: 'running', connection: 'connected', toolMayHaveExecuted: false,
+        compatibility: { model: selected.model, version: 1, tools: converted.compatibility } })
+      run.progress.start()
+      onStop = () => {
+        this.requestRunStop(run)
+        this.diagnostics.event('run.stop_requested', { runId, sessionId: agent.id })
+        try { run.projection.interrupt() }
+        catch { this.diagnostics.event('run.stop_projection_failed', { runId, code: 'STOP_PROJECTION_FAILED' }) }
+        try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
+        catch { this.diagnostics.event('run.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
+      }
+      this.listenForRunStop(run, onStop)
+      this.diagnostics.event('run.started', { runId, sessionId: agent.id, deviceId: binding.deviceId, stage: 'query' })
+      startedAt = Date.now()
       await this.checkpoint(agent.session)
       signal.throwIfAborted()
       timing('checkpointed')
-      await this.state.markRunSent(agent.id, runId)
+      await this.markRunSent(run)
       signal.throwIfAborted()
       run.requestStarted = true
       timing('request_sent')
@@ -1051,8 +1025,9 @@ export class BridgeBackend {
       run.completed = true
       return { kind: 'completed' }
     } catch (error) {
+      startedAt ??= Date.now()
       if (run.preparationError && !signal.aborted) error = run.preparationError
-      run.progress.close()
+      run.progress?.close()
       if (['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_FLOW_FAILED'].includes(error.code)) {
         this.authentication = error.code === 'AUTH_FLOW_FAILED' ? 'verification-failed' : 'login-required'
       }
@@ -1077,7 +1052,7 @@ export class BridgeBackend {
       }
       await run.toolQueue.catch(() => {})
       await transport.peer.drainNotifications?.().catch(() => {})
-      run.projection.finish({ interrupted: true })
+      run.projection?.finish({ interrupted: true })
       this.sessionStatus(agent, { ...(run.stopState ?? { phase: run.requestStarted && !run.observedOutcome ? 'unknown' : 'failed', toolMayHaveExecuted: run.calls.size > 0 }),
         ...(run.toolOutcomeUnknown ? { toolMayHaveExecuted: true } : {}),
         context: { status: 'unknown' } })
@@ -1087,15 +1062,9 @@ export class BridgeBackend {
         errorName: error.name, durationMs: Date.now() - startedAt })
       throw error
     } finally {
-      await run.stopPersistence
-      signal.removeEventListener('abort', onStop)
-      this.runs.delete(runId)
+      await this.detachRun(run, onStop)
       this.localTiming.finish(runId)
-      this.retiredRuns.add(runId)
-      if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
-      await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'),
-        Boolean(run.toolOutcomeUnknown || run.journalError))
-      await this.diagnostics.flush()
+      await this.finishRunResources(run, Boolean(run.toolOutcomeUnknown || run.journalError))
       if (run.completed && !signal.aborted && !run.toolOutcomeUnknown && !run.journalError
         && transport === this.connection && run.historyGeneration === this.historyGeneration) {
         this.verifiedHistory.set(agent.session, { transport, generation: this.historyGeneration })
@@ -1112,16 +1081,14 @@ export class BridgeBackend {
     signal.throwIfAborted()
     if (run.preparationError) throw run.preparationError
     if (run.concluded || run.inputClosed) return { continue: false }
-    const { agent, turn } = run
+    const { agent } = run
     if (typeof agent.preStep !== 'function') throw failure('DSH_PRE_STEP_UNAVAILABLE', '当前 DSH 未提供所需的步骤准备接口。')
     const pending = [...agent.inbox.nextStep]
     let decision
     let accepted = false
     try {
       // DSH waits for nested instruction projections at its native step boundary.
-      agent.session.append('step/end', { turn, step: run.step })
-      agent._bridgeStepOpen = false
-      decision = await agent.preStep('next-step', { turn, step: run.step + 1 })
+      decision = await agent.preStep('next-step', run.steps.beginPreparation())
       signal.throwIfAborted()
       if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
       const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent), run.catalogModels)
@@ -1150,12 +1117,7 @@ export class BridgeBackend {
       signal.throwIfAborted()
       if (run.inputClosed) throw failure('USER_INPUT_CLOSED', '当前运行已结束接收插话，未发送消息已保留。')
       for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-      run.step++
-      agent.phase.step = run.step
-      agent.session.append('step/start', { turn, step: run.step })
-      agent._bridgeStepOpen = true
-      run.stepPrepared = true
-      run.projection.step = run.step
+      run.projection.advanceStep(run.steps.completePreparation())
       accepted = true
       this.diagnostics.event('step.prepared', { runId: run.runId, stage: 'pre-step' })
       return { ...(additionalContexts.length ? { additionalContexts } : {}),
@@ -1185,7 +1147,7 @@ export class BridgeBackend {
     if (!run || !run.toolNames.has(params.name) || typeof params.callId !== 'string') {
       throw failure('UNADMITTED_TOOL', '工具不属于当前运行的能力集合。')
     }
-    const advertised = run.projection.committedToolCalls.get(params.callId)
+    const advertised = run.projection.getCommittedToolCall(params.callId)
     if (!advertised || advertised.name !== params.name) throw failure('TOOL_EVENT_UNCOMMITTED', '工具调用尚未在本地历史中登记，未执行。')
     let parsed
     try { parsed = JSON.parse(advertised.arguments) } catch { throw failure('TOOL_ARGUMENTS_INVALID', '模型声明的工具参数不是有效 JSON，未执行。') }
@@ -1296,6 +1258,7 @@ export class BridgeBackend {
   async dispose() {
     if (this.disposing) return this.disposing
     this.disposed = true
+    this.connectionContext.retire()
     this.lifetime.abort()
     this.disposing = (async () => {
       try { if (this.connection) await this.connection.close() }
