@@ -14,7 +14,7 @@ const { scopeOf, scopeChainOf } = await import(resolveDshModule('@deepseek-ai/ds
 export const Config = native.Config;
 export const inject = [...native.inject, 'agents', 'llm', 'claudeBridge'];
 
-function selectionContext(ctx, backend, allowedModels, toolName) {
+function selectionContext(ctx, readCatalog, allowedModels, toolName) {
   const settings = { current: () => ({ enabled: true, allowedModels }) };
   const llm = new Proxy(ctx.llm, { get(target, key) {
     if (key === 'listProviders') return () => target.listProviders().filter(row => row.id === CLAUDE_PROVIDER);
@@ -23,7 +23,7 @@ function selectionContext(ctx, backend, allowedModels, toolName) {
       if (key === 'listModels') { signal = model; model = undefined; }
       assertRemoteSubagentRoute({ provider });
       signal?.throwIfAborted();
-      const models = subagentModels(await backend.catalog());
+      const models = subagentModels(await readCatalog());
       signal?.throwIfAborted();
       if (key === 'listModels') return models;
       const found = models.find(row => row.id === model);
@@ -116,7 +116,7 @@ export async function apply(ctx, config) {
         signal?.throwIfAborted();
         if (disposed) throw new Error('远程子任务预设已卸载。');
         entry.fiber = agent.ctx.inject(native.inject, inner => native.apply(
-          selectionContext(inner, ctx.claudeBridge.backend, allowedModels, config.toolName ?? 'subagent'),
+          selectionContext(inner, () => ctx.claudeBridge.backend.catalog(), allowedModels, config.toolName ?? 'subagent'),
           { ...config, modelSelectionSettings: allowedModels !== undefined }, agent.session));
         fibers.add(entry.fiber);
         await entry.fiber;
