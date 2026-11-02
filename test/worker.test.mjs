@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto'
 import { createWorkerHandlers, parseServiceBudget } from '../remote/runtime.mjs'
 
 import { createAuthReader } from '../remote/auth.mjs'
+import { createRunStore } from '../remote/history.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 
@@ -1062,6 +1063,105 @@ test('取消后 settle 等待 SDK 和回调实际收尾', async (t) => {
   assert.equal((await f.worker.handlers.settle({ runId: f.params.runId })).status, 'cancelled')
   assert.equal((await f.worker.handlers.settle({ runId: 'never-seen' })).code, 'RUN_UNKNOWN')
   assert.equal(JSON.stringify(f.state.notifications).includes('晚到文字'), false)
+})
+
+test('SDK 成功但恢复保存失败时 query 和 settle 保留未知，已有运行记录不伪装完成', async t => {
+  const store = createRunStore()
+  let candidate, saves = 0
+  const f = await fixture(t, async function* () {
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  }, { runStore: { ...store, async finish(_cwd, _runId, outcome) {
+    candidate = outcome; saves++
+    throw new Error('synthetic save failure')
+  } } })
+  const response = await f.worker.handlers.query(f.params, f.context)
+  assert.equal(response.status, 'unknown')
+  assert.equal(response.code, 'RECOVERY_SAVE_FAILED')
+  assert.equal(response.toolMayHaveExecuted, true)
+  assert.deepEqual(await f.worker.handlers.settle({ runId: f.params.runId }), {
+    status: 'unknown', code: 'RECOVERY_SAVE_FAILED', toolMayHaveExecuted: true,
+  })
+  assert.equal(saves, 1)
+  assert.equal(candidate.status, 'completed', '结算不原地修改执行候选')
+  const saved = JSON.parse(await readFile(join(f.state.queries[0].options.cwd, 'bridge-runs.json'), 'utf8'))
+  assert.equal(saved.runs[f.params.runId].status, 'running')
+  assert.equal(saved.runs[f.params.runId].finishedAt, undefined)
+})
+
+test('锁释放失败优先于先前保存失败，修正记录后才发布 query 与 settle 终态', async t => {
+  for (const failInitialSave of [false, true]) {
+    const store = createRunStore(), sequence = []
+    let firstCandidate
+    const f = await fixture(t, async function* () {
+      yield { type: 'result', subtype: 'success', session_id: SESSION }
+    }, {
+      runStore: { ...store, async finish(cwd, runId, outcome) {
+        sequence.push(`save:${outcome.status}:${outcome.code ?? ''}`)
+        if (!firstCandidate) {
+          firstCandidate = outcome
+          if (failInitialSave) throw new Error('synthetic save failure')
+        }
+        return store.finish(cwd, runId, outcome)
+      } },
+      acquireLock: async () => ({ held: true, lost: new Promise(() => {}), async release() {
+        sequence.push('release')
+        throw new Error('synthetic release failure')
+      } }),
+    })
+    const response = await f.worker.handlers.query(f.params, f.context)
+    assert.deepEqual(sequence, ['save:completed:', 'release', 'save:unknown:LOCK_RELEASE_FAILED'])
+    assert.equal(response.status, 'unknown')
+    assert.equal(response.code, 'LOCK_RELEASE_FAILED')
+    assert.equal(response.toolMayHaveExecuted, true)
+    assert.deepEqual(await f.worker.handlers.settle({ runId: f.params.runId }), {
+      status: 'unknown', code: 'LOCK_RELEASE_FAILED', toolMayHaveExecuted: true,
+    })
+    assert.equal(firstCandidate.status, 'completed')
+    assert.equal(firstCandidate.code, undefined)
+    const saved = JSON.parse(await readFile(join(f.state.queries[0].options.cwd, 'bridge-runs.json'), 'utf8'))
+    assert.equal(saved.runs[f.params.runId].status, 'unknown')
+    assert.equal(saved.runs[f.params.runId].code, 'LOCK_RELEASE_FAILED')
+    assert.equal(saved.runs[f.params.runId].toolMayHaveExecuted, true)
+  }
+})
+
+test('SDK 成功候选后的工具回调晚失败覆盖候选，query 与 settle 等待回调结算', async t => {
+  let rejectTool, candidateReady
+  const pendingTool = new Promise((_resolve, reject) => { rejectTool = reject })
+  const candidateSeen = new Promise(resolve => { candidateReady = resolve })
+  const input = { command: 'synthetic' }
+  const f = await fixture(t, async function* ({ options }) {
+    await options.hooks.PreToolUse[0].hooks[0]({ hook_event_name: 'PreToolUse',
+      tool_name: 'mcp__dsh__local_command', tool_input: input, tool_use_id: 'late-tool' })
+    yield assistantTool('late-tool', input)
+    options.mcpServers.dsh.instance.tools[0].handler(input).catch(() => {})
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  f.peer.request = async method => {
+    assert.equal(method, 'tool.execute')
+    return pendingTool
+  }
+  const notify = f.peer.notify
+  f.peer.notify = (method, params) => {
+    notify(method, params)
+    if (method === 'diagnostic' && params.stage === 'sdk' && params.event === 'completed') candidateReady()
+  }
+  const query = f.worker.handlers.query(f.params, f.context)
+  await candidateSeen
+  let settled = false
+  const waiting = f.worker.handlers.settle({ runId: f.params.runId }).then(value => { settled = true; return value })
+  await tick()
+  assert.equal(settled, false)
+  rejectTool(new Error('synthetic late tool failure'))
+  const response = await query
+  assert.equal(response.status, 'failed')
+  assert.equal(response.code, 'UNKNOWN_TOOL_OUTCOME')
+  assert.equal(response.toolMayHaveExecuted, true)
+  assert.deepEqual(await waiting, { status: 'failed', code: 'UNKNOWN_TOOL_OUTCOME', toolMayHaveExecuted: true })
+  const saved = JSON.parse(await readFile(join(f.state.queries[0].options.cwd, 'bridge-runs.json'), 'utf8'))
+  assert.equal(saved.runs[f.params.runId].status, response.status)
+  assert.equal(saved.runs[f.params.runId].code, response.code)
+  assert.equal(f.state.queries.length, 1)
 })
 
 test('工具和审批修改后的未知参数在 SDK 清理前拒绝', async (t) => {

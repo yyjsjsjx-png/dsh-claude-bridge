@@ -18,6 +18,7 @@ import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { createPromptInput } from './prompt-input.mjs'
 import { createToolCalls } from './tool-calls.mjs'
+import { createRunSettlement } from './run-settlement.mjs'
 
 const bridgeManifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'))
 const defaultBridgeRelease = { serverVersion: bridgeManifest.version,
@@ -337,7 +338,7 @@ export function parseServiceBudget(value) {
 }
 
 /** Create handlers for one private stdio worker. Dependencies are injected for offline tests. */
-export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, toolEventTimeoutMs = 15_000, inputConfirmationTimeoutMs = 30_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now(), observability }) {
+export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath, homeDir, sdkVersion, cliVersion, userName = 'desktop', authorizedDeviceId, maxBudgetUsd, acquireLock = acquireSessionLock, authReader: injectedAuthReader, runStore = createRunStore(), toolEventTimeoutMs = 15_000, inputConfirmationTimeoutMs = 30_000, bridgeRelease = defaultBridgeRelease, responseTimingNow = () => performance.now(), observability }) {
   if (!sdk || typeof sdk.query !== 'function' || typeof sdk.tool !== 'function'
     || typeof sdk.createSdkMcpServer !== 'function' || typeof sdk.getSessionInfo !== 'function') {
     throw new TypeError('SDK 接口不完整')
@@ -365,7 +366,6 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   const catalogReader = createCatalogReader({ sdk, sessionRoot, cliPath, childEnv })
   const planUsageReader = createPlanUsageReader({ sdk, sessionRoot, cliPath, childEnv })
   const authReader = injectedAuthReader ?? createAuthReader({ cliPath, childEnv })
-  const runStore = createRunStore()
   const readHistory = createHistoryReader({ sdk, sessionRoot, authorizedDeviceId, acquireLock, requireAuth, activeSessions })
   const serverVersion = bridgeRelease?.serverVersion
   const minimumClientVersion = bridgeRelease?.minimumClientVersion ?? null
@@ -538,6 +538,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     let onAbort
     let authFlowFailed = false
     let diagnosticLog
+    let candidateOutcome, finalOutcome
+    const settlement = createRunSettlement()
     const started = performance.now()
     const elapsed = () => Math.round(performance.now() - started)
     const diagnose = (stage, event, code) => {
@@ -574,7 +576,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       if (activeRuns.has(runId) || completedRuns.has(runId)) throw new WorkerError('DUPLICATE_RUN', '运行标识已被使用')
       const controller = new AbortController()
       const settled = new Promise((resolve) => { finishRun = resolve })
-      run = { controller, problem: undefined, settled, outcome: undefined, callbacks: new Set(), inFlightTools: 0 }
+      run = { controller, problem: undefined, settled, inFlightTools: 0 }
       activeRuns.set(runId, run)
       onAbort = () => {
         diagnose('cancel', 'received')
@@ -725,11 +727,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         createError: (code, message, details) => new WorkerError(code, message, details) })
       try {
         let contextSampler
-        const trackCallback = (promise) => {
-          run.callbacks.add(promise)
-          promise.finally(() => run.callbacks.delete(promise)).catch(() => {})
-          return promise
-        }
+        const trackCallback = settlement.track
         // PreToolUse supplies the ID that MCP handlers lack. Only the per-run
         // registry can bind it to canonical arguments or advance tool facts.
         const qualifiedNames = new Set(definitions.map(({ name }) => `mcp__dsh__${name}`))
@@ -1167,19 +1165,18 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           const detail = failureDetail(result, assistantError, authFlowFailed)
           diagnose('sdk', 'failed', detail.code)
           const metrics = resultMetrics(result, runId, contextSummary)
-          run.outcome = { sessionId, status: 'failed', ...detail, ...(metrics ? { metrics } : {}) }
-          return run.outcome
+          candidateOutcome = { sessionId, status: 'failed', ...detail, ...(metrics ? { metrics } : {}) }
+        } else {
+          diagnose('sdk', 'completed')
+          timing('completed')
+          const metrics = resultMetrics(result, runId, contextSummary)
+          candidateOutcome = { sessionId, status: 'completed', ...(metrics ? { metrics } : {}),
+            ...(compact ? { compaction: compactMetadata ?? { status: 'unchanged' } } : {}) }
         }
-        diagnose('sdk', 'completed')
-        timing('completed')
-        const metrics = resultMetrics(result, runId, contextSummary)
-        run.outcome = { sessionId, status: 'completed', ...(metrics ? { metrics } : {}),
-          ...(compact ? { compaction: compactMetadata ?? { status: 'unchanged' } } : {}) }
-        return run.outcome
       } finally {
         controller.abort()
         toolCalls.dispose()
-        await Promise.allSettled([...run.callbacks])
+        await settlement.drain()
         if (run.problem) throw run.problem
       }
     } catch (error) {
@@ -1190,39 +1187,25 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         : ((error instanceof WorkerError || error instanceof CatalogError || error instanceof AuthError) ? error
           : detail ? new WorkerError(detail.code, detail.message) : new WorkerError('WORKER_FAILED', '远程执行失败')))
       diagnose('query', 'failed', problem.code)
-      const outcome = {
+      candidateOutcome = {
         ...(sessionId ? { sessionId } : {}),
         status: problem.code.startsWith('CANCELLED') ? 'cancelled' : 'failed',
         code: problem.code,
         message: problem.message,
         ...(problem.toolMayHaveExecuted ? { toolMayHaveExecuted: true } : {}),
       }
-      if (run) run.outcome = outcome
-      return outcome
     } finally {
-      if (run?.recoveryCwd) {
-        try { await runStore.finish(run.recoveryCwd, runId, run.outcome) }
-        catch {
-          if (run.outcome) Object.assign(run.outcome, { status: 'unknown', code: 'RECOVERY_SAVE_FAILED',
-            message: '云端执行结果未能可靠登记，请等待恢复核对。', toolMayHaveExecuted: true })
-        }
-      }
-      if (lock) {
-        try { await lock.release() } catch {
-          diagnose('session', 'lock-release-failed', 'LOCK_RELEASE_FAILED')
-          if (run?.outcome) Object.assign(run.outcome, { status: 'unknown', code: 'LOCK_RELEASE_FAILED',
-            message: '远程会话锁无法确认释放，执行状态需核实', toolMayHaveExecuted: true })
-          if (run?.recoveryCwd) await runStore.finish(run.recoveryCwd, runId, run.outcome).catch(() => {})
-        }
-      }
+      const finalized = await settlement.finish(candidateOutcome, {
+        save: run?.recoveryCwd ? outcome => runStore.finish(run.recoveryCwd, runId, outcome) : undefined,
+        release: lock ? () => lock.release() : undefined,
+        onReleaseFailure: () => diagnose('session', 'lock-release-failed', 'LOCK_RELEASE_FAILED'),
+      })
+      finalOutcome = finalized.outcome
       if (run) {
-        run.observations?.finish(run.outcome)
+        run.observations?.finish(finalOutcome)
         if (run.quotaActive) observability?.activity(runId, false)
         activeRuns.delete(runId)
-        const outcome = run.outcome
-          ? { status: run.outcome.status, ...(run.outcome.code ? { code: run.outcome.code } : {}),
-              ...(run.outcome.toolMayHaveExecuted ? { toolMayHaveExecuted: true } : {}) }
-          : { status: 'unknown', code: 'UNKNOWN_EXECUTION_OUTCOME', toolMayHaveExecuted: true }
+        const outcome = finalized.summary
         completedRuns.set(runId, outcome)
         if (completedRuns.size > 256) completedRuns.delete(completedRuns.keys().next().value)
         finishRun(outcome)
@@ -1233,6 +1216,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         try { context.peer.notify('diagnostic', { event: 'diagnostics.failed', runId, code: 'DIAGNOSTIC_WRITE_FAILED' }) } catch {}
       })
     }
+    return finalOutcome
   }
 
   async function settle(params, context = {}) {
