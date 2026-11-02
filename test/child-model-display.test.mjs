@@ -40,7 +40,7 @@ test('普通child与远程root不显示子代理标签，避免更改普通路�
   assert.deepEqual(SessionModelBadge(nativeAddress).children, ['Sonnet 5.5 · 模型默认'])
 })
 
-test('请求配置与本响应SDK返回型号分开，root只补返回事实，别名差异不宣称降级或实际强度', () => {
+test('只有远程子页显示请求配置与SDK返回事实，主会话即使有actual也不显示标签', () => {
   const selected = { lastUsed: { provider: 'claude-sdk-remote', model: 'sonnet', reasoningEffort: 'high' } }
   const observation = { current: { requestedModel: 'sonnet', actualModel: 'claude-sonnet-wire',
     responseId: 'response-a', source: 'sdk-message-start' } }
@@ -49,11 +49,13 @@ test('请求配置与本响应SDK返回型号分开，root只补返回事实，�
   assert.match(child.props.title, /不等于降级/)
   assert.match(child.props.title, /未报告实际思考等级/)
   const root = SessionModelBadge(props(selected, {}, null, observation))
-  assert.deepEqual(root.children, ['SDK 返回：claude-sonnet-wire'])
-  assert.doesNotMatch(root.props['aria-label'], /子代理/)
+  assert.equal(root, null)
+  assert.equal(SessionModelBadge(props(selected, null, 'subagent', observation)), null)
   assert.equal(SessionModelBadge(props(selected, null, null, observation)), null)
   assert.equal(SessionModelBadge(props(selected, {}, null, { current: { ...observation.current, requestedModel: 'haiku' } })), null)
   assert.equal(SessionModelBadge(props(selected, {}, null, { current: { ...observation.current, actualModel: null } })), null)
+  assert.deepEqual(SessionModelBadge(props(selected, {}, 'subagent', {
+    current: { ...observation.current, requestedModel: 'haiku' } })).children, ['Sonnet 5.5 · high'])
 })
 
 test('唯一dock标签复用实际pane标准hooks，不依赖header/root binding或替换factory且不加载目录', async () => {
