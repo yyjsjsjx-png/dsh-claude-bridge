@@ -5,7 +5,7 @@
     - id: claude-agent-loop
       name: dsh-claude-bridge/agent-loop
       config:
-        agents: []
+        sourceEntry: agent-loop
     - id: claude-bridge
       name: dsh-claude-bridge/bridge
       config:

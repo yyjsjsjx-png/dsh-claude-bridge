@@ -16,11 +16,12 @@ function policyFailure(RemoteError, error, sessionId) {
 
 function checkedPreset(RemoteError, session, projected) {
   const original = session?.header?.agentPreset;
-  if (typeof original !== 'string' || !original || projected !== original) {
+  if (typeof original !== 'string' || !original || typeof projected !== 'string' || !projected
+    || (original === CLAUDE_PRESET) !== (projected === CLAUDE_PRESET)) {
     throw remoteFailure(RemoteError, 'agent-preset/locked',
       '会话创建预设与当前预设不一致，不能继续操作。', { sessionId: session?.id });
   }
-  return original;
+  return projected;
 }
 
 async function attachedAgent(controller, sessionId) {
@@ -139,13 +140,14 @@ export function makeGuardedSessionController(Base, RemoteError) {
       }
 
       // The rc.5 upstream can recompose an existing *cold* blank session in
-      // create(), bypassing select(). Only reuse an already matching preset.
+      // create(), bypassing select(). Remote engine transitions stay guarded;
+      // ordinary blank recomposition belongs to the native controller.
       if (input.sessionId !== undefined) {
         const current = await existingPreset(ctx, RemoteError, input.sessionId);
-        if (current !== target) delete input.sessionId;
+        if ((current === CLAUDE_PRESET || target === CLAUDE_PRESET) && current !== target) delete input.sessionId;
       }
       const created = await super.create({ ...input, agentPreset: target });
-      if (created.agentPreset !== target) {
+      if (target === CLAUDE_PRESET && created.agentPreset !== target) {
         throw remoteFailure(RemoteError, 'agent-preset/locked', '创建结果的会话预设不一致。',
           { sessionId: created.sessionId });
       }
@@ -212,7 +214,7 @@ export function makeGuardedSessionController(Base, RemoteError) {
   };
 }
 
-/** Lock preset changes from creation, including before the first turn. */
+/** Guard remote engine boundaries; ordinary preset selection stays native. */
 export function makeLockedPresetRegistry(Base, RemoteError) {
   return class LockedPresetRegistry extends Base {
     constructor(ctx, config, ...rest) {
@@ -222,6 +224,7 @@ export function makeLockedPresetRegistry(Base, RemoteError) {
 
     async select(agent, agentPreset) {
       const current = presetForAgent(this.bridgeContext, RemoteError, agent);
+      if (current !== CLAUDE_PRESET && agentPreset !== CLAUDE_PRESET) return super.select(agent, agentPreset);
       try { assertPresetUnchanged(current, agentPreset); }
       catch (error) { policyFailure(RemoteError, error, agent.id); }
       // Re-selecting the same preset is a no-op; do not recompose or append.

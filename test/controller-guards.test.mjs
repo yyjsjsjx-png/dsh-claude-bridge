@@ -163,9 +163,9 @@ test('普通 DSH 会话仍沿用原生分叉', async () => {
   assert.equal(getWrites(), 1);
 });
 
-test('预设守卫在首轮之前也拒绝更改且不会重组', async () => {
+test('远程引擎预设守卫不代替普通会话的原生预设选择', async () => {
   let calls = 0;
-  class Base { async select() { calls++; } }
+  class Base { async select(_agent, preset) { calls++; return preset; } }
   const Registry = makeLockedPresetRegistry(Base, FakeRemoteError);
   const session = { id: 's', header: { agentPreset: 'standard' } };
   const agent = { id: 's', session };
@@ -176,5 +176,22 @@ test('预设守卫在首轮之前也拒绝更改且不会重组', async () => {
     return true;
   });
   assert.equal(await registry.select(agent, 'standard'), 'standard');
-  assert.equal(calls, 0);
+  assert.equal(await registry.select(agent, 'custom'), 'custom');
+  assert.equal(calls, 2);
+  session.header.agentPreset = 'claude-sdk-remote';
+  registry.bridgeContext.sessionProjections.stateOf = () => 'claude-sdk-remote';
+  await assert.rejects(registry.select(agent, 'standard'), /不能切换预设/);
+  assert.equal(await registry.select(agent, 'claude-sdk-remote'), 'claude-sdk-remote');
+  assert.equal(calls, 2);
+});
+
+test('普通原生预设投影切换后仍可选择普通模型、提示和分叉，跨远程引擎仍拒绝', async () => {
+  const { controller, getWrites } = harness();
+  await controller.create({});
+  controller.agent.session.preset = 'custom';
+  await controller.selectModel({ sessionId: 's', provider: 'deepseek', model: 'v1' });
+  await controller.prompt({ sessionId: 's' });
+  await controller.fork({ sessionId: 's', turn: 1 });
+  assert.equal(getWrites(), 3);
+  await assert.rejects(controller.selectModel({ sessionId: 's', provider: 'claude-sdk-remote', model: 'account-default' }));
 });

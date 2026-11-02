@@ -70,6 +70,14 @@ test('实际 rc5：标准 bundle 接受不同版本号并检查实际 Host 能�
   const patches = files.flatMap(path => boot.loadOverlayPatches('dsh', path))
   const rows = boot.composeEntries([patches.filter(patch => patch.insert)])
   assert.equal(rows.length, 5)
+  const source = { id: 'agent-loop', name: '@deepseek-ai/dsh-agent-loop', config: {
+    agents: [{ id: 'preserved', provider: 'ordinary', model: 'fixture' }], maxParallelToolCalls: 3,
+  } }
+  const composed = boot.composeEntries([[{ insert: [source] }], patches])
+  const inherited = composed.find(row => row.id === 'agent-loop')
+  assert.equal(inherited.disabled, true)
+  assert.deepEqual(inherited.config, source.config)
+  assert.deepEqual(composed.find(row => row.id === 'claude-agent-loop').config, { sourceEntry: 'agent-loop' })
   for (const row of rows) {
     assert.ok(row.name === manifest.name || row.name.startsWith(manifest.name + '/'))
     await access(boot.resolvePluginResource(row.name, pathToFileURL(join(root, 'package.json')).href))
@@ -155,7 +163,8 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
         + (Object.hasOwn(module, 'default') ? `export { default } from ${JSON.stringify(url)};\n` : '')
         + 'export const newOptionalFeature = true;\n')
     }
-    await writePackage('@deepseek-ai/dsh-agent-loop', '// Changed upstream implementation; bridge uses its own adapted loop.\n')
+    // The routed factory now requires the installation's real AgentLoop API;
+    // the compatible future-package shim above preserves it without a hash lock.
     await writePackage('@deepseek-ai/dsh-web-app', 'export {};\n')
     await mkdir(join(base, '@deepseek-ai/dsh-web-app/presets'))
     const content = `# Compatible future preset change\n${standard.content}`

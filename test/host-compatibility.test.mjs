@@ -27,6 +27,18 @@ test('源模式 RPC 参数保持兼容，新增可选参数可用，重命名参
     error => error.code === 'DSH_API_INCOMPATIBLE' && /RPC 参数已改变/u.test(error.message));
 });
 
+test('原生执行路由按 AgentLoop 能力检查，不接受缺失 prepare 的版本外观', () => {
+  class AgentLoop {
+    static Config = {};
+    static inject = [];
+    prepare() {} create() {} createAgent() {} resume() {} setupAndPublish() {} initializeAgent() {}
+  }
+  assert.doesNotThrow(() => assertHostModule('@deepseek-ai/dsh-agent-loop', { AgentLoop }, '0.3.0'));
+  AgentLoop.prototype.prepare = undefined;
+  assert.throws(() => assertHostModule('@deepseek-ai/dsh-agent-loop', { AgentLoop }, '0.3.0'),
+    error => error.code === 'DSH_API_INCOMPATIBLE' && /prepare/u.test(error.message));
+});
+
 test('严格恢复依赖精确检查 catalog 与 codec 的实际调用接口', () => {
   const catalogName = '@deepseek-ai/dsh-session-format-catalog';
   const codecName = '@deepseek-ai/dsh-session-format-v3-to-v4';

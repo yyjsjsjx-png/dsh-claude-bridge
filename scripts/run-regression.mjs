@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 
 export const RC5_VERSION = '0.2.1-rc.5';
 export const RC5_NATIVE_TESTS = Object.freeze([
+  'test/agent-loop-native.test.mjs',
   'test/bundle-native.test.mjs', 'test/catalog-visibility.test.mjs',
   'test/controller-native.test.mjs', 'test/history-native.test.mjs',
   'test/preset-native.test.mjs', 'test/sdk-projection.test.mjs',

@@ -16,6 +16,7 @@ export const HOST_FUNCTIONS = Object.freeze({
   '@deepseek-ai/dsh-session-format-catalog': [],
   '@deepseek-ai/dsh-session-format-v3-to-v4': [],
   '@deepseek-ai/dsh-agent': ['agentEvents', 'assembleContextFor'],
+  '@deepseek-ai/dsh-agent-loop': ['AgentLoop'],
   '@deepseek-ai/dsh-util-values': ['assertNever', 'deepFreeze'],
   '@deepseek-ai/dsh-scope': ['createScope', 'scopeOf'],
   '@deepseek-ai/dsh-system-prompt': ['joinContextSections', 'renderContextSections', 'renderPrompt'],
@@ -25,7 +26,7 @@ export const HOST_FUNCTIONS = Object.freeze({
   '@deepseek-ai/dsh-agent-preset-registry': ['AgentPresetRegistry'],
   '@deepseek-ai/dsh-typert-protocol': ['RemoteError', 'Remote', 'TypertRemoteService', 'principalOf', 'remoteMethods'],
   '@deepseek-ai/cordis-plugin-include': [],
-  '@deepseek-ai/cordis-plugin-loader': ['EntryTree'],
+  '@deepseek-ai/cordis-plugin-loader': ['Entry', 'EntryTree', 'interpolate'],
   '@deepseek-ai/dsh-app-boot': ['prepareProfileEntries'],
   'js-yaml': ['load'],
   '@deepseek-ai/dsh-home-paths': ['resolveDshHome'],
@@ -33,6 +34,12 @@ export const HOST_FUNCTIONS = Object.freeze({
 });
 
 const HOST_METHODS = {
+  '@deepseek-ai/dsh-agent-loop': {
+    AgentLoop: ['prepare', 'create', 'createAgent', 'resume', 'setupAndPublish', 'initializeAgent'],
+  },
+  '@deepseek-ai/cordis-plugin-loader': {
+    EntryTree: ['resolve'],
+  },
   '@deepseek-ai/dsh-llm': {
     AssistantStreamAccumulator: ['push', 'snapshot'], BlockAssembler: ['push', 'message'],
   },
@@ -95,6 +102,15 @@ export function assertHostModule(name, module, version) {
   }
   if (name === '@deepseek-ai/cordis-plugin-include') {
     requireValue(module.entryListSchema, '缺少预设 YAML schema', version);
+  }
+  if (name === '@deepseek-ai/cordis-plugin-loader') {
+    requireValue(module.Entry.key, '缺少 Entry.key', version, 'symbol');
+  }
+  if (name === '@deepseek-ai/dsh-agent-loop') {
+    requireValue(module.AgentLoop.Config, '缺少 AgentLoop.Config', version);
+    if (!Array.isArray(module.AgentLoop.inject)) {
+      throw new DshCompatibilityError(version, '缺少 AgentLoop.inject');
+    }
   }
   if (name === 'zod') {
     for (const key of ['object', 'string', 'number', 'array', 'boolean', 'union', 'literal']) {
