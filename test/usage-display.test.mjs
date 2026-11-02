@@ -140,3 +140,76 @@ test('速度复用原生统计组件，运行中采样即更新，旧会话缺�
   dispose()
   assert.equal(entries.length, 1)
 })
+
+test('远程弹窗独立显示客户端与SDK均值，缺客户端观察保持未知，普通及紧凑模式仍委托原生', () => {
+  const Native = () => {}, NativeAssistant = () => {}, entries = [], callbacks = new Map(), calls = []
+  const nativeInject = id => ({ nativeSession: id })
+  entries.push({ options: { id: 'activity' }, locale: 'chat', inject: nativeInject, component: Native, slot: 'conversation.composer.dock' },
+    { options: { key: 'assistant-step' }, locale: 'chat', inject: nativeInject, component: NativeAssistant, slot: 'conversation.chat.node' })
+  const session = {}, scope = {}
+  let snapshot = { version: 1, submissions: 3, samples: 2, totalMs: 440 }, disposed = false
+  const observer = { subscribe: () => () => {}, getSnapshot: () => snapshot }
+  const ctx = { sessions: { binding: id => id === 'session' ? { session, ctx: scope } : undefined }, slots: {
+    entries: name => entries.filter(entry => entry.slot === name),
+    subscribe(name, fn) { callbacks.set(name, fn); return () => callbacks.delete(name) },
+    register(options, component) {
+      const entry = { options, component, inject: options.inject, locale: options.locale, slot: options.name }
+      entries.push(entry); callbacks.get(options.name)?.()
+      return () => { entries.splice(entries.indexOf(entry), 1); callbacks.get(options.name)?.() }
+    },
+  } }
+  const React = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useMemo: fn => fn(), useSyncExternalStore: (_subscribe, get) => get(), useState: () => [true, () => {}],
+    useRef: () => ({ current: null }), useEffect() {},
+  }
+  const previousDocument = globalThis.document
+  globalThis.document = { body: {} }
+  const dispose = createUsageProjectionBridge({ React, createPortal: content => content,
+    useAnchoredPosition: () => ({ left: 10, top: 10 }), useDismissOnOutsidePointer() {},
+    createClientFirstOutput: () => ({ bind(...args) { calls.push(args); return observer }, dispose() { disposed = true } }),
+  })(ctx)
+  try {
+    const activity = entries.find(entry => entry.slot === 'conversation.composer.dock' && entry.component !== Native)
+    const injection = activity.inject('session')
+    assert.equal(injection.nativeSession, 'session')
+    assert.equal(injection.clientFirstOutput, observer)
+    assert.deepEqual(calls[0], ['session', session, scope])
+    let remote = true, mode = 'standard'
+    const props = { ...injection, usePerformanceUsage: () => mode, t: key => key,
+      useProjection(key) {
+        if (key === 'claudeBridge') return remote ? {} : null
+        if (key === 'claudeBridgeResponseStats') return { responseCount: 5, ttftMs: 148, ttftSteps: 4, decodeMs: 1000, decodeTokens: 20, tpsSamples: 3 }
+        return { turns: 2, steps: 7, llmMs: 3000, toolMs: 1000 }
+      },
+    }
+    const render = () => { const view = activity.component(props); return view.type === Native ? view : view.type(view.props) }
+    const find = (node, predicate) => !node || typeof node !== 'object' ? undefined
+      : predicate(node) ? node : node.children?.map(child => find(child, predicate)).find(Boolean)
+    const pairs = tree => {
+      const list = find(tree, node => node.type === 'dl').children, result = new Map()
+      for (let i = 0; i < list.length; i += 2) result.set(list[i].children[0], { value: list[i + 1].children[0], title: list[i].props.title })
+      return result
+    }
+    let values = pairs(render())
+    assert.equal(values.size, 5)
+    assert.equal(values.get('客户端首字显示（观察）').value, '220 ms')
+    assert.match(values.get('客户端首字显示（观察）').title, /2\/3 次客户端提交.*旧历史缺观察为未知/)
+    assert.equal(values.get('SDK 首有效输出（估算）').value, '37 ms')
+    assert.match(values.get('SDK 首有效输出（估算）').title, /4\/5 个响应.*分母独立/)
+    assert.equal(values.get('接收速度（TPS）').value, '20 tok/s')
+    snapshot = { version: 1, submissions: 1, samples: 0, totalMs: 0 }
+    values = pairs(render())
+    assert.equal(values.get('客户端首字显示（观察）').value, '未知')
+    assert.equal(values.get('SDK 首有效输出（估算）').value, '37 ms')
+    mode = 'compact'
+    assert.equal(render().type, Native)
+    remote = false
+    assert.equal(activity.component(props).type, Native)
+    assert.equal(activity.component(props).props, props)
+    const assistant = entries.find(entry => entry.slot === 'conversation.chat.node' && entry.component !== NativeAssistant)
+    assert.equal(assistant.component(props).type, NativeAssistant)
+    assert.equal(assistant.component(props).props, props)
+  } finally { dispose(); globalThis.document = previousDocument }
+  assert.equal(disposed, true)
+  assert.equal(entries.length, 2)
+})
