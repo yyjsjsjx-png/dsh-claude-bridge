@@ -1026,6 +1026,12 @@ export class BridgeBackend {
       this.diagnostics.event('run.completed', { runId, sessionId: agent.id, durationMs: Date.now() - startedAt })
       timing('completed')
       run.completed = true
+      // Optional display metadata is projected only after the required run
+      // checkpoint. It cannot change the main outcome or add a flush barrier.
+      if (typeof result.sessionTitle === 'string') {
+        try { this.onSessionTitle?.(agent.session, result.sessionTitle) }
+        catch { this.diagnostics.event('title.sync', { code: 'SDK_TITLE_SYNC_FAILED' }) }
+      }
       return { kind: 'completed' }
     } catch (error) {
       startedAt ??= Date.now()
