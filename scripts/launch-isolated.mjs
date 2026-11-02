@@ -39,7 +39,7 @@ await mkdir(directory, { recursive: true })
 await mkdir(home, { recursive: true })
 
 const replacements = {
-  __AGENT_LOOP_URL__: 'plugin/compat/agent-loop.mjs',
+  __AGENT_LOOP_URL__: 'plugin/agent-loop.mjs',
   __BRIDGE_SERVICE_URL__: 'plugin/index.mjs',
   __SESSION_CONTROLLER_URL__: 'plugin/session-controller.mjs',
   __PRESET_SERVICE_URL__: 'plugin/preset-service.mjs',

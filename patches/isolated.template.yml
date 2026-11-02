@@ -6,7 +6,7 @@
     - id: claude-agent-loop
       name: '__AGENT_LOOP_URL__'
       config:
-        agents: []
+        sourceEntry: agent-loop
     - id: claude-bridge
       name: '__BRIDGE_SERVICE_URL__'
       config:

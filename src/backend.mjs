@@ -33,6 +33,7 @@ import { evaluateBridgeCompatibility, bridgeCompatibilityAllowed } from './bridg
 import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } from './catalog-display.mjs'
 import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.mjs'
 import { RunStepLifecycle } from './step-lifecycle.mjs'
+import { assertPreparedInstructionAudit } from './instruction-audit.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const USER_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -876,12 +877,14 @@ export class BridgeBackend {
   }
 
   prepareMessages(agent, assembly, messages, signal, continuation = false) {
-    return prepareRequestMessages({ assembly, messages, continuation,
+    const prepared = prepareRequestMessages({ assembly, messages, continuation,
       context: this.helpers.assembleContextFor(agent, signal),
       refreshContext: (accepted, context) => this.ctx.systemPrompt.refreshContext(accepted, context),
       renderContextSections: refreshed => this.helpers.renderContextSections(refreshed),
       joinContextSections: sections => this.helpers.joinContextSections(sections),
       projectContext: (text, sections) => agent.runtimeContext.project(text, sections) })
+    assertPreparedInstructionAudit(agent, prepared)
+    return prepared
   }
 
   async runStep(agent, decision) {

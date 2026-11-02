@@ -49,7 +49,7 @@ export function apply(ctx) {
   throw new Error('controlled optional failure');
 }
 `);
-    const mount = async (plugins, mode = 'full', baseUrl = shipped.baseUrl, noticeReasons = []) => {
+    const mount = async (plugins, mode = 'full', baseUrl = shipped.baseUrl, noticeReasons = [], fallbackPlugins = basicPlugins) => {
       const key = { id: 'native-preset-agent', inject() {} };
       const scope = createScope(ctx, key);
       key.ctx = scope.ctx;
@@ -63,7 +63,7 @@ export function apply(ctx) {
           tree = new OuterTree(child.extend({ baseUrl }));
           child.effect(() => () => tree.root.stop());
           await tree.root.update([{ id: 'remote-container', name: new URL('../plugin/remote-composition.mjs', import.meta.url).href,
-            config: { plugins, basicPlugins, shell: 'pwsh', baseUrl, mode, reasons: [], noticeReasons } }]);
+            config: { plugins, basicPlugins: fallbackPlugins, shell: 'pwsh', baseUrl, mode, reasons: [], noticeReasons } }]);
         });
         await tree.await();
         const entry = [...tree.entries()].find(row => row.options.id === 'remote-container');
@@ -73,6 +73,26 @@ export function apply(ctx) {
         return { scope, key, tree, assembly: await ctx.systemPrompt.assemble({ scope: key }) };
       } catch (error) { await scope.dispose(); throw error; }
     };
+
+    await t.test('远程指令审计映射由加载回退管理，不检查未使用的基础组合', async () => {
+      const unsupported = basicPlugins.map(row => row.id === 'agent-instructions'
+        ? { ...row, name: 'unsupported-instruction-component' } : row);
+      const control = await mount(basicPlugins);
+      const expectedMode = remotePresetStatus(ctx).mode;
+      const expectedTools = control.assembly.tools;
+      await control.scope.dispose();
+      const normal = await mount(basicPlugins, 'full', shipped.baseUrl, [], unsupported);
+      try {
+        assert.equal(remotePresetStatus(ctx).mode, expectedMode);
+        assert.deepEqual(normal.assembly.tools, expectedTools);
+      }
+      finally { await normal.scope.dispose(); }
+      const fallback = await mount(unsupported);
+      try {
+        assert.equal(remotePresetStatus(ctx).mode, 'basic');
+        assert.ok(fallback.assembly.tools.some(tool => tool.name === 'pwsh'));
+      } finally { await fallback.scope.dispose(); }
+    });
 
     await t.test('可选组件抛错后其提示词被清理，shell 保留', async () => {
       const mounted = await mount([...basicPlugins, { id: 'optional-broken', name: pathToFileURL(broken).href }]);

@@ -32,7 +32,12 @@ export function prepareRequestMessages({ assembly, messages, context, refreshCon
     }
   }
   if (runtime && !contextAdmitted) admitted.push(runtime)
-  if (admitted.some(message => message.source.kind === 'agent-instructions' && message.source.form === 'instructions'
+  assertInstructionBudget(admitted, continuation)
+  return admitted
+}
+
+export function assertInstructionBudget(messages, continuation = false) {
+  if (messages.some(message => message.source.kind === 'agent-instructions' && message.source.form === 'instructions'
     && message.content.some(block => block.type === 'text'
       && INSTRUCTION_BUDGET_HEADER.test(block.text)))) {
     const message = continuation
@@ -40,5 +45,4 @@ export function prepareRequestMessages({ assembly, messages, context, refreshCon
       : 'DSH 报告项目指令被省略或截断；已停止本轮推理，请先确认指令完整性。'
     throw Object.assign(new Error(`[INSTRUCTION_BUDGET_EXCEEDED] ${message}`), { code: 'INSTRUCTION_BUDGET_EXCEEDED' })
   }
-  return admitted
 }
