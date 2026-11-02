@@ -670,6 +670,31 @@ test('目录解析并发与短期重复读取只请求一次，手动刷新另�
   assert.equal(catalogs, 3)
 })
 
+test('登录复核后旧在途目录不回填或被新调用共享，自身手动刷新仍正确缓存新目录', async t => {
+  let catalogs = 0, auth = 0, releaseOld, started
+  const waiting = new Promise(resolve => { started = resolve })
+  const f = await fixture(t, async () => ({ peer: { async request(method) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    if (method === 'authStatus') { auth++; return { loggedIn: true } }
+    assert.equal(method, 'catalog'); catalogs++
+    if (catalogs === 1) { started(); return new Promise(resolve => { releaseOld = resolve }) }
+    return { status: 'ok', models: [{ value: `new-${catalogs}`, displayName: '新目录' }] }
+  } }, async close() {} }))
+  const old = f.backend.catalog().then(value => ({ value }), error => ({ error }))
+  await waiting
+  await f.backend.refreshAuthentication()
+  const fresh = f.backend.catalog()
+  releaseOld({ status: 'ok', models: [{ value: 'old', displayName: '旧目录' }] })
+  const [oldOutcome, newReply] = await Promise.all([old, fresh])
+  assert.equal(oldOutcome.error?.code, 'AUTHENTICATION_CHANGED')
+  assert.equal(newReply.models[0].value, 'new-2')
+  assert.equal((await f.backend.catalog()).models[0].value, 'new-2')
+  assert.equal(catalogs, 2)
+  assert.equal((await f.backend.catalog({ refresh: true })).models[0].value, 'new-3')
+  assert.equal((await f.backend.catalog()).models[0].value, 'new-3')
+  assert.equal(catalogs, 3); assert.equal(auth, 2)
+})
+
 test('用量按轮次累加 token，SDK 累计费用每会话只取最近一次', () => {
   const backend = Object.create(BridgeBackend.prototype)
   backend.state = { value: { sessions: {

@@ -91,6 +91,7 @@ export class BridgeBackend {
     this.remoteCapabilities = { status: 'unchecked', shell: requiredShellName(), reason: '尚未检查远程会话的基础执行能力。' }
     this.shellFailures = new WeakMap()
     this.connectionContext = new ConnectionContext()
+    this.catalogGeneration = 0
     this.historyGeneration = 0
     this.verifiedHistory = new WeakMap()
     this.connectionUsers = 0
@@ -132,6 +133,7 @@ export class BridgeBackend {
     this.catalogCache = undefined
     this.catalogPending = undefined
     this.catalogPendingRefresh = undefined
+    this.catalogPendingContext = undefined
     this.displayIdentityPending = undefined
     this.displayCatalogRefreshPending = undefined
     this.displayCatalogRefreshAfter = 0
@@ -212,7 +214,7 @@ export class BridgeBackend {
     return summary
   }
 
-  async refreshAuthentication() {
+  async refreshAuthentication(catalogRequest) {
     this.planUsageCache = undefined
     this.catalogCache = undefined
     const identity = this.connectionContext.capture()
@@ -232,6 +234,18 @@ export class BridgeBackend {
         this.catalogCache = undefined
       }
       throw error
+    } finally {
+      if (this.connectionContext.current(identity)) {
+        // The completed login recheck fences all metadata already in flight,
+        // including requests sent while authStatus itself was waiting.
+        this.catalogGeneration++
+        this.catalogCache = undefined
+        // An explicit catalog refresh owns this recheck, then sends its new
+        // directory RPC. Other pending reads must keep their stale generation.
+        if (catalogRequest && this.catalogPendingContext === catalogRequest) {
+          catalogRequest.generation = this.catalogGeneration
+        }
+      }
     }
   }
 
@@ -315,7 +329,7 @@ export class BridgeBackend {
     if (!refresh && this.authentication === 'login-required') throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
     if (!refresh && this.authentication !== 'verification-failed' && this.catalogCache
       && Date.now() - this.catalogCache.time < MODEL_CATALOG_CACHE_MS) return structuredClone(this.catalogCache.reply)
-    if (this.catalogPending) {
+    if (this.catalogPending && this.catalogPendingContext?.generation === this.catalogGeneration) {
       if (!refresh || this.catalogPendingRefresh) return this.catalogPending
       const identity = this.connectionContext.capture()
       await this.catalogPending.catch(() => {})
@@ -323,27 +337,40 @@ export class BridgeBackend {
       return this.catalog({ refresh: true })
     }
     const identity = this.connectionContext.capture()
+    const catalogRequest = { generation: this.catalogGeneration }
+    const assertCurrentCatalog = () => {
+      if (catalogRequest.generation !== this.catalogGeneration) {
+        throw failure('AUTHENTICATION_CHANGED', '登录状态已重新验证，请重新读取模型目录。')
+      }
+    }
     const pending = (async () => {
       const transport = await this.connect()
       // Automatic model resolution may call this once for every catalog row.
       // Only the explicit refresh action forces a fresh CLI auth check.
-      if (refresh) await this.refreshAuthentication()
+      if (refresh) await this.refreshAuthentication(catalogRequest)
+      assertCurrentCatalog()
       const reply = await transport.peer.request('catalog', { refresh }, { timeoutMs: 45000 })
       if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      assertCurrentCatalog()
       if (reply.status !== 'ok') throw failure(reply.code ?? 'CATALOG_UNAVAILABLE', reply.message ?? '无法获取当前账号模型目录。')
       this.catalogCache = { time: Date.now(), reply: structuredClone(reply) }
       await this.rememberDisplayCatalog(reply.models, identity, transport)
       if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+      assertCurrentCatalog()
       this.displayCatalogStatus = { status: 'ready' }
       return reply
     })()
     this.catalogPending = pending
     this.catalogPendingRefresh = refresh
+    this.catalogPendingContext = catalogRequest
     try { return await pending } catch (error) {
-      if (this.connectionContext.current(identity) && isModelCatalogAuthFailure(error.code)) this.catalogCache = undefined
+      if (this.connectionContext.current(identity) && catalogRequest.generation === this.catalogGeneration
+        && isModelCatalogAuthFailure(error.code)) this.catalogCache = undefined
       throw error
     } finally {
-      if (this.catalogPending === pending) { this.catalogPending = undefined; this.catalogPendingRefresh = undefined }
+      if (this.catalogPending === pending) {
+        this.catalogPending = this.catalogPendingRefresh = this.catalogPendingContext = undefined
+      }
     }
   }
 
