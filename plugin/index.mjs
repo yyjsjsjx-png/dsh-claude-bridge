@@ -50,6 +50,7 @@ import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
 import { createClientTimingRecorder } from '../src/client-timing-diagnostics.mjs';
+import { createModelCycleProjection, modelCycleRows } from '../src/model-cycle-projection.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
@@ -70,6 +71,7 @@ let ClaudeBridgeService = (() => {
     let _planUsage_decorators;
     let _syncSession_decorators;
     let _recordClientTiming_decorators;
+    let _modelRequestStats_decorators;
     let _refreshCatalog_decorators;
     let _modelPreferences_decorators;
     let _visibleModels_decorators;
@@ -84,6 +86,7 @@ let ClaudeBridgeService = (() => {
             _planUsage_decorators = [Remote('planUsage')];
             _syncSession_decorators = [Remote('syncSession')];
             _recordClientTiming_decorators = [Remote('recordClientTiming')];
+            _modelRequestStats_decorators = [Remote('modelRequestStats')];
             _refreshCatalog_decorators = [Remote('refreshCatalog')];
             _modelPreferences_decorators = [Remote('modelPreferences')];
             _visibleModels_decorators = [Remote('visibleModels')];
@@ -95,6 +98,7 @@ let ClaudeBridgeService = (() => {
             __esDecorate(this, null, _planUsage_decorators, { kind: "method", name: "planUsage", static: false, private: false, access: { has: obj => "planUsage" in obj, get: obj => obj.planUsage }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _syncSession_decorators, { kind: "method", name: "syncSession", static: false, private: false, access: { has: obj => "syncSession" in obj, get: obj => obj.syncSession }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _recordClientTiming_decorators, { kind: "method", name: "recordClientTiming", static: false, private: false, access: { has: obj => "recordClientTiming" in obj, get: obj => obj.recordClientTiming }, metadata: _metadata }, null, _instanceExtraInitializers);
+            __esDecorate(this, null, _modelRequestStats_decorators, { kind: "method", name: "modelRequestStats", static: false, private: false, access: { has: obj => "modelRequestStats" in obj, get: obj => obj.modelRequestStats }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _refreshCatalog_decorators, { kind: "method", name: "refreshCatalog", static: false, private: false, access: { has: obj => "refreshCatalog" in obj, get: obj => obj.refreshCatalog }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _modelPreferences_decorators, { kind: "method", name: "modelPreferences", static: false, private: false, access: { has: obj => "modelPreferences" in obj, get: obj => obj.modelPreferences }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _visibleModels_decorators, { kind: "method", name: "visibleModels", static: false, private: false, access: { has: obj => "visibleModels" in obj, get: obj => obj.visibleModels }, metadata: _metadata }, null, _instanceExtraInitializers);
@@ -137,6 +141,7 @@ let ClaudeBridgeService = (() => {
             ctx.sessionProjections.register(createRunProgressProjection(z));
             ctx.sessionProjections.register(createResponseUsageProjection(z));
             ctx.sessionProjections.register(createResponseTimingProjection(z));
+            ctx.sessionProjections.register(createModelCycleProjection(z));
             ctx.sessionProjections.register(createModelObservationProjection(z));
             const backend = this.backend;
             const adapter = new ClaudeCatalogAdapter(backend, ctx);
@@ -284,6 +289,22 @@ let ClaudeBridgeService = (() => {
                 }
                 throw error;
             }
+        }
+        async modelRequestStats(value) {
+            this.assertOwner();
+            if (!value || typeof value !== 'object' || Array.isArray(value)
+                || Object.keys(value).some(key => !['sessionId', 'offset', 'limit'].includes(key))
+                || typeof value.sessionId !== 'string' || !value.sessionId || value.sessionId.length > 160
+                || !Number.isSafeInteger(value.offset ?? 0) || (value.offset ?? 0) < 0
+                || !Number.isSafeInteger(value.limit ?? 100) || (value.limit ?? 100) < 1 || (value.limit ?? 100) > 200) {
+                throw new RemoteError('claude-bridge/invalid-request-stats', '请求统计分页参数无效。', {});
+            }
+            const session = this.ctx.sessions.get(value.sessionId) ?? this.ctx.agents.get(value.sessionId)?.session;
+            if (!session || session.header.agentPreset !== CLAUDE_PRESET)
+                return { status: 'not-loaded', total: 0, rows: [] };
+            const state = this.ctx.sessionProjections.stateOf(session, 'claudeBridgeModelStats');
+            const rows = modelCycleRows(state), offset = value.offset ?? 0;
+            return { status: 'ready', total: rows.length, rows: rows.slice(offset, offset + (value.limit ?? 100)) };
         }
         async refreshCatalog() {
             this.assertOwner();

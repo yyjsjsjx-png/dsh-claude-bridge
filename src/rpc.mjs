@@ -5,6 +5,8 @@ const MAX_INCOMING_IDS = 100_000
 const MAX_TIMING_BUCKETS = 2048
 const RPC_ID = /^[0-9a-f-]{36}:[1-9][0-9]*$/i
 const RUN_ID = /^(?:[0-9a-f-]{36}|run-[a-z0-9_.-]{1,100})$/i
+const safeCallId = value => typeof value === 'string' && /^[a-zA-Z0-9_.:-]{1,160}$/.test(value)
+  && !/^(?:sk|pk|token|secret)[-_]/i.test(value)
 const safeMethod = value => typeof value === 'string' && /^[a-zA-Z0-9_.$/-]{1,100}$/.test(value)
   && !/^(?:sk|pk|token|secret)[-_]/i.test(value)
 const textDecoder = new TextDecoder('utf-8', { fatal: true })
@@ -85,7 +87,7 @@ export function createRpcPeer({
     throw new TypeError('onDiagnostic 必须是函数')
   }
   if (onTraffic !== undefined && typeof onTraffic !== 'function') throw new TypeError('onTraffic 必须是函数')
-  const traffic = (direction, message) => { try { onTraffic?.({ direction, message }) } catch {} }
+  const traffic = (direction, message, origin, at) => { try { onTraffic?.({ direction, message, origin, at }) } catch {} }
 
   const prefix = randomUUID()
   const pending = new Map()
@@ -124,13 +126,15 @@ export function createRpcPeer({
   }
 
   function rpcMetadata(message, request) {
-    if (!onDiagnostic) return {}
+    if (!onDiagnostic && !onTraffic) return {}
     try {
       const origin = request ?? (typeof message.method === 'string' ? message : pending.get(message.id))
       const runId = origin?.params?.runId ?? origin?.runId
+      const callId = origin?.params?.callId ?? origin?.callId
       return { ...(typeof message.id === 'string' && RPC_ID.test(message.id) ? { id: message.id } : {}),
         ...(safeMethod(origin?.method) ? { method: origin.method } : {}),
-        ...(typeof runId === 'string' && RUN_ID.test(runId) ? { runId } : {}) }
+        ...(typeof runId === 'string' && RUN_ID.test(runId) ? { runId } : {}),
+        ...(safeCallId(callId) ? { callId } : {}) }
     } catch { return {} }
   }
 
@@ -217,10 +221,12 @@ export function createRpcPeer({
       throw closedError()
     }
     try {
-      traffic('sent', message)
       const writingAt = performance.now()
       try { output.write(frame) }
       finally { rpcTiming('write', writingAt, frame.length, metadata) }
+      // Accepted by the Host's logical output stream, including backpressure
+      // and recovery buffering. This is not socket or SDK upstream dispatch.
+      traffic('sent', message, metadata, writingAt)
     } catch {
       close('write_error')
       throw closedError()
@@ -262,8 +268,9 @@ export function createRpcPeer({
     if (options.signal?.aborted) return Promise.reject(cancelledError())
     const id = `${prefix}:${++counter}`
     return new Promise((resolve, reject) => {
+      const metadata = rpcMetadata({ method, params })
       const entry = { resolve, reject, signal: options.signal, method, startedAt: Date.now(),
-        runId: rpcMetadata({ method, params }).runId }
+        runId: metadata.runId, callId: metadata.callId }
       entry.abort = () => cancelPending(id, cancelledError())
       if (options.timeoutMs !== undefined) {
         entry.timer = setTimeout(() => cancelPending(id,
@@ -383,8 +390,9 @@ export function createRpcPeer({
     let message
     try { message = JSON.parse(textDecoder.decode(line)) } catch { return close('protocol_error') }
     if (!isRecord(message) || message.jsonrpc !== '2.0') return close('protocol_error')
-    rpcTiming('receive', receivedAt, frameBytes, rpcMetadata(message))
-    traffic('received', message)
+    const metadata = rpcMetadata(message)
+    rpcTiming('receive', receivedAt, frameBytes, metadata)
+    traffic('received', message, metadata, receivedAt)
     if ('method' in message) handleCall(message, line.length, frameBytes)
     else handleResponse(message)
   }

@@ -11,6 +11,7 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/instruction-audit-native.test.mjs',
   'test/subagent-selection-native.test.mjs',
   'test/sdk-native-title-display-native.test.mjs',
+  'test/model-cycle-projection.test.mjs',
   'test/child-model-display-native.test.mjs',
   'test/bundle-native.test.mjs', 'test/catalog-visibility.test.mjs',
   'test/controller-native.test.mjs', 'test/history-native.test.mjs',

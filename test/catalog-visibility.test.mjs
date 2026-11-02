@@ -6,6 +6,24 @@ import { tmpdir } from 'node:os';
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES);
 
+test('实际rc5请求明细：只读已加载远程投影，owner与分页边界不激活模型', { skip: !available }, async () => {
+  const { ClaudeBridgeService } = await import('../plugin/index.mjs');
+  const { initialModelCycle, applyModelCycle, CLIENT_MODEL_TIMING_RECORD } = await import('../src/model-cycle-projection.mjs');
+  let state = initialModelCycle();
+  for (let step = 1; step <= 3; step++) state = applyModelCycle(state, { type: CLIENT_MODEL_TIMING_RECORD, ignorable: true,
+    data: { version: 1, runId: 'run', responseId: `response-${step}`, turn: 1, step, metric: 'first-output',
+      source: 'host-model-cycle', clock: 'local-monotonic', startBoundary: 'tool-results', quality: 'precise', durationMs: step } });
+  const session = { header: { agentPreset: 'claude-sdk-remote' } }, denied = new Error('owner required');
+  const service = { assertOwner() { throw denied; }, ctx: { sessions: { get: () => session },
+    sessionProjections: { stateOf: () => state } } };
+  await assert.rejects(ClaudeBridgeService.prototype.modelRequestStats.call(service, { sessionId: 's' }), e => e === denied);
+  service.assertOwner = () => {};
+  const value = await ClaudeBridgeService.prototype.modelRequestStats.call(service, { sessionId: 's', offset: 1, limit: 1 });
+  assert.equal(value.total, 3); assert.equal(value.rows.length, 1); assert.equal(value.rows[0].step, 2);
+  await assert.rejects(ClaudeBridgeService.prototype.modelRequestStats.call(service, { sessionId: 's', limit: 201 }),
+    error => error.code === 'claude-bridge/invalid-request-stats');
+});
+
 test('实际 rc5 服务：客户端计时仅owner可写，普通会话不采集，未知字段拒绝', { skip: !available }, async () => {
   const { ClaudeBridgeService } = await import('../plugin/index.mjs');
   const rows = [], denied = new Error('owner required');

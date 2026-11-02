@@ -172,7 +172,8 @@ export function createClientReceiveTiming({ now = () => performance.now(), docum
           if (arrival.type !== 'assistant-stream' || result?.type !== 'transient') return;
           const event = result.entry?.event, chunk = event?.data?.chunk;
           if (event?.type === 'assistant/live-chunk' && (['text-delta', 'reasoning-delta'].includes(chunk?.type)
-            && nonempty(chunk.text) || chunk?.type === 'tool-call-delta' && nonempty(chunk.argumentsDelta))) {
+            && nonempty(chunk.text) || chunk?.type === 'tool-call-delta'
+              && (nonempty(chunk.argumentsDelta) || nonempty(chunk.id) && nonempty(chunk.name)))) {
             output(event.data, arrival.at, true);
           }
         });

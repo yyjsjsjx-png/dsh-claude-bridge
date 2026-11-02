@@ -22,6 +22,7 @@ import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
 import { createClientTimingRecorder } from '../src/client-timing-diagnostics.mjs';
+import { createModelCycleProjection, modelCycleRows } from '../src/model-cycle-projection.mjs';
 
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
@@ -72,6 +73,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
     ctx.sessionProjections.register(createRunProgressProjection(z));
     ctx.sessionProjections.register(createResponseUsageProjection(z));
     ctx.sessionProjections.register(createResponseTimingProjection(z));
+    ctx.sessionProjections.register(createModelCycleProjection(z));
     ctx.sessionProjections.register(createModelObservationProjection(z));
     const backend = this.backend;
     const adapter = new ClaudeCatalogAdapter(backend, ctx);
@@ -218,6 +220,23 @@ export class ClaudeBridgeService extends TypertRemoteService {
       }
       throw error;
     }
+  }
+
+  @Remote('modelRequestStats')
+  async modelRequestStats(value) {
+    this.assertOwner();
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).some(key => !['sessionId', 'offset', 'limit'].includes(key))
+      || typeof value.sessionId !== 'string' || !value.sessionId || value.sessionId.length > 160
+      || !Number.isSafeInteger(value.offset ?? 0) || (value.offset ?? 0) < 0
+      || !Number.isSafeInteger(value.limit ?? 100) || (value.limit ?? 100) < 1 || (value.limit ?? 100) > 200) {
+      throw new RemoteError('claude-bridge/invalid-request-stats', '请求统计分页参数无效。', {});
+    }
+    const session = this.ctx.sessions.get(value.sessionId) ?? this.ctx.agents.get(value.sessionId)?.session;
+    if (!session || session.header.agentPreset !== CLAUDE_PRESET) return { status: 'not-loaded', total: 0, rows: [] };
+    const state = this.ctx.sessionProjections.stateOf(session, 'claudeBridgeModelStats');
+    const rows = modelCycleRows(state), offset = value.offset ?? 0;
+    return { status: 'ready', total: rows.length, rows: rows.slice(offset, offset + (value.limit ?? 100)) };
   }
 
   @Remote('refreshCatalog')

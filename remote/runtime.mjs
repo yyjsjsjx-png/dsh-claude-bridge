@@ -5,6 +5,7 @@ import { createContextSampler, sanitizeCompactionMessage } from './context-sampl
 import { createPlanUsageReader } from './plan-usage.mjs'
 import { acquireSessionLock } from './lock.mjs'
 import { CatalogError, createCatalogReader, validateModelSelection } from './catalog.mjs'
+import { isModelCatalogAuthFailure } from '../src/catalog-cache-policy.mjs'
 import { AuthError, createAuthReader } from './auth.mjs'
 import { sdkErrorDetail } from './errors.mjs'
 import { createHistoryReader, createRunStore } from './history.mjs'
@@ -13,6 +14,7 @@ import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { validateContextPreferences } from '../src/context-preferences.mjs'
 import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
 import { createFirstOutputObserver } from './first-output.mjs'
+import { firstOutputKind } from '../src/sdk-output-kind.mjs'
 import { createRunObservations } from './run-observations.mjs'
 import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
@@ -382,12 +384,17 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   }
 
   async function requireAuth(signal, refresh = false) {
-    const status = await authReader.read({ signal, refresh })
-    if (!status.loggedIn) throw new AuthError('AUTH_REQUIRED', '请先在服务器登录 Claude Code')
-    if (status.authMethod && status.authMethod !== 'claude.ai') {
-      throw new AuthError('AUTH_METHOD_UNSUPPORTED', '当前版本仅支持本人 Claude 订阅登录；API Key 等其他登录方式暂未开放')
+    try {
+      const status = await authReader.read({ signal, refresh })
+      if (!status.loggedIn) throw new AuthError('AUTH_REQUIRED', '请先在服务器登录 Claude Code')
+      if (status.authMethod && status.authMethod !== 'claude.ai') {
+        throw new AuthError('AUTH_METHOD_UNSUPPORTED', '当前版本仅支持本人 Claude 订阅登录；API Key 等其他登录方式暂未开放')
+      }
+      return status
+    } catch (error) {
+      if (!signal?.aborted && error?.code !== 'CANCELLED') catalogReader.clear()
+      throw error
     }
-    return status
   }
 
   async function authStatus(params = {}, context = {}) {
@@ -397,10 +404,15 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         || (params.refresh !== undefined && typeof params.refresh !== 'boolean')) {
         throw new WorkerError('INVALID_REQUEST', '登录状态请求无效')
       }
-      return await authReader.read({ signal: context.signal, refresh: params.refresh === true })
+      const status = await authReader.read({ signal: context.signal, refresh: params.refresh === true })
+      // Safe auth metadata has no account identity. An explicit recheck is an
+      // account boundary even when the new account is also logged in.
+      if (params.refresh === true || !status.loggedIn || status.authMethod && status.authMethod !== 'claude.ai') catalogReader.clear()
+      return status
     } catch (error) {
       const problem = error instanceof WorkerError || error instanceof AuthError
         ? error : new AuthError('AUTH_STATUS_UNAVAILABLE', '无法读取远程 Claude Code 登录状态')
+      if (!(error instanceof WorkerError) && !context.signal?.aborted && problem.code !== 'CANCELLED') catalogReader.clear()
       return { status: problem.code === 'CANCELLED' ? 'cancelled' : 'failed', code: problem.code, message: problem.message }
     }
   }
@@ -1022,6 +1034,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
           publish: message => { if (!compact) context.peer.notify('sdk.message', { runId, message }) } })
         try {
           const initialized = await verifyHooksApplied(sdkQuery, controller)
+          catalogReader.remember(initialized.models)
           if (compact && !initialized.commands?.some(command => command?.name === 'compact')) {
             throw new WorkerError('COMPACT_UNAVAILABLE', '当前 SDK 会话未提供官方 compact 命令')
           }
@@ -1075,12 +1088,10 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             || (message?.type === 'assistant' && !isNoResponsePlaceholder(message.message)))) {
             if (!firstModelEvent) { firstModelEvent = true; timing('first_model_event') }
             const delta = message.event?.type === 'content_block_delta' ? message.event.delta : undefined
-            const token = delta?.type === 'text_delta' ? delta.text : delta?.type === 'thinking_delta'
-              ? delta.thinking : delta?.type === 'input_json_delta' ? delta.partial_json : undefined
             const full = message.type === 'assistant' ? message.message?.content : undefined
-            if (!firstToken && ((typeof token === 'string' && token.length)
+            if (!firstToken && (firstOutputKind(message.event)
               || full?.some(block => (block.type === 'text' && block.text?.length)
-                || (block.type === 'thinking' && block.thinking?.length) || block.type === 'tool_use'))) {
+                || (block.type === 'thinking' && block.thinking?.length) || block.type === 'tool_use' && block.id?.length && block.name?.length))) {
               firstToken = true; timing('first_token')
             }
             if (!firstText && ((delta?.type === 'text_delta' && delta.text?.length)
@@ -1223,6 +1234,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         onReleaseFailure: () => diagnose('session', 'lock-release-failed', 'LOCK_RELEASE_FAILED'),
       })
       finalOutcome = finalized.outcome
+      if (isModelCatalogAuthFailure(finalOutcome?.code)) catalogReader.clear()
       if (run) {
         run.observations?.finish(finalOutcome)
         if (run.quotaActive) observability?.activity(runId, false)

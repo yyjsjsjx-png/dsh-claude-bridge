@@ -15,14 +15,14 @@ const revisions = new WeakMap()
 
 /** Project SDK text/thinking into DSH's existing live and durable renderers. */
 export class SdkProjection {
-  constructor({ agent, helpers, turn, step, model, runId, timingNow, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText }) {
-    Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText })
+  constructor({ agent, helpers, turn, step, model, runId, timingNow, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText, onResponseRecord }) {
+    Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText, onResponseRecord })
     this.runId = runId ?? `turn:${turn}:step:${step}`
     this.requestedModel = model
     this.startStep = step
     this.timingNow = timingNow ?? (() => performance.now())
     this.responseTiming = createResponseTimingTracker({ runId: this.runId, turn, now: this.timingNow,
-      onRecord: record => helpers.appendPluginRecord(agent.session, RESPONSE_TIMING_RECORD, record) })
+      onRecord: record => this.recordMetadata(RESPONSE_TIMING_RECORD, record) })
     this.active = undefined
     this.blocks = new Map()
     this.committedToolIds = new Set()
@@ -40,6 +40,11 @@ export class SdkProjection {
 
   advanceStep(step) {
     this.step = step
+  }
+
+  recordMetadata(type, data) {
+    this.helpers.appendPluginRecord(this.agent.session, type, data)
+    try { this.onResponseRecord?.(type, data) } catch { /* Diagnostic exports cannot change model execution. */ }
   }
 
   getCommittedToolCall(id) {
@@ -70,7 +75,9 @@ export class SdkProjection {
   push(chunk) {
     const token = ['text-delta', 'reasoning-delta'].includes(chunk.type) ? chunk.text
       : chunk.type === 'tool-call-delta' ? chunk.argumentsDelta : undefined
-    if (typeof token === 'string' && token.length) {
+    const toolStart = chunk.type === 'tool-call-delta' && typeof chunk.id === 'string' && chunk.id.length
+      && typeof chunk.name === 'string' && chunk.name.length
+    if (typeof token === 'string' && token.length || toolStart) {
       if (!this.firstToken) { this.firstToken = true; this.onFirstToken?.(chunk.type) }
       if (chunk.type === 'text-delta' && !this.firstText) { this.firstText = true; this.onFirstText?.() }
     }
@@ -324,7 +331,7 @@ export class SdkProjection {
     response.actualModel = actual
     this.model = actual ?? this.requestedModel
     if (response.recordedModel === actual) return
-    this.helpers.appendPluginRecord(this.agent.session, MODEL_OBSERVATION_RECORD, { version: 1,
+    this.recordMetadata(MODEL_OBSERVATION_RECORD, { version: 1,
       runId: this.runId, responseId: sdkModelName(response.id), turn: response.turn, step: response.step,
       requestedModel: this.requestedModel, actualModel: actual, source: actual === null ? null : source })
     response.recordedModel = actual
@@ -350,7 +357,7 @@ export class SdkProjection {
     this.responseTiming.responseUsage({ responseId: response.id, outputTokens: usage.outputTokens, final: true })
     const signature = JSON.stringify(usage)
     if (signature === response.recorded) return
-    this.helpers.appendPluginRecord(this.agent.session, RESPONSE_USAGE_RECORD, { version: 1,
+    this.recordMetadata(RESPONSE_USAGE_RECORD, { version: 1,
       runId: this.runId, responseId: response.id, turn: response.turn, step: response.step,
       source: 'sdk-stream', usage })
     response.recorded = signature

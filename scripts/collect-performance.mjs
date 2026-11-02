@@ -2,6 +2,7 @@ import { readFile, readdir, lstat, mkdir, writeFile } from 'node:fs/promises'
 import { resolve, join, basename } from 'node:path'
 import { createHash } from 'node:crypto'
 import { analyzePerformance, formatPerformanceReport, sanitizePerformanceRecord } from '../src/performance-report.mjs'
+import { formatModelRequestsCsv } from '../src/model-request-report.mjs'
 
 const args = process.argv.slice(2), roots = []
 const LOG_NAMES = new Set(['bridge.previous.jsonl', 'bridge.jsonl', 'diagnostics.sanitized.jsonl'])
@@ -58,6 +59,7 @@ const artifacts = [
   ['diagnostics.sanitized.jsonl', rows.map(row => JSON.stringify(row)).join('\n') + '\n'],
   ['performance-report.json', JSON.stringify(report, null, 2) + '\n'],
   ['performance-report.md', formatPerformanceReport(report)],
+  ['model-requests.csv', formatModelRequestsCsv(report.modelRequests)],
 ]
 const manifest = []
 for (const [name, body] of artifacts) {

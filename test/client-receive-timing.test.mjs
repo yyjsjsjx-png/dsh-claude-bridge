@@ -109,7 +109,7 @@ test('原生连续六次提交全覆盖：每次自身rpcId、新turn及首有�
   unsubscribe(); f.tracker.dispose()
 })
 
-test('child手动提交、背景接收、思考及工具参数均有独立有效样本，工具结果/名字不计', () => {
+test('child手动提交、背景接收、思考及工具参数均有独立有效样本，工具结果与不完整工具名不计', () => {
   for (const kind of ['reasoning-delta', 'tool-call-delta']) {
     const f = fixture({ sessionId: 'synthetic/child' })
     f.session.address = { parentSessionId: 'synthetic/parent', childSessionId: 'synthetic/child' }
@@ -117,7 +117,7 @@ test('child手动提交、背景接收、思考及工具参数均有独立有效
     const chunk = f.startAttempt()
     f.hidden(true); f.tick(80)
     f.append('tool/result', { turn: 1, step: 1, content: [{ type: 'text', text: '合成工具结果' }] })
-    chunk({ type: 'tool-call-delta', index: 0, id: 'tool', name: 'synthetic-tool', argumentsDelta: '' })
+    chunk({ type: 'tool-call-delta', index: 0, name: 'synthetic-tool', argumentsDelta: '' })
     assert.equal(f.snapshot().samples, 0)
     chunk(kind === 'reasoning-delta' ? { type: kind, index: 0, text: '合成思考' }
       : { type: kind, index: 0, id: 'tool', argumentsDelta: '{' }, 1)

@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { sdkErrorDetail } from './errors.mjs'
+import { MODEL_CATALOG_CACHE_MS, isModelCatalogAuthFailure } from '../src/catalog-cache-policy.mjs'
 
 export class CatalogError extends Error {
   constructor(code, message) {
@@ -59,11 +60,22 @@ function sanitizeModels(input) {
 }
 
 /** Read model capabilities from the CLI initialize handshake without sending a prompt. */
-export function createCatalogReader({ sdk, sessionRoot, cliPath, childEnv, now = () => Date.now(), cacheMs = 30_000 }) {
+export function createCatalogReader({ sdk, sessionRoot, cliPath, childEnv, now = () => Date.now(), cacheMs = MODEL_CATALOG_CACHE_MS }) {
   let cached
   let pending
   let generation = 0
   const cancelled = () => new CatalogError('CANCELLED', '模型目录查询已取消')
+  const clear = () => { cached = pending = undefined; generation++ }
+  function remember(input) {
+    // A normal SDK Query already returns these capabilities at initialization.
+    // Missing/invalid optional metadata must not change that Query's result.
+    try {
+      const models = sanitizeModels(input)
+      generation++; pending = undefined
+      cached = { time: now(), models }
+      return true
+    } catch { return false }
+  }
 
   async function read({ signal, refresh = false } = {}) {
     if (signal?.aborted) throw cancelled()
@@ -135,9 +147,11 @@ export function createCatalogReader({ sdk, sessionRoot, cliPath, childEnv, now =
       if (currentGeneration === generation) cached = { time: now(), models }
       return models
     } catch (error) {
-      if (error instanceof CatalogError) throw error
       const detail = sdkErrorDetail(error)
-      throw new CatalogError(detail?.code ?? 'CATALOG_UNAVAILABLE', detail?.message ?? '无法取得账号可用模型目录')
+      const problem = error instanceof CatalogError ? error
+        : new CatalogError(detail?.code ?? 'CATALOG_UNAVAILABLE', detail?.message ?? '无法取得账号可用模型目录')
+      if (currentGeneration === generation && isModelCatalogAuthFailure(problem.code)) clear()
+      throw problem
     } finally {
       clearTimeout(timer)
       controller.abort()
@@ -146,7 +160,7 @@ export function createCatalogReader({ sdk, sessionRoot, cliPath, childEnv, now =
     }
   }
 
-  return { read }
+  return { read, clear, remember }
 }
 
 /** Reject an unknown model or unsupported explicit effort instead of falling back. */
