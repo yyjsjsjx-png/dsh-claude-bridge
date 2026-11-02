@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { getEventListeners } from 'node:events'
 import { BridgeBackend } from '../src/backend.mjs'
 import { ConnectionContext } from '../src/connection-context.mjs'
 import { planUsageSnapshot } from '../src/plan-usage.mjs'
@@ -236,6 +237,22 @@ async function prepareCompact(f) {
   return binding
 }
 
+async function lifecycleFixture(t, kind, request) {
+  const f = await fixture(t, async () => ({ peer: { async request(method, params, options) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { manualCompact: true } }
+    return request(method, params, options)
+  } }, async close() {} }))
+  const controller = kind === 'query' ? f.phaseAbort : new AbortController()
+  if (kind === 'compact') await prepareCompact(f)
+  return { ...f, controller, start: () => kind === 'query'
+    ? f.backend.runStep(f.agent, f.decision) : f.backend.compact(f.agent, controller.signal) }
+}
+
+async function assertLifecycleFailure(f, kind, expected) {
+  if (kind === 'query') await assert.rejects(f.start(), expected)
+  else assert.equal((await f.start()).kind, 'error')
+}
+
 test('/compact 使用维护门禁和已有绑定，不发送 DSH 历史，成功后更新 SDK 快照', async t => {
   let outcome = 'compacted'
   const requests = []
@@ -294,6 +311,170 @@ test('/compact 取消后迟到成功不覆盖未知状态，不自动重试或�
   assert.equal(queries, 1)
   assert.equal(settlements, 1)
   assert.equal(f.backend.runs.size, 0)
+})
+
+test('query 与 compact 登记后 setup 失败均收尾，beginRun 本身失败不结束未建台账', async t => {
+  for (const kind of ['query', 'compact']) {
+    for (const stage of kind === 'query' ? ['begin', 'header', 'status', 'started'] : ['begin', 'status', 'started']) {
+      let requests = 0, finishes = 0, stopRequests = 0, runId, runSignal, failed = false
+      const f = await lifecycleFixture(t, kind, async () => { requests++; throw new Error('不应发送请求') })
+      const synthetic = Object.assign(new Error('合成 setup 失败'), { code: 'SETUP_FAILED' })
+      const begin = f.backend.state.beginRun.bind(f.backend.state)
+      f.backend.state.beginRun = async (...args) => {
+        runId = args[1]
+        if (stage === 'begin') throw synthetic
+        return begin(...args)
+      }
+      const finish = f.backend.state.finishRun.bind(f.backend.state)
+      f.backend.state.finishRun = async (...args) => { finishes++; return finish(...args) }
+      const stop = f.backend.state.requestStop.bind(f.backend.state)
+      f.backend.state.requestStop = async (...args) => { stopRequests++; return stop(...args) }
+      const append = f.agent.session.append.bind(f.agent.session)
+      f.agent.session.append = (type, ...args) => {
+        if (!failed && stage === 'header' && type === 'request/header') { failed = true; throw synthetic }
+        return append(type, ...args)
+      }
+      const status = f.backend.sessionStatus.bind(f.backend)
+      f.backend.sessionStatus = (agent, patch) => {
+        if (patch.phase === (kind === 'query' ? 'running' : 'compacting')) {
+          runSignal = f.backend.runs.get(runId).signal
+          if (!failed && stage === 'status') { failed = true; throw synthetic }
+        }
+        return status(agent, patch)
+      }
+      const event = f.backend.diagnostics.event
+      f.backend.diagnostics.event = (name, fields) => {
+        if (!failed && stage === 'started' && name === (kind === 'query' ? 'run.started' : 'compact.started')) {
+          assert.equal(getEventListeners(runSignal, 'abort').length, 1)
+          failed = true; throw synthetic
+        }
+        return event(name, fields)
+      }
+      await assertLifecycleFailure(f, kind, { code: 'SETUP_FAILED' })
+      assert.equal(requests, 0)
+      assert.equal(f.backend.runs.size, 0)
+      assert.equal(finishes, stage === 'begin' ? 0 : 1)
+      const saved = f.backend.state.value.sessions[f.agent.id].runs?.[runId]
+      if (stage === 'begin') assert.equal(saved, undefined)
+      else {
+        assert.equal(saved.status, 'not-sent')
+        assert.equal(saved.requiresReview, false)
+        assert.equal(f.backend.retiredRuns.has(runId), true)
+      }
+      if (runSignal) assert.equal(getEventListeners(runSignal, 'abort').length, 0)
+      f.controller.abort()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(stopRequests, 0, '收尾后的 signal 不再修改台账')
+    }
+  }
+})
+
+test('query 与 compact 在 markRunSent 返回前取消均不发送 query，最终记 not-sent', async t => {
+  for (const kind of ['query', 'compact']) {
+    let entered, release, runId, requests = 0
+    const marked = new Promise(resolve => { entered = resolve })
+    const pending = new Promise(resolve => { release = resolve })
+    const f = await lifecycleFixture(t, kind, async () => { requests++; throw new Error('不应发送请求') })
+    const mark = f.backend.state.markRunSent.bind(f.backend.state)
+    f.backend.state.markRunSent = async (...args) => {
+      await mark(...args)
+      runId = args[1]; entered()
+      await pending
+    }
+    const running = kind === 'query'
+      ? assert.rejects(f.start(), { name: 'AbortError' })
+      : f.start().then(result => assert.equal(result.kind, 'error'))
+    await marked
+    const run = f.backend.runs.get(runId)
+    assert.equal(f.backend.state.value.sessions[f.agent.id].runs[runId].status, 'sent')
+    f.controller.abort()
+    await run.stopPersistence
+    release()
+    await running
+    assert.equal(requests, 0)
+    assert.equal(run.requestStarted, undefined)
+    assert.equal(f.backend.runs.size, 0)
+    assert.equal(getEventListeners(run.signal, 'abort').length, 0)
+    const saved = f.backend.state.value.sessions[f.agent.id].runs[runId]
+    assert.equal(saved.status, 'not-sent')
+    assert.equal(saved.requiresReview, false)
+    assert.ok(saved.stopRequestedAt)
+  }
+})
+
+test('发送意图助手返回与调用方续段之间取消时，query 与 compact 均不派发或记为已发送', async t => {
+  for (const kind of ['query', 'compact']) {
+    let stopped, releaseStop, run, requests = 0
+    const stoppedBeforeDispatch = new Promise(resolve => { stopped = resolve })
+    const stopGate = new Promise(resolve => { releaseStop = resolve })
+    const f = await lifecycleFixture(t, kind, async method => {
+      if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false }
+      assert.equal(method, 'query'); requests++
+      return { status: 'completed', compaction: { status: 'compacted' } }
+    })
+    const stop = f.backend.state.requestStop.bind(f.backend.state)
+    f.backend.state.requestStop = async (...args) => { await stopGate; return stop(...args) }
+    const mark = f.backend.state.markRunSent.bind(f.backend.state)
+    f.backend.state.markRunSent = async (...args) => {
+      await mark(...args)
+      run = f.backend.runs.get(args[1])
+      // First microtask precedes the helper's await continuation; the second
+      // follows it but precedes the caller's await continuation and RPC.
+      queueMicrotask(() => queueMicrotask(() => { f.controller.abort(); stopped() }))
+    }
+    const running = kind === 'query'
+      ? assert.rejects(f.start(), { name: 'AbortError' })
+      : f.start().then(result => assert.equal(result.kind, 'error'))
+    await stoppedBeforeDispatch
+    await new Promise(resolve => setImmediate(resolve))
+    const beforeStopSaved = { requests, started: run.requestStarted, aborted: run.queryAbort.signal.aborted }
+    releaseStop()
+    await running
+    assert.deepEqual(beforeStopSaved, { requests: 0, started: undefined, aborted: false })
+    assert.equal(requests, 0)
+    assert.equal(f.backend.runs.size, 0)
+    assert.equal(getEventListeners(run.signal, 'abort').length, 0)
+    const saved = f.backend.state.value.sessions[f.agent.id].runs[run.runId]
+    assert.equal(saved.status, 'not-sent')
+    assert.equal(saved.requiresReview, false)
+  }
+})
+
+test('query 与 compact 的停止保存失败先记 journalError 再 abort，收尾保留 review', async t => {
+  for (const kind of ['query', 'compact']) {
+    let started, failStop, run, aborts = 0, stops = 0, requests = 0
+    const ready = new Promise(resolve => { started = resolve })
+    const saveStop = new Promise((_resolve, reject) => { failStop = reject })
+    const synthetic = new Error('合成 stop 保存失败')
+    const f = await lifecycleFixture(t, kind, async (method, params, options) => {
+      if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false }
+      assert.equal(method, 'query'); requests++
+      run = f.backend.runs.get(params.runId)
+      started()
+      return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => {
+        aborts++
+        assert.equal(run.journalError, synthetic)
+        reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }))
+      }, { once: true }))
+    })
+    f.backend.state.requestStop = () => { stops++; return saveStop }
+    const running = kind === 'query'
+      ? assert.rejects(f.start(), { name: 'AbortError' })
+      : f.start().then(result => assert.equal(result.kind, 'error'))
+    await ready
+    f.controller.abort()
+    assert.equal(stops, 1)
+    assert.equal(run.queryAbort.signal.aborted, false, '停止持久化尚未结算时不提前 abort')
+    failStop(synthetic)
+    await running
+    assert.equal(aborts, 1)
+    assert.equal(requests, 1)
+    assert.equal(f.backend.runs.size, 0)
+    assert.equal(getEventListeners(run.signal, 'abort').length, 0)
+    const saved = f.backend.state.value.sessions[f.agent.id].runs[run.runId]
+    assert.equal(saved.status, kind === 'query' ? 'cancelled' : 'unknown')
+    assert.equal(saved.requiresReview, true)
+  }
 })
 
 test('已确认视觉型号开放原生 read_image，并把校验后的图片工具结果送到 MCP', async (t) => {

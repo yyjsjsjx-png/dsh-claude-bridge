@@ -674,6 +674,34 @@ export class BridgeBackend {
     }).finally(() => run.queryAbort.abort())
   }
 
+  listenForRunStop(run, onStop) {
+    run.signal.addEventListener('abort', onStop, { once: true })
+    if (run.signal.aborted) onStop()
+  }
+
+  async markRunSent(run) {
+    run.signal.throwIfAborted()
+    await this.state.markRunSent(run.agent.id, run.runId)
+    // The caller checks cancellation and marks requestStarted in the same
+    // continuation as the RPC call; returning here adds an async boundary.
+  }
+
+  async detachRun(run, onStop) {
+    await run.stopPersistence
+    if (onStop) run.signal.removeEventListener('abort', onStop)
+    this.runs.delete(run.runId)
+  }
+
+  async finishRunResources(run, requiresReview) {
+    this.retiredRuns.add(run.runId)
+    if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
+    // A saved send intent is not proof of an RPC dispatch: cancellation can
+    // arrive while markRunSent is still being persisted.
+    const status = run.requestStarted ? (run.journalStatus ?? 'unknown') : 'not-sent'
+    await this.state.finishRun(run.agent.id, run.runId, status, requiresReview)
+    await this.diagnostics.flush()
+  }
+
   async recover(agent, confirm, signal) {
     if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { kind: 'error', text: '此命令只用于远程会话。' }
     if (agent.phase?.kind !== 'idle' || typeof agent.runMaintenance !== 'function') {
@@ -716,24 +744,23 @@ export class BridgeBackend {
         }
         const contextPreferences = this.contextRequestPreferences()
         const runId = randomUUID()
-        await this.state.beginRun(agent.id, runId, 'compact')
-        this.verifiedHistory.delete(agent.session)
         const run = { runId, kind: 'compact', agent, signal, queryAbort: new AbortController(), toolQueue: Promise.resolve() }
-        this.runs.set(runId, run)
-        this.sessionStatus(agent, { model: selected.model, runId, phase: 'compacting', connection: 'connected', toolMayHaveExecuted: false })
-        const onStop = () => {
-          this.requestRunStop(run)
-          this.diagnostics.event('compact.stop_requested', { runId, sessionId: agent.id })
-          try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
-          catch { this.diagnostics.event('compact.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
-        }
-        signal.addEventListener('abort', onStop, { once: true })
-        if (signal.aborted) onStop()
-        this.diagnostics.event('compact.started', { runId, sessionId: agent.id })
+        let onStop
+        await this.state.beginRun(agent.id, runId, 'compact')
         try {
+          this.verifiedHistory.delete(agent.session)
+          this.runs.set(runId, run)
+          this.sessionStatus(agent, { model: selected.model, runId, phase: 'compacting', connection: 'connected', toolMayHaveExecuted: false })
+          onStop = () => {
+            this.requestRunStop(run)
+            this.diagnostics.event('compact.stop_requested', { runId, sessionId: agent.id })
+            try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
+            catch { this.diagnostics.event('compact.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
+          }
+          this.listenForRunStop(run, onStop)
+          this.diagnostics.event('compact.started', { runId, sessionId: agent.id })
           await this.checkpoint(agent.session)
-          signal.throwIfAborted()
-          await this.state.markRunSent(agent.id, runId)
+          await this.markRunSent(run)
           signal.throwIfAborted()
           run.requestStarted = true
           const result = await transport.peer.request('query', { action: 'compact', runId,
@@ -769,13 +796,8 @@ export class BridgeBackend {
           this.diagnostics.event('compact.failed', { runId, code: error.code ?? 'COMPACT_FAILED' })
           throw error
         } finally {
-          await run.stopPersistence
-          signal.removeEventListener('abort', onStop)
-          this.runs.delete(runId)
-          this.retiredRuns.add(runId)
-          if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
-          await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'), Boolean(run.journalError))
-          await this.diagnostics.flush()
+          await this.detachRun(run, onStop)
+          await this.finishRunResources(run, Boolean(run.journalError))
         }
       }))
     } catch (error) {
@@ -918,62 +940,62 @@ export class BridgeBackend {
     signal.throwIfAborted()
     const systemPrompt = prepared.renderSystemPrompt()
     timing('prompt_prepared')
-    await this.state.beginRun(agent.id, runId, 'query', { turn, step })
-    this.verifiedHistory.delete(agent.session)
-    timing('journal_prepared')
-    const header = { config: { provider: selected.provider, model: selected.model,
-      ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
-    tools: assembly.tools }
-    agent.session.append('request/header', { header, reason: binding.started ? 'resume' : 'initial' })
-    for (const { message, intent } of agent.systemPrompt.project(systemPrompt, { inHistory: false, startsSeries: true })) {
-      agent.session.append('system/message', { turn, step, message }, intent)
-    }
-    for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
     const steps = new RunStepLifecycle({ agent, phase, turn, step })
     const run = { runId, agent, turn, steps, get step() { return steps.current },
       signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
       compatibility: converted.compatibility,
-      historyGeneration: this.historyGeneration,
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
-    run.progress = createRunProgressReporter({ runId, model: selected.model,
-      isActive: () => this.runs.get(runId) === run && !signal.aborted,
-      readStatus: () => agent._bridgeStatus,
-      writeStatus: patch => this.sessionStatus(agent, patch),
-      writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
-    run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
-      onStarted: () => this.state.markStarted(agent.id),
-      onProgress: event => run.progress.accept(event),
-      onFirstToken: type => timing('first_token', type),
-      onFirstText: () => timing('first_text'),
-      onModelStart: () => steps.modelStart({ signal, tools: run.toolQueue }),
-      onUsage: async message => {
-        const report = { usage: message.usage, usageScope: 'current-turn-main-agent',
-          modelUsage: message.modelUsage, modelUsageScope: 'session-cumulative',
-          total_cost_usd: message.total_cost_usd, costScope: 'session-cumulative-estimate' }
-        await this.state.recordUsage(agent.id, runId, report)
-      } })
-    this.runs.set(runId, run)
-    this.sessionStatus(agent, { model: selected.model, runId, phase: 'running', connection: 'connected', toolMayHaveExecuted: false,
-      compatibility: { model: selected.model, version: 1, tools: converted.compatibility } })
-    run.progress.start()
-    const onStop = () => {
-      this.requestRunStop(run)
-      this.diagnostics.event('run.stop_requested', { runId, sessionId: agent.id })
-      try { run.projection.interrupt() }
-      catch { this.diagnostics.event('run.stop_projection_failed', { runId, code: 'STOP_PROJECTION_FAILED' }) }
-      try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
-      catch { this.diagnostics.event('run.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
-    }
-    signal.addEventListener('abort', onStop, { once: true })
-    if (signal.aborted) onStop()
-    this.diagnostics.event('run.started', { runId, sessionId: agent.id, deviceId: binding.deviceId, stage: 'query' })
-    const startedAt = Date.now()
+    let onStop, startedAt
+    await this.state.beginRun(agent.id, runId, 'query', { turn, step })
     try {
+      this.verifiedHistory.delete(agent.session)
+      timing('journal_prepared')
+      const header = { config: { provider: selected.provider, model: selected.model,
+        ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}) },
+      tools: assembly.tools }
+      agent.session.append('request/header', { header, reason: binding.started ? 'resume' : 'initial' })
+      for (const { message, intent } of agent.systemPrompt.project(systemPrompt, { inHistory: false, startsSeries: true })) {
+        agent.session.append('system/message', { turn, step, message }, intent)
+      }
+      for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
+      run.historyGeneration = this.historyGeneration
+      run.progress = createRunProgressReporter({ runId, model: selected.model,
+        isActive: () => this.runs.get(runId) === run && !signal.aborted,
+        readStatus: () => agent._bridgeStatus,
+        writeStatus: patch => this.sessionStatus(agent, patch),
+        writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
+      run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
+        onStarted: () => this.state.markStarted(agent.id),
+        onProgress: event => run.progress.accept(event),
+        onFirstToken: type => timing('first_token', type),
+        onFirstText: () => timing('first_text'),
+        onModelStart: () => steps.modelStart({ signal, tools: run.toolQueue }),
+        onUsage: async message => {
+          const report = { usage: message.usage, usageScope: 'current-turn-main-agent',
+            modelUsage: message.modelUsage, modelUsageScope: 'session-cumulative',
+            total_cost_usd: message.total_cost_usd, costScope: 'session-cumulative-estimate' }
+          await this.state.recordUsage(agent.id, runId, report)
+        } })
+      this.runs.set(runId, run)
+      this.sessionStatus(agent, { model: selected.model, runId, phase: 'running', connection: 'connected', toolMayHaveExecuted: false,
+        compatibility: { model: selected.model, version: 1, tools: converted.compatibility } })
+      run.progress.start()
+      onStop = () => {
+        this.requestRunStop(run)
+        this.diagnostics.event('run.stop_requested', { runId, sessionId: agent.id })
+        try { run.projection.interrupt() }
+        catch { this.diagnostics.event('run.stop_projection_failed', { runId, code: 'STOP_PROJECTION_FAILED' }) }
+        try { this.sessionStatus(agent, { phase: 'stopping', context: { status: 'unknown' } }) }
+        catch { this.diagnostics.event('run.stop_status_failed', { runId, code: 'STOP_STATUS_FAILED' }) }
+      }
+      this.listenForRunStop(run, onStop)
+      this.diagnostics.event('run.started', { runId, sessionId: agent.id, deviceId: binding.deviceId, stage: 'query' })
+      startedAt = Date.now()
       await this.checkpoint(agent.session)
       signal.throwIfAborted()
       timing('checkpointed')
-      await this.state.markRunSent(agent.id, runId)
+      await this.markRunSent(run)
       signal.throwIfAborted()
       run.requestStarted = true
       timing('request_sent')
@@ -1003,8 +1025,9 @@ export class BridgeBackend {
       run.completed = true
       return { kind: 'completed' }
     } catch (error) {
+      startedAt ??= Date.now()
       if (run.preparationError && !signal.aborted) error = run.preparationError
-      run.progress.close()
+      run.progress?.close()
       if (['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_FLOW_FAILED'].includes(error.code)) {
         this.authentication = error.code === 'AUTH_FLOW_FAILED' ? 'verification-failed' : 'login-required'
       }
@@ -1029,7 +1052,7 @@ export class BridgeBackend {
       }
       await run.toolQueue.catch(() => {})
       await transport.peer.drainNotifications?.().catch(() => {})
-      run.projection.finish({ interrupted: true })
+      run.projection?.finish({ interrupted: true })
       this.sessionStatus(agent, { ...(run.stopState ?? { phase: run.requestStarted && !run.observedOutcome ? 'unknown' : 'failed', toolMayHaveExecuted: run.calls.size > 0 }),
         ...(run.toolOutcomeUnknown ? { toolMayHaveExecuted: true } : {}),
         context: { status: 'unknown' } })
@@ -1039,15 +1062,9 @@ export class BridgeBackend {
         errorName: error.name, durationMs: Date.now() - startedAt })
       throw error
     } finally {
-      await run.stopPersistence
-      signal.removeEventListener('abort', onStop)
-      this.runs.delete(runId)
+      await this.detachRun(run, onStop)
       this.localTiming.finish(runId)
-      this.retiredRuns.add(runId)
-      if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
-      await this.state.finishRun(agent.id, runId, run.journalStatus ?? (run.requestStarted ? 'unknown' : 'not-sent'),
-        Boolean(run.toolOutcomeUnknown || run.journalError))
-      await this.diagnostics.flush()
+      await this.finishRunResources(run, Boolean(run.toolOutcomeUnknown || run.journalError))
       if (run.completed && !signal.aborted && !run.toolOutcomeUnknown && !run.journalError
         && transport === this.connection && run.historyGeneration === this.historyGeneration) {
         this.verifiedHistory.set(agent.session, { transport, generation: this.historyGeneration })
