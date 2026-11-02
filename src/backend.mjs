@@ -32,6 +32,7 @@ import { prepareRequestAssembly, prepareRequestMessages } from './request-prepar
 import { evaluateBridgeCompatibility, bridgeCompatibilityAllowed } from './bridge-compatibility.mjs'
 import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } from './catalog-display.mjs'
 import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.mjs'
+import { RunStepLifecycle } from './step-lifecycle.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const USER_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -928,7 +929,9 @@ export class BridgeBackend {
       agent.session.append('system/message', { turn, step, message }, intent)
     }
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-    const run = { runId, agent, turn, step, signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
+    const steps = new RunStepLifecycle({ agent, phase, turn, step })
+    const run = { runId, agent, turn, steps, get step() { return steps.current },
+      signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
       compatibility: converted.compatibility,
       historyGeneration: this.historyGeneration,
@@ -943,20 +946,7 @@ export class BridgeBackend {
       onProgress: event => run.progress.accept(event),
       onFirstToken: type => timing('first_token', type),
       onFirstText: () => timing('first_text'),
-      onModelStart: async () => {
-        if (signal.aborted) return
-        if (!run.modelStarted) { run.modelStarted = true; return run.step }
-        if (run.stepPrepared) { run.stepPrepared = false; return run.step }
-        await run.toolQueue
-        if (signal.aborted) return
-        agent.session.append('step/end', { turn, step: run.step })
-        agent._bridgeStepOpen = false
-        run.step++
-        phase.step = run.step
-        agent.session.append('step/start', { turn, step: run.step })
-        agent._bridgeStepOpen = true
-        return run.step
-      },
+      onModelStart: () => steps.modelStart({ signal, tools: run.toolQueue }),
       onUsage: async message => {
         const report = { usage: message.usage, usageScope: 'current-turn-main-agent',
           modelUsage: message.modelUsage, modelUsageScope: 'session-cumulative',
@@ -1074,16 +1064,14 @@ export class BridgeBackend {
     signal.throwIfAborted()
     if (run.preparationError) throw run.preparationError
     if (run.concluded || run.inputClosed) return { continue: false }
-    const { agent, turn } = run
+    const { agent } = run
     if (typeof agent.preStep !== 'function') throw failure('DSH_PRE_STEP_UNAVAILABLE', '当前 DSH 未提供所需的步骤准备接口。')
     const pending = [...agent.inbox.nextStep]
     let decision
     let accepted = false
     try {
       // DSH waits for nested instruction projections at its native step boundary.
-      agent.session.append('step/end', { turn, step: run.step })
-      agent._bridgeStepOpen = false
-      decision = await agent.preStep('next-step', { turn, step: run.step + 1 })
+      decision = await agent.preStep('next-step', run.steps.beginPreparation())
       signal.throwIfAborted()
       if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
       const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent), run.catalogModels)
@@ -1112,12 +1100,7 @@ export class BridgeBackend {
       signal.throwIfAborted()
       if (run.inputClosed) throw failure('USER_INPUT_CLOSED', '当前运行已结束接收插话，未发送消息已保留。')
       for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-      run.step++
-      agent.phase.step = run.step
-      agent.session.append('step/start', { turn, step: run.step })
-      agent._bridgeStepOpen = true
-      run.stepPrepared = true
-      run.projection.advanceStep(run.step)
+      run.projection.advanceStep(run.steps.completePreparation())
       accepted = true
       this.diagnostics.event('step.prepared', { runId: run.runId, stage: 'pre-step' })
       return { ...(additionalContexts.length ? { additionalContexts } : {}),
