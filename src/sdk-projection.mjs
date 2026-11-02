@@ -36,6 +36,15 @@ export class SdkProjection {
     this.usageReported = false
   }
 
+  advanceStep(step) {
+    this.step = step
+  }
+
+  getCommittedToolCall(id) {
+    const call = this.committedToolCalls.get(id)
+    return call && { ...call }
+  }
+
   emit(frame) {
     const revision = (revisions.get(this.agent) ?? 0) + 1
     revisions.set(this.agent, revision)
@@ -292,7 +301,7 @@ export class SdkProjection {
     this.startedModelIds.add(key)
     this.modelResponses++
     const step = await this.onModelStart?.(id)
-    if (step !== undefined) this.step = step
+    if (step !== undefined) this.advanceStep(step)
     this.currentResponse = { id, turn: this.turn, step: this.step }
     this.responses.set(key, this.currentResponse)
     this.responseTiming.responseStarted({ responseId: id, step: this.step, ...timing })

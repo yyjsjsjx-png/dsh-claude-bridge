@@ -132,12 +132,12 @@ test('实际 rc5 helper：工具使用最终 SDK 参数登记，Unicode 流式�
   await projection.accept({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
   await projection.accept({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 12 } } })
   await projection.accept({ type: 'stream_event', event: { type: 'message_stop' } })
-  assert.equal(projection.committedToolCalls.has('toolu_unicode'), false)
+  assert.equal(projection.getCommittedToolCall('toolu_unicode'), undefined)
   assert.equal(records.filter(record => record.type === 'assistant/message').length, 0)
   await projection.accept({ type: 'assistant', message: { id: 'canonical-tool', content: [
     { type: 'tool_use', id: 'toolu_unicode', name: 'mcp__dsh__local_command', input: canonical },
   ] } })
-  assert.deepEqual(JSON.parse(projection.committedToolCalls.get('toolu_unicode').arguments), canonical)
+  assert.deepEqual(JSON.parse(projection.getCommittedToolCall('toolu_unicode').arguments), canonical)
   const committed = records.find(record => record.type === 'assistant/message')
   assert.deepEqual(JSON.parse(committed.data.message.content[0].arguments), canonical)
   assert.deepEqual(committed.data.stream, [])
@@ -314,7 +314,7 @@ test('实际 rc5 helper：SDK tool_use 投影为可关联的 assistant tool-call
   assert.equal(call?.id, 'toolu_test')
   assert.equal(call?.name, 'local_smoke')
   assert.deepEqual(JSON.parse(call.arguments), { command: 'pwd' })
-  assert.deepEqual(projection.committedToolCalls.get('toolu_test'), { name: 'local_smoke', arguments: call.arguments })
+  assert.deepEqual(projection.getCommittedToolCall('toolu_test'), { name: 'local_smoke', arguments: call.arguments })
 })
 
 test('实际 rc5 helper：流式文本与工具参数共同形成有序 assistant 块', { skip: !available }, async () => {
@@ -679,6 +679,6 @@ test('实际rc5：权威工具消息补齐残缺或改变的原始参数时，�
     assert.equal(view.tpsSamples, 0)
     assert.equal(view.incompleteCaptures, 1)
     assert.equal(f.records.filter(e => e.type === 'assistant/message').length, 1)
-    assert.deepEqual(JSON.parse(projection.committedToolCalls.get('input-call').arguments), { command: 'complete' })
+    assert.deepEqual(JSON.parse(projection.getCommittedToolCall('input-call').arguments), { command: 'complete' })
   }
 })

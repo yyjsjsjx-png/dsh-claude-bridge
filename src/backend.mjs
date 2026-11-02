@@ -1155,7 +1155,7 @@ export class BridgeBackend {
       agent.session.append('step/start', { turn, step: run.step })
       agent._bridgeStepOpen = true
       run.stepPrepared = true
-      run.projection.step = run.step
+      run.projection.advanceStep(run.step)
       accepted = true
       this.diagnostics.event('step.prepared', { runId: run.runId, stage: 'pre-step' })
       return { ...(additionalContexts.length ? { additionalContexts } : {}),
@@ -1185,7 +1185,7 @@ export class BridgeBackend {
     if (!run || !run.toolNames.has(params.name) || typeof params.callId !== 'string') {
       throw failure('UNADMITTED_TOOL', '工具不属于当前运行的能力集合。')
     }
-    const advertised = run.projection.committedToolCalls.get(params.callId)
+    const advertised = run.projection.getCommittedToolCall(params.callId)
     if (!advertised || advertised.name !== params.name) throw failure('TOOL_EVENT_UNCOMMITTED', '工具调用尚未在本地历史中登记，未执行。')
     let parsed
     try { parsed = JSON.parse(advertised.arguments) } catch { throw failure('TOOL_ARGUMENTS_INVALID', '模型声明的工具参数不是有效 JSON，未执行。') }
