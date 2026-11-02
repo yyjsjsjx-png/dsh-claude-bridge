@@ -179,27 +179,35 @@ function compactTokens(value) {
           : React.createElement('p', { style: { margin: '8px 0 0' } }, '完成一轮对话后更新。')), document.body));
   }
 
-  /** Read-only child label: lastUsed is folded from request/header, while next
-   * may still be an unsent selection. Catalog names never authorize execution. */
-  function ChildModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
+  /** Requested selection and per-response SDK evidence are independent. */
+  function SessionModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
     const bridge = useProjection('claudeBridge');
     const selected = useProjection('modelSelection')?.lastUsed;
+    const observation = useProjection('claudeBridgeModelObservation')?.current;
     const session = useSession(value => value);
     const summary = useSessions(value => value)?.byId?.[sessionId];
     const directory = useModelDirectory(value => value);
-    if (bridge == null || (session?.subagent == null && summary?.origin !== 'subagent')) return null;
+    if (bridge == null) return null;
+    const child = session?.subagent != null || summary?.origin === 'subagent';
     const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
+    const actual = known && observation?.requestedModel === selected.model ? observation?.actualModel : null;
+    if (!child && !actual) return null;
     const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
       ?.find(row => row.id === selected.model) : undefined;
     const name = model?.name || (known ? selected.model : '型号待确认');
     const effort = known ? selected.reasoningEffort || '模型默认' : '强度待确认';
-    const title = known
-      ? `此子代理最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
+    const requestTitle = known
+      ? `最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
       : '此子代理尚无原生 request/header；不会用父选型或待发送选型代替。';
+    const title = `${requestTitle}\n${actual
+      ? `本响应 SDK 返回型号：${actual}；来源：${observation.source}；响应：${observation.responseId ?? '未提供 ID'}。\n型号别名展开或字符串差异不等于降级；SDK 未报告实际思考等级。`
+      : '本响应尚无 SDK 返回型号；不会用请求配置、初始化信息或旧响应代替。'}`;
+    const text = `${child ? `${name} · ${effort}` : ''}${actual ? `${child ? ' ｜ ' : ''}SDK 返回：${actual}` : ''}`;
     return React.createElement('span', { className: 'dsh-claude-child-model', role: 'status', title,
-      'aria-label': `子代理请求型号 ${name}，思考强度 ${effort}`,
+      'aria-label': `${child ? `子代理请求型号 ${name}，请求思考强度 ${effort}。` : ''}${actual ? `本响应 SDK 返回型号 ${actual}` : ''}`,
       style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #666)',
-        maxWidth: '320px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, `${name} · ${effort}`);
+        minWidth: 0, maxWidth: '320px', flexShrink: 1,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, text);
   }
 
   function QuotaMeter({ useBridgeStatus, useQuota, readQuota }) {
@@ -362,5 +370,5 @@ function compactTokens(value) {
               : new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
-  return { SessionMeter, QuotaMeter, ChildModelBadge };
+  return { SessionMeter, QuotaMeter, SessionModelBadge };
 }

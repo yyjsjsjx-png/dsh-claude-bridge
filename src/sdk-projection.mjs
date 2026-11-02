@@ -7,6 +7,7 @@ import { contextSnapshot } from './context-usage.mjs'
 import { RESPONSE_USAGE_RECORD, RUN_USAGE_RECORD, responseUsageFromSdk } from './response-usage.mjs'
 import { createResponseTimingTracker, RESPONSE_TIMING_RECORD } from './response-timing.mjs'
 import { observeResponseTiming } from './sdk-response-timing.mjs'
+import { MODEL_OBSERVATION_RECORD, sdkModelName } from './model-observation.mjs'
 
 // DSH followers require dense revisions across the attached Agent lifecycle,
 // including a stopped query followed by a fresh projection for the next turn.
@@ -17,6 +18,7 @@ export class SdkProjection {
   constructor({ agent, helpers, turn, step, model, runId, timingNow, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText }) {
     Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText })
     this.runId = runId ?? `turn:${turn}:step:${step}`
+    this.requestedModel = model
     this.startStep = step
     this.timingNow = timingNow ?? (() => performance.now())
     this.responseTiming = createResponseTimingTracker({ runId: this.runId, turn, now: this.timingNow,
@@ -98,6 +100,7 @@ export class SdkProjection {
         await this.modelStart(this.messageId, message.parent_tool_use_id == null
           ? { at: receivedAt, streamStarted: true } : {})
         if (this.interrupted) return
+        if (message.parent_tool_use_id == null) this.observeModel(event.message?.model, 'sdk-message-start')
         this.streamUsage = event.message?.usage
         this.streamUsageFinal = false
         this.streamResponse = this.currentResponse
@@ -164,10 +167,13 @@ export class SdkProjection {
       if (isNoResponsePlaceholder(message.message)) return
       const content = message.message?.content
       if (!Array.isArray(content)) return
-      this.messageId = message.message?.id ?? this.messageId
+      const id = message.message?.id ?? this.messageId
+      // Settle the previous response using its own model before switching ids.
+      if (this.messageId != null && id !== this.messageId && this.active) this.finish({ usage: this.confirmedUsage() })
+      this.messageId = id
       await this.modelStart(this.messageId)
       if (this.interrupted) return
-      if (typeof message.message.model === 'string') this.model = message.message.model
+      if (message.parent_tool_use_id == null) this.observeModel(message.message.model, 'sdk-assistant')
       // Partial JSON is for display. The final SDK input is the authority for
       // execution, including escaped Unicode and other normalization details.
       // Never advertise a streamed tool before this final input is available.
@@ -293,6 +299,7 @@ export class SdkProjection {
     const key = id ?? 'unidentified-response'
     if (this.startedModelIds.has(key)) {
       this.currentResponse = this.responses.get(key)
+      this.model = this.currentResponse.actualModel ?? this.requestedModel
       this.responseTiming.responseStarted({ responseId: id, step: this.currentResponse.step, ...timing })
       return
     }
@@ -302,9 +309,25 @@ export class SdkProjection {
     this.modelResponses++
     const step = await this.onModelStart?.(id)
     if (step !== undefined) this.advanceStep(step)
-    this.currentResponse = { id, turn: this.turn, step: this.step }
+    this.model = this.requestedModel
+    this.currentResponse = { id, turn: this.turn, step: this.step, actualModel: null }
     this.responses.set(key, this.currentResponse)
     this.responseTiming.responseStarted({ responseId: id, step: this.step, ...timing })
+  }
+
+  observeModel(value, source) {
+    const response = this.currentResponse
+    if (!response) return
+    // A full block message can omit model after message_start already supplied
+    // it. Only a new response resets to unknown; never inherit another id.
+    const actual = sdkModelName(value) ?? response.actualModel
+    response.actualModel = actual
+    this.model = actual ?? this.requestedModel
+    if (response.recordedModel === actual) return
+    this.helpers.appendPluginRecord(this.agent.session, MODEL_OBSERVATION_RECORD, { version: 1,
+      runId: this.runId, responseId: sdkModelName(response.id), turn: response.turn, step: response.step,
+      requestedModel: this.requestedModel, actualModel: actual, source: actual === null ? null : source })
+    response.recordedModel = actual
   }
 
   confirmedUsage() {

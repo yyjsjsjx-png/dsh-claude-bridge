@@ -47,6 +47,7 @@ import { createSessionStatusProjection } from '../src/session-status.mjs';
 import { createRunProgressProjection } from '../src/run-progress.mjs';
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
+import { createModelObservationProjection } from '../src/model-observation.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
@@ -132,6 +133,7 @@ let ClaudeBridgeService = (() => {
             ctx.sessionProjections.register(createRunProgressProjection(z));
             ctx.sessionProjections.register(createResponseUsageProjection(z));
             ctx.sessionProjections.register(createResponseTimingProjection(z));
+            ctx.sessionProjections.register(createModelObservationProjection(z));
             const backend = this.backend;
             const adapter = new ClaudeCatalogAdapter(backend, ctx);
             this.catalogAdapter = adapter;

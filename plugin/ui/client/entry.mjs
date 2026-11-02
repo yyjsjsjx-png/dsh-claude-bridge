@@ -134,7 +134,7 @@ exports.apply = async function apply(ctx) {
     onAuthenticationRequired: settings.authenticationRequired });
   const picker = createPickerController({ rpc, workspaces: ctx.workspaces, sessions: ctx.sessions,
     uiWorkspace: ctx.uiWorkspace, createStore, textError });
-  const { SessionMeter, QuotaMeter, ChildModelBadge } = createMeterViews({ React, createPortal,
+  const { SessionMeter, QuotaMeter, SessionModelBadge } = createMeterViews({ React, createPortal,
     useAnchoredPosition, useDismissOnOutsidePointer });
   const { MenuItem, HeroButton, Picker, Settings } = createFormViews({ React });
   const historyTasks = new Map();
@@ -181,7 +181,7 @@ exports.apply = async function apply(ctx) {
       try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
       return { sessionId, hooks: { modelDirectory: directory ?? ABSENT_STATUS } };
     },
-  }, ChildModelBadge));
+  }, SessionModelBadge));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,

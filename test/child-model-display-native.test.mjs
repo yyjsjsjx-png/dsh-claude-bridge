@@ -23,9 +23,10 @@ test('实际rc5原生modelSelection：child请求头重放与待发送选型隔�
     provider: 'claude-sdk-remote', model: 'sonnet', reasoningEffort: 'high' } } })
   session.append('model/selection', { provider: 'claude-sdk-remote', model: 'haiku', reasoningEffort: 'low' })
   const replay = () => projection.wire.view(session.snapshotEvents().reduce(projection.apply, projection.init(session.header)))
-  const { ChildModelBadge } = createMeterViews({ React: { createElement: (type, props, ...children) => ({ type, props, children }) } })
-  const render = () => ChildModelBadge({ sessionId: session.id,
-    useProjection: key => key === 'claudeBridge' ? { model: 'haiku' } : replay(), useSession: select => select({}),
+  const { SessionModelBadge } = createMeterViews({ React: { createElement: (type, props, ...children) => ({ type, props, children }) } })
+  const render = () => SessionModelBadge({ sessionId: session.id,
+    useProjection: key => ({ claudeBridge: { model: 'haiku' }, modelSelection: replay(),
+      claudeBridgeModelObservation: null })[key], useSession: select => select({}),
     useSessions: select => select({ byId: { [session.id]: { origin: session.header.origin } } }),
     useModelDirectory: select => select({ groups: [{ id: 'claude-sdk-remote', models: [{ id: 'sonnet', name: 'Sonnet 5.5' }] }] }),
   })

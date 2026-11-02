@@ -13,6 +13,7 @@ import { SdkProjection } from '../src/sdk-projection.mjs'
 import { HISTORY_ASSISTANT } from '../src/history-records.mjs'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 import { RESPONSE_TIMING_RECORD, createResponseTimingProjection } from '../src/response-timing.mjs'
+import { MODEL_OBSERVATION_RECORD, createModelObservationProjection } from '../src/model-observation.mjs'
 
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
 // The ordinary Node test suite skips these cases if its ASAR reader is absent.
@@ -89,7 +90,7 @@ test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订�
       if (result.value.type === 'event') {
         const event = result.value.event
         assert.equal(event.seq, cursor + 1)
-        assert.equal(event.type, RESPONSE_TIMING_RECORD)
+        assert.ok([RESPONSE_TIMING_RECORD, MODEL_OBSERVATION_RECORD].includes(event.type))
         assert.equal(event.ignorable, true)
         cursor = event.seq
         const decision = client.acceptDurable(result.value)
@@ -110,7 +111,7 @@ test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订�
   const first = await nextFrame()
   assert.equal(first.frame.type, 'start')
   assert.equal(first.frame.startedAfterSeq, cursor)
-  assert.equal(metadataEvents, 1)
+  assert.equal(metadataEvents, 2)
   await nextFrame()
   for (const text of ['合成第一段', '合成第二段']) {
     await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })
@@ -159,6 +160,64 @@ async function fixture() {
   const projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'haiku', async onUsage() {} })
   return { records, frames, projection, agent, helpers }
 }
+
+test('实际rc5型号归属：message_stop提前落盘使用本响应型号，缺失不沿用，独立观察可严格重放',
+  { skip: !available }, async () => {
+    const native = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+    const { z } = await import(resolveDshModule('zod'))
+    const helpers = { ...await import('../plugin/compat/runtime.mjs'), appendPluginRecord: native.appendPluginRecord }
+    const id = 'model-observation-native'
+    const session = native.Session.create(id, undefined, { version: native.SESSION_FORMAT_VERSION,
+      id, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+    session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
+    const request = { type: 'request/header', data: { reason: 'initial', header: {
+      config: { provider: 'claude-sdk-remote', model: 'haiku', reasoningEffort: 'high' } } } }
+    session.append(request.type, request.data)
+    const projection = new SdkProjection({ agent: { id, session, dispatch: { emit() {} } },
+      helpers, turn: 1, step: 1, model: 'haiku', runId: 'model-run' })
+    const stream = event => projection.accept({ type: 'stream_event', event })
+    const beginText = async (id, model, text) => {
+      await stream({ type: 'message_start', message: { id, ...(model ? { model } : {}), usage: { input_tokens: 1 } } })
+      await stream({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
+      await stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })
+      await stream({ type: 'content_block_stop', index: 0 })
+    }
+    const stop = async () => {
+      await stream({ type: 'message_delta', usage: { output_tokens: 1 } })
+      await stream({ type: 'message_stop' })
+    }
+    const models = () => session.snapshotEvents().filter(e => e.type === 'assistant/message').map(e => e.data.message.source.model)
+    const evidence = () => session.snapshotEvents().filter(e => e.type === MODEL_OBSERVATION_RECORD).map(e => e.data)
+    await projection.accept({ type: 'system', subtype: 'init', model: 'init-is-not-evidence' })
+    await projection.accept({ type: 'assistant', message: { id: 'synthetic', model: '<synthetic>',
+      content: [{ type: 'text', text: 'No response requested.' }] } })
+    assert.equal(evidence().length, 0)
+    await beginText('response-a', 'wire-a', '合成A'); await stop()
+    assert.deepEqual(models(), ['wire-a']) // Already durable before final assistant.
+    await projection.accept({ type: 'assistant', message: { id: 'response-a', content: [{ type: 'text', text: '合成A' }] } })
+    assert.equal(evidence().length, 1) // Missing field on same response retains its evidence.
+    await beginText('response-b', undefined, '合成B'); await stop()
+    assert.deepEqual(models(), ['wire-a', 'haiku']) // Native mandatory source uses requested fallback, never wire-a.
+    assert.equal(evidence().at(-1).actualModel, null)
+    await projection.accept({ type: 'assistant', message: { id: 'response-b', model: 'wire-b', content: [{ type: 'text', text: '合成B' }] } })
+    assert.equal(evidence().at(-1).actualModel, 'wire-b') // Late evidence is independent of already-committed text.
+    await beginText('response-c', 'wire-c', '合成C')
+    await projection.accept({ type: 'assistant', message: { id: 'response-d', model: 'wire-d', content: [{ type: 'text', text: '合成D' }] } })
+    await projection.accept({ type: 'result' })
+    assert.deepEqual(models(), ['wire-a', 'haiku', 'wire-c', 'wire-d'])
+    session.append('step/end', { turn: 1, step: 1 }); session.append('turn/end', { turn: 1 })
+    await strictSession(session)
+    const restored = native.Session.create(id, session.snapshotEvents(), session.header)
+    const observer = createModelObservationProjection(z)
+    const state = restored.snapshotEvents().reduce(observer.apply, observer.init(restored.header))
+    observer.stateSchema.parse(state); observer.wire.viewSchema.parse(observer.wire.view(state))
+    assert.equal(state.current.actualModel, 'wire-d')
+    assert.equal(state.current.requestedModel, 'haiku')
+    assert.equal(state.current.source, 'sdk-assistant')
+    assert.equal(observer.apply(state, request).current, null) // Same requested alias, new run: no stale actual.
+    assert.equal(observer.init({ agentPreset: 'standard' }), null)
+    assert.equal(observer.apply(null, { type: MODEL_OBSERVATION_RECORD, ignorable: true, data: {} }), null)
+  })
 
 test('实际 rc5 Backend：批次预准备步骤复用同 ID 流和完整快照，最终步骤由原生循环闭合后可严格重载',
   { skip: !available }, async t => {
