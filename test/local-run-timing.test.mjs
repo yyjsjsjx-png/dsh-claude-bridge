@@ -2,8 +2,18 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { PassThrough } from 'node:stream'
 import { createRpcPeer } from '../src/rpc.mjs'
-import { createLocalRunTiming } from '../src/local-run-timing.mjs'
+import { createLocalRunTiming, startLocalRunPhase } from '../src/local-run-timing.mjs'
 import { retainedPlanUsage } from '../src/observability-plan-usage.mjs'
+
+test('运行分段以单调时钟记录独立区间，观察失败不替换业务异常', () => {
+  let clock = 10
+  const rows = []
+  const finish = startLocalRunPhase({ runId: 'run-phase', stage: 'tool_pipeline', callId: 'tool-phase',
+    now: () => clock, onTiming: row => { rows.push(row); throw new Error('private diagnostic error') } })
+  const original = new Error('business failure')
+  assert.throws(() => { try { clock = 35; throw original } finally { finish() } }, error => error === original)
+  assert.deepEqual(rows, [{ runId: 'run-phase', stage: 'tool_pipeline', callId: 'tool-phase', durationMs: 25 }])
+})
 
 test('本机计时在RPC通知排队前观察有效思考，排除头帧与重放', async () => {
   let clock = 10, release

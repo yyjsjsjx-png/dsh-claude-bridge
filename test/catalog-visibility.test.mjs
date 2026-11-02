@@ -6,6 +6,25 @@ import { tmpdir } from 'node:os';
 
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES);
 
+test('实际 rc5 服务：客户端计时仅owner可写，普通会话不采集，未知字段拒绝', { skip: !available }, async () => {
+  const { ClaudeBridgeService } = await import('../plugin/index.mjs');
+  const rows = [], denied = new Error('owner required');
+  const service = { assertOwner() { throw denied; },
+    ctx: { sessions: { get: id => ({ header: { agentPreset: id === 'r' ? 'claude-sdk-remote' : 'native' } }) } },
+    backend: { diagnostics: { event: (...args) => rows.push(args) } } };
+  const value = { version: 1, sessionId: 'r', requestId: 'one', metric: 'submission', quality: 'precise',
+    durationMs: 0, source: 'client-session-receive', clock: 'client-monotonic' };
+  await assert.rejects(ClaudeBridgeService.prototype.recordClientTiming.call(service, value), e => e === denied);
+  assert.equal(rows.length, 0);
+  service.assertOwner = () => {};
+  assert.deepEqual(await ClaudeBridgeService.prototype.recordClientTiming.call(service, value), { recorded: true });
+  assert.deepEqual(await ClaudeBridgeService.prototype.recordClientTiming.call(service, { ...value, sessionId: 'n' }),
+    { recorded: false, reason: 'not-remote' });
+  await assert.rejects(ClaudeBridgeService.prototype.recordClientTiming.call(service, { ...value, text: 'PRIVATE' }),
+    error => error.code === 'claude-bridge/invalid-client-timing');
+  assert.equal(rows.length, 1);
+});
+
 test('实际 rc5 服务：状态返回同一份 Host 检查，不把启动探针当作实测验收', { skip: !available }, async () => {
   const { ClaudeBridgeService } = await import('../plugin/index.mjs');
   const { assertDshCompatibility } = await import('../plugin/compat/resolve-dsh-module.mjs');

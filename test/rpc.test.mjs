@@ -226,3 +226,38 @@ test('诊断仅包含元数据，记录失败不会影响正常请求', async (t
   assert.ok(records.some((record) => record.event === 'rpc_handler_failed' && record.code === -32000))
   assert.doesNotMatch(JSON.stringify(records), /PRIVATE_REQUEST_BODY|PRIVATE_HANDLER_BODY/)
 })
+
+test('RPC耗时按运行和阶段聚合流帧，等待通知尾部但不阻塞query，诊断失败不改变结果', async t => {
+  const input = new PassThrough(), output = new PassThrough(), rows = []
+  const gate = deferred(), started = deferred()
+  let sent
+  output.on('data', frame => { sent = JSON.parse(frame) })
+  const peer = createRpcPeer({ input, output, onDiagnostic: row => {
+    rows.push(row)
+    if (row.event === 'perf.rpc') throw new Error('PRIVATE_DIAGNOSTIC_FAILURE')
+  }, onNotification: async () => { started.resolve(); await gate.promise } })
+  t.after(() => { gate.resolve(); peer.close(); input.destroy(); output.destroy() })
+  const pending = peer.request('query', { runId: 'run-timing', prompt: 'PRIVATE_PROMPT' })
+  const line = JSON.stringify({ jsonrpc: '2.0', method: 'sdk.message', params: {
+    runId: 'run-timing', message: { text: 'PRIVATE_中文_CONTENT' } } }) + '\n'
+  for (let index = 0; index < 100; index++) input.write(line)
+  await started.promise
+  input.write(JSON.stringify({ jsonrpc: '2.0', id: sent.id, result: { status: 'completed' } }) + '\n')
+  assert.deepEqual(await pending, { status: 'completed' })
+  assert.equal(rows.filter(row => row.event === 'perf.rpc').length, 0)
+  gate.resolve(); await peer.drainNotifications(); await Promise.resolve()
+  const metrics = rows.filter(row => row.event === 'perf.rpc')
+  assert.equal(metrics.length, 6)
+  for (const stage of ['encode', 'write', 'receive']) {
+    const row = metrics.find(row => row.method === 'query' && row.stage === stage)
+    assert.equal(row.samples, 1); assert.equal(row.requestId, sent.id)
+    assert.equal(row.runId, 'run-timing'); assert.ok(row.bytes > 0)
+  }
+  for (const stage of ['receive', 'notification_wait', 'notification_handle']) {
+    const row = metrics.find(row => row.method === 'sdk.message' && row.stage === stage)
+    assert.equal(row.samples, 100)
+    assert.equal(row.bytes, 100 * Buffer.byteLength(line))
+    assert.ok(row.durationMs >= row.maxMs && row.maxMs >= 0)
+  }
+  assert.doesNotMatch(JSON.stringify(metrics), /PRIVATE|中文|prompt|message\":/)
+})

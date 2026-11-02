@@ -21,6 +21,7 @@ import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
+import { createClientTimingRecorder } from '../src/client-timing-diagnostics.mjs';
 
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
@@ -200,6 +201,23 @@ export class ClaudeBridgeService extends TypertRemoteService {
     if (!agent?.session) throw new RemoteError('claude-bridge/invalid-session', '无法解析会话智能体。', {});
     if (agent.session.header.agentPreset !== CLAUDE_PRESET) return { status: 'not-remote' };
     return this.backend.syncSession(agent);
+  }
+
+  @Remote('recordClientTiming')
+  async recordClientTiming(value) {
+    this.assertOwner();
+    this.clientTimingRecorder ??= createClientTimingRecorder({
+      isRemoteSession: id => (this.ctx.sessions.get(id) ?? this.ctx.agents.get(id)?.session)
+        ?.header.agentPreset === CLAUDE_PRESET,
+      record: (event, fields) => this.backend.diagnostics.event(event, fields),
+    });
+    try { return this.clientTimingRecorder(value); }
+    catch (error) {
+      if (error.code === 'INVALID_CLIENT_TIMING') {
+        throw new RemoteError('claude-bridge/invalid-client-timing', '客户端耗时诊断格式无效。', {});
+      }
+      throw error;
+    }
   }
 
   @Remote('refreshCatalog')

@@ -10,6 +10,7 @@ import { COMPRESSION, encodeFrame, decodeFrame, compressedFrameSize } from '../s
 import { RECOVERY_PROTOCOL, createReplayBuffer, validatePriorityCancels } from '../src/replay-buffer.mjs'
 import { createObservabilityHost } from './observability-host.mjs'
 import { SocketAttempt, WorkerSocketLease } from './socket-lifecycle.mjs'
+import { networkNow as defaultNetworkNow, networkPongTiming, readNetworkTime } from '../src/network-timing.mjs'
 
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
@@ -69,6 +70,7 @@ export async function createBridgeServer({
   executable = process.execPath,
   onDiagnostic,
   observability,
+  networkNow = defaultNetworkNow,
 } = {}) {
   const uid = getUid()
   if (!Number.isSafeInteger(uid) || uid <= 0) throw new Error('远端服务必须由非 root 用户运行')
@@ -94,7 +96,7 @@ export async function createBridgeServer({
   integer(heartbeatTimeoutMs, 'heartbeatTimeoutMs')
   if (heartbeatTimeoutMs <= heartbeatMs) throw new RangeError('心跳等待时间无效')
   if (forceKillMs <= stopGraceMs || stopTimeoutMs <= forceKillMs) throw new RangeError('停止等待时间无效')
-  if (typeof spawnImpl !== 'function' || typeof loadToken !== 'function' || typeof killGroup !== 'function') {
+  if (typeof spawnImpl !== 'function' || typeof loadToken !== 'function' || typeof killGroup !== 'function' || typeof networkNow !== 'function') {
     throw new TypeError('服务依赖无效')
   }
   if (onDiagnostic !== undefined && typeof onDiagnostic !== 'function') throw new TypeError('onDiagnostic 必须是函数')
@@ -471,6 +473,7 @@ export async function createBridgeServer({
     socket.on('close', () => detach(state, attempt))
     socket.on('message', (data, isBinary) => {
       if (state.stopPromise || !state.lease.isCurrent(attempt)) return
+      const receivedAt = readNetworkTime(networkNow)
       attempt.heard()
       let bytes
       try { bytes = Buffer.isBuffer(data) ? data : Buffer.from(data) }
@@ -559,7 +562,11 @@ export async function createBridgeServer({
           }
           if (!state.recoverable || !state.recoveryReady) return disconnect(state, 1002)
           if (control.type === 'recovery.release') return disconnect(state, 1000)
-          if (control.type === 'recovery.ping') { sendControl(state, { type: 'recovery.pong', protocol: 1 }); return }
+          if (control.type === 'recovery.ping') {
+            const timing = networkPongTiming(control.timing, receivedAt, readNetworkTime(networkNow))
+            sendControl(state, { type: 'recovery.pong', protocol: 1, ...(timing ? { timing } : {}) })
+            return
+          }
           if (control.type === 'recovery.ack') {
             try {
               if (!Number.isSafeInteger(control.ack) || control.ack < 0) throw new Error('游标无效')

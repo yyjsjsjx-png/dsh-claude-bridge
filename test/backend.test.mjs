@@ -1020,6 +1020,13 @@ test('pending 模型优先，重复 callId 只执行一次并记录关联结果'
   assert.equal(f.records[callIndex].data.arguments, '{\n  "command": "pwd"\n}')
   assert.equal(result.data.message.source.callId, 'toolu_test')
   assert.deepEqual(result.intent.sourceEventSeqs, [callIndex + 1])
+  await f.backend.diagnostics.flush()
+  const phases = (await readFile(f.backend.diagnostics.path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    .filter(row => row.event === 'perf.local' && ['tool_total', 'tool_pipeline', 'run_finalize'].includes(row.stage))
+  assert.equal(phases.length, 3)
+  assert.ok(phases.every(row => row.runId === request.runId && row.durationMs >= 0))
+  assert.deepEqual(phases.filter(row => row.callId === 'toolu_test').map(row => row.stage), ['tool_pipeline', 'tool_total'])
+  assert.ok(phases.find(row => row.stage === 'tool_total').durationMs >= phases.find(row => row.stage === 'tool_pipeline').durationMs)
 })
 
 test('取消后等待远端 settle 与已启动的本机工具 drain', async (t) => {

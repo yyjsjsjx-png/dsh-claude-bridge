@@ -203,6 +203,27 @@ test('新 Host 只回收已断开且同设备的旧 worker，新 worker 不伪�
   assert.notEqual(reply.recovery.id, oldId)
 })
 
+test('新服务为恢复ping附服务端接收发送时间，旧及无效扩展仍是普通pong', async t => {
+  let clock = 1000
+  const { wss, token, workers } = await setup(t, { serverOptions: { networkNow: () => (clock += 2) } })
+  const socket = authenticate(wss, token)
+  const id = JSON.parse(socket.sent[0]).recovery.id
+  const ready = new Promise(resolve => socket.once('sent', resolve))
+  socket.message(JSON.stringify({ type: 'recovery.negotiate', protocol: 1, id, ack: 0, cancelIds: [] }))
+  await ready
+  clock = 2000
+  socket.message(JSON.stringify({ type: 'recovery.ping', protocol: 1,
+    timing: { version: 1, probeId: 3, t1: 1500, body: 'PRIVATE' } }))
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)), { type: 'recovery.pong', protocol: 1,
+    timing: { version: 1, probeId: 3, t1: 1500, t2: 2002, t3: 2004 } })
+  for (const timing of [undefined, { version: 2, probeId: 3, t1: 1500 }, { version: 1, probeId: 3, t1: 'PRIVATE' }]) {
+    socket.message(JSON.stringify({ type: 'recovery.ping', protocol: 1, ...(timing ? { timing } : {}) }))
+    assert.deepEqual(JSON.parse(socket.sent.at(-1)), { type: 'recovery.pong', protocol: 1 })
+  }
+  assert.equal(socket.readyState, 1)
+  assert.equal(workers[0].finished, false)
+})
+
 test('连续恢复后旧 socket 事件和旧握手截止时间不停止新连接或释放设备', async t => {
   const { wss, workers, token, diagnostics } = await setup(t, { serverOptions: { authTimeoutMs: 100 } })
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 })

@@ -4,6 +4,7 @@ import { setTimeout as wait } from 'node:timers/promises'
 import { urlContainsToken, validateConnectionToken, validateDeviceId, validateServerUrl } from './connection-settings.mjs'
 import { COMPRESSION, encodeFrame, decodeFrame, compressedFrameSize } from './websocket-compression.mjs'
 import { RECOVERY_PROTOCOL, createReplayBuffer } from './replay-buffer.mjs'
+import { createNetworkProbe, networkNow as defaultNetworkNow, readNetworkTime } from './network-timing.mjs'
 
 export class WebSocketTransportError extends Error {
   constructor(code, message) { super(message); this.name = 'WebSocketTransportError'; this.code = code }
@@ -20,7 +21,7 @@ export async function createWebSocketTransport({
   onConnectionState, onTraffic, signal, webSocketFactory = url => new WebSocket(url), connectTimeoutMs = 10_000,
   closeTimeoutMs = 10_000, maxLineBytes = 4 * 1024 * 1024, reconnectWindowMs = 60_000, initialConnectWindowMs = 0,
   reconnectDelays = [1000, 2000, 4000, 8000], heartbeatMs = 15_000, heartbeatTimeoutMs = 45_000,
-  random = Math.random,
+  random = Math.random, networkNow = defaultNetworkNow,
 } = {}) {
   const url = validateServerUrl(rawUrl)
   let token = validateConnectionToken(rawToken)
@@ -30,7 +31,7 @@ export async function createWebSocketTransport({
   if (maxLineBytes > 64 * 1024 * 1024 || reconnectWindowMs > 300_000 || heartbeatTimeoutMs <= heartbeatMs) throw new RangeError('连接限制无效')
   if (!Number.isSafeInteger(initialConnectWindowMs) || initialConnectWindowMs < 0 || initialConnectWindowMs > 300_000) throw new RangeError('首次连接等待时间无效')
   if (!Array.isArray(reconnectDelays) || !reconnectDelays.length || reconnectDelays.some(value => !Number.isSafeInteger(value) || value < 1)) throw new TypeError('重连间隔无效')
-  if (typeof webSocketFactory !== 'function' || typeof random !== 'function') throw new TypeError('连接依赖无效')
+  if (typeof webSocketFactory !== 'function' || typeof random !== 'function' || typeof networkNow !== 'function') throw new TypeError('连接依赖无效')
   for (const callback of [onDiagnostic, onConnectionState]) if (callback !== undefined && typeof callback !== 'function') throw new TypeError('连接回调无效')
   if (signal !== undefined && typeof signal?.addEventListener !== 'function') throw new TypeError('signal 必须是 AbortSignal')
   if (signal?.aborted) throw new WebSocketTransportError('CONNECT_CANCELLED', '连接已取消')
@@ -51,7 +52,7 @@ export async function createWebSocketTransport({
     if (closing) return
     closing = true
     if (replay && current?.ready) { try { control(current, { type: 'recovery.release' }) } catch {} }
-    lifetime.abort(); clearInterval(heartbeat)
+    lifetime.abort(); clearInterval(heartbeat); current?.networkProbe?.close()
     peer?.close(reason); closeSocket(current)
     input?.end(); output?.end(); token = undefined
     stateChanged('disconnected')
@@ -105,14 +106,28 @@ export async function createWebSocketTransport({
     clearTimeout(attempt.timer); signal?.removeEventListener('abort', attempt.abort)
     if (!peer) establishPeer()
     if (replay) {
+      attempt.networkProbe = createNetworkProbe({ now: networkNow, timeoutMs: heartbeatMs,
+        onDiagnostic: fields => diagnose('perf.network', fields) })
+      const ping = () => {
+        const timing = attempt.networkProbe.ping()
+        control(attempt, { type: 'recovery.ping', ...(timing ? { timing } : {}) })
+      }
       clearInterval(heartbeat)
       heartbeat = setInterval(() => {
         if (closing || current !== attempt || !attempt.ready) return
         if (Date.now() - attempt.lastHeard >= heartbeatTimeoutMs) { lose(attempt, 'websocket_heartbeat_timeout'); return }
-        try { control(attempt, { type: 'recovery.ping' }) } catch { lose(attempt, 'websocket_error') }
+        try { ping() } catch { lose(attempt, 'websocket_error') }
       }, heartbeatMs)
       heartbeat.unref?.()
       flushReplay()
+      // An optional first observation cannot fail authentication or trigger a
+      // retry. The original periodic heartbeat still owns liveness failures.
+      try { ping() } catch {
+        attempt.networkProbe.close()
+        diagnose('perf.network', { version: 1, stage: 'unsupported', code: 'NETWORK_PROBE_SEND_FAILED' })
+      }
+    } else {
+      diagnose('perf.network', { version: 1, stage: 'unsupported', code: 'NETWORK_RECOVERY_UNAVAILABLE' })
     }
     diagnose('websocket_authenticated', { durationMs: Math.max(0, Date.now() - attempt.startedAt) })
     if (attempt.compressed) diagnose('websocket_compression_negotiated')
@@ -145,6 +160,7 @@ export async function createWebSocketTransport({
   }
   function receive(attempt, value) {
     if (attempt !== current || closing || attempt.lost || attempt.failed) return
+    const receivedAt = readNetworkTime(networkNow)
     attempt.lastHeard = Date.now()
     if (!attempt.ready) {
       if (typeof value !== 'string' || Buffer.byteLength(value) > 16384 || !attempt.authSent) return rejectAttempt(attempt, 'AUTH_PROTOCOL_ERROR', '服务器认证响应无效')
@@ -189,7 +205,8 @@ export async function createWebSocketTransport({
         if (message.type === 'recovery.ack') {
           if (!Number.isSafeInteger(message.ack) || message.ack < 0) throw new Error('恢复游标无效')
           if (message.ack >= replay.acknowledged) replay.acknowledge(message.ack)
-        } else if (message.type !== 'recovery.pong') throw new Error('恢复协议无效')
+        } else if (message.type === 'recovery.pong') attempt.networkProbe?.pong(message.timing, receivedAt)
+        else throw new Error('恢复协议无效')
       } catch { peer.close('websocket_protocol_error') }
       return
     }
@@ -256,7 +273,7 @@ export async function createWebSocketTransport({
   }
   function lose(attempt, reason, fatal = false) {
     if (!attempt || attempt !== current || attempt.lost || closing) return
-    attempt.lost = true; attempt.ready = false; clearInterval(heartbeat)
+    attempt.lost = true; attempt.ready = false; clearInterval(heartbeat); attempt.networkProbe?.close()
     closeSocket(attempt, 4000)
     if (!replay || fatal) { peer?.close(reason); return }
     if (retryTask) return

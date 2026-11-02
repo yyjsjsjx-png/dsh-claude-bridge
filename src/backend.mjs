@@ -18,7 +18,7 @@ import { imageCapability } from './model-capabilities.mjs'
 import { contextSnapshot, initialSessionStatus, reconcileSessionStatus, SESSION_STATUS_RECORD } from './session-status.mjs'
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { retainedPlanUsage } from './observability-plan-usage.mjs'
-import { createLocalRunTiming } from './local-run-timing.mjs'
+import { createLocalRunTiming, startLocalRunPhase } from './local-run-timing.mjs'
 import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult,
   verifiedCloudToolResult, recoveryToolUpdate, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
 import { readHistoryPages } from './history-reader.mjs'
@@ -258,7 +258,8 @@ export class BridgeBackend {
           }
           this.diagnostics.event('connection.state', { status: connection })
         },
-        onDiagnostic: ({ event, ...fields }) => this.diagnostics.event(event, fields),
+        onDiagnostic: ({ event, ...fields }) => this.diagnostics.event(event,
+          { ...fields, ...(event === 'perf.rpc' ? { source: 'host-rpc' } : {}) }),
       }
       if (this.createTransport) transport = await this.createTransport(options)
       else if (this.config.transport === 'ssh') {
@@ -694,13 +695,17 @@ export class BridgeBackend {
   }
 
   async finishRunResources(run, requiresReview) {
-    this.retiredRuns.add(run.runId)
-    if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
-    // A saved send intent is not proof of an RPC dispatch: cancellation can
-    // arrive while markRunSent is still being persisted.
-    const status = run.requestStarted ? (run.journalStatus ?? 'unknown') : 'not-sent'
-    await this.state.finishRun(run.agent.id, run.runId, status, requiresReview)
-    await this.diagnostics.flush()
+    const finishTiming = startLocalRunPhase({ runId: run.runId, stage: 'run_finalize',
+      onTiming: fields => this.diagnostics.event('perf.local', fields) })
+    try {
+      this.retiredRuns.add(run.runId)
+      if (this.retiredRuns.size > 256) this.retiredRuns.delete(this.retiredRuns.values().next().value)
+      // A saved send intent is not proof of an RPC dispatch: cancellation can
+      // arrive while markRunSent is still being persisted.
+      const status = run.requestStarted ? (run.journalStatus ?? 'unknown') : 'not-sent'
+      await this.state.finishRun(run.agent.id, run.runId, status, requiresReview)
+      await this.diagnostics.flush()
+    } finally { finishTiming() }
   }
 
   async recover(agent, confirm, signal) {
@@ -1162,93 +1167,102 @@ export class BridgeBackend {
     try { parsed = JSON.parse(advertised.arguments) } catch { throw failure('TOOL_ARGUMENTS_INVALID', '模型声明的工具参数不是有效 JSON，未执行。') }
     if (!isDeepStrictEqual(parsed, params.arguments)) throw failure('TOOL_ARGUMENTS_MISMATCH', '声明参数与实际工具参数不一致，未执行。')
     if (run.calls.has(params.callId)) return run.calls.get(params.callId)
+    const finishTiming = startLocalRunPhase({ runId: run.runId, stage: 'tool_total', callId: params.callId,
+      onTiming: fields => this.diagnostics.event('perf.local', fields) })
     const operation = run.toolQueue.then(async () => {
-      const signal = AbortSignal.any([run.signal, context.signal])
-      signal.throwIfAborted()
-      if (run.concluded) return { content: [{ type: 'text', text: '当前工具已结束本轮，请直接给出最终回复。' }], isError: true }
-      const { agent, turn, step } = run
-      const previous = await this.state.previousTool(agent.id, params.callId)
-      if (previous && previous.runId !== run.runId) {
-        const call = agent.session.eventAt?.(previous.callSeq)
-        let original
-        try { original = JSON.parse(call?.data.arguments) } catch {}
-        if (previous.name !== params.name || !isDeepStrictEqual(original, params.arguments)) {
-          throw failure('TOOL_ARGUMENTS_MISMATCH', '恢复调用与原工具参数不一致，未执行。')
-        }
-        const result = agent.session.eventAt?.(previous.resultSeq)
-        if (call?.type !== 'tool/call' || call.data.callId !== params.callId
-          || !knownToolResult(result) || (result.data.message.toolCallId ?? result.data.message.source?.callId) !== params.callId) {
-          throw failure('UNKNOWN_TOOL_OUTCOME', '原工具结果仍未知，未重复执行。')
-        }
-        return { content: await toMcpContent(result.data.message.content, run.media), isError: Boolean(result.data.message.isError) }
-      }
-      await this.state.beginTool(agent.id, run.runId, params.callId, params.name,
-        createHash('sha256').update(advertised.arguments).digest('hex'))
-      const call = agent.session.append('tool/call', { turn, step, callId: params.callId, name: params.name,
-        // DSH's durable validator requires the exact advertised JSON string,
-        // including whitespace/key order. Execution uses the checked object.
-        arguments: advertised.arguments })
-      this.diagnostics.event('tool.started', { runId: run.runId, callId: params.callId, toolName: params.name })
-      const startedAt = Date.now()
-      let result
-      let dispatched = false
       try {
-        await this.checkpoint(agent.session)
+        const signal = AbortSignal.any([run.signal, context.signal])
         signal.throwIfAborted()
-        await this.state.markToolDispatched(agent.id, run.runId, params.callId, call.seq)
-        signal.throwIfAborted()
-        dispatched = true
-        result = await this.ctx.agents.withInitiator(agent, () => this.ctx.tools.execute({
-          callId: params.callId, name: params.name, arguments: params.arguments, agent, signal,
-        }))
-      } catch (error) {
-        if (!dispatched) {
-          await this.state.finishTool(agent.id, run.runId, params.callId, 'not-sent')
-          throw error
+        if (run.concluded) return { content: [{ type: 'text', text: '当前工具已结束本轮，请直接给出最终回复。' }], isError: true }
+        const { agent, turn, step } = run
+        const previous = await this.state.previousTool(agent.id, params.callId)
+        if (previous && previous.runId !== run.runId) {
+          const call = agent.session.eventAt?.(previous.callSeq)
+          let original
+          try { original = JSON.parse(call?.data.arguments) } catch {}
+          if (previous.name !== params.name || !isDeepStrictEqual(original, params.arguments)) {
+            throw failure('TOOL_ARGUMENTS_MISMATCH', '恢复调用与原工具参数不一致，未执行。')
+          }
+          const result = agent.session.eventAt?.(previous.resultSeq)
+          if (call?.type !== 'tool/call' || call.data.callId !== params.callId
+            || !knownToolResult(result) || (result.data.message.toolCallId ?? result.data.message.source?.callId) !== params.callId) {
+            throw failure('UNKNOWN_TOOL_OUTCOME', '原工具结果仍未知，未重复执行。')
+          }
+          return { content: await toMcpContent(result.data.message.content, run.media), isError: Boolean(result.data.message.isError) }
         }
-        run.toolOutcomeUnknown = true
-        const unknownResult = agent.session.append('tool/result', { turn, step,
-          message: this.helpers.createToolResultMessage({ callId: params.callId, isError: true,
-            content: [{ type: 'text', text: UNKNOWN_TOOL_TEXT }] }),
-          meta: { claudeBridgeOutcome: 'unknown' },
+        await this.state.beginTool(agent.id, run.runId, params.callId, params.name,
+          createHash('sha256').update(advertised.arguments).digest('hex'))
+        const call = agent.session.append('tool/call', { turn, step, callId: params.callId, name: params.name,
+          // DSH's durable validator requires the exact advertised JSON string,
+          // including whitespace/key order. Execution uses the checked object.
+          arguments: advertised.arguments })
+        this.diagnostics.event('tool.started', { runId: run.runId, callId: params.callId, toolName: params.name })
+        const startedAt = Date.now()
+        let result
+        let dispatched = false
+        try {
+          await this.checkpoint(agent.session)
+          signal.throwIfAborted()
+          await this.state.markToolDispatched(agent.id, run.runId, params.callId, call.seq)
+          signal.throwIfAborted()
+          dispatched = true
+          // The native pipeline includes its own approval wait, not pure tool CPU.
+          const finishPipeline = startLocalRunPhase({ runId: run.runId, stage: 'tool_pipeline', callId: params.callId,
+            onTiming: fields => this.diagnostics.event('perf.local', fields) })
+          try {
+            result = await this.ctx.agents.withInitiator(agent, () => this.ctx.tools.execute({
+              callId: params.callId, name: params.name, arguments: params.arguments, agent, signal,
+            }))
+          } finally { finishPipeline() }
+        } catch (error) {
+          if (!dispatched) {
+            await this.state.finishTool(agent.id, run.runId, params.callId, 'not-sent')
+            throw error
+          }
+          run.toolOutcomeUnknown = true
+          const unknownResult = agent.session.append('tool/result', { turn, step,
+            message: this.helpers.createToolResultMessage({ callId: params.callId, isError: true,
+              content: [{ type: 'text', text: UNKNOWN_TOOL_TEXT }] }),
+            meta: { claudeBridgeOutcome: 'unknown' },
+          }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+          await this.checkpoint(agent.session)
+          await this.state.finishTool(agent.id, run.runId, params.callId, 'unknown', unknownResult.seq)
+          this.diagnostics.event('tool.unknown', { runId: run.runId, callId: params.callId, toolName: params.name,
+            code: 'UNKNOWN_TOOL_OUTCOME', toolMayHaveExecuted: true, durationMs: Date.now() - startedAt })
+          throw this.stopForShellFailure(run, params.name, error) ?? error
+        }
+        const resultEvent = agent.session.append('tool/result', { turn, step,
+          message: this.helpers.createToolResultMessage({ callId: params.callId, content: result.content, isError: Boolean(result.isError) }),
+          ...(result.meta === undefined ? {} : { meta: result.meta }),
+          ...(result.error?.info ? { error: result.error.info } : {}),
         }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
-        await this.checkpoint(agent.session)
-        await this.state.finishTool(agent.id, run.runId, params.callId, 'unknown', unknownResult.seq)
-        this.diagnostics.event('tool.unknown', { runId: run.runId, callId: params.callId, toolName: params.name,
-          code: 'UNKNOWN_TOOL_OUTCOME', toolMayHaveExecuted: true, durationMs: Date.now() - startedAt })
-        throw this.stopForShellFailure(run, params.name, error) ?? error
-      }
-      const resultEvent = agent.session.append('tool/result', { turn, step,
-        message: this.helpers.createToolResultMessage({ callId: params.callId, content: result.content, isError: Boolean(result.isError) }),
-        ...(result.meta === undefined ? {} : { meta: result.meta }),
-        ...(result.error?.info ? { error: result.error.info } : {}),
-      }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
-      try {
-        await this.checkpoint(agent.session)
-        await this.state.finishTool(agent.id, run.runId, params.callId, 'completed', resultEvent.seq)
-      } catch (error) { run.toolOutcomeUnknown = true; throw error }
-      const shellFailure = this.stopForShellFailure(run, params.name, result)
-      if (shellFailure) throw shellFailure
-      const content = await toMcpContent(result.content, run.media)
-      const additionalContexts = []
-      if (result.isError === true && typeof result.error?.info?.code === 'string'
-        && /^[A-Z0-9_]{1,80}$/.test(result.error.info.code)) {
-        additionalContexts.push(`[桥接插件工具说明] ${params.name}（${params.callId}）返回错误码 ${result.error.info.code}。请依据实际工具结果调整做法；错误本身不能证明操作未生效。涉及先前副作用时先只读核实，并遵守用户停止和审批结果。`)
-      }
-      for (const additional of result.additionalContexts ?? []) {
-        const blocks = await toSdkPrompt([additional], run.media)
-        if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_TOOL_CONTEXT', '工具附加上下文含有当前无法转换的内容。')
-        additionalContexts.push(blocks.map(block => block.text).join('\n'))
-        agent.session.append('user/message', additional, { surfaceOp: 'append' })
-        this.diagnostics.event('tool.context_converted', { runId: run.runId, callId: params.callId, toolName: params.name })
-      }
-      if (result.concludesTurn) run.concluded = true
-      this.diagnostics.event('tool.completed', { runId: run.runId, callId: params.callId, toolName: params.name,
-        durationMs: Date.now() - startedAt, status: result.isError ? 'error' : 'ok' })
-      return { content, isError: Boolean(result.isError),
-        ...(additionalContexts.length ? { additionalContexts } : {}),
-        ...(result.concludesTurn ? { concludesTurn: true } : {}),
-      }
+        try {
+          await this.checkpoint(agent.session)
+          await this.state.finishTool(agent.id, run.runId, params.callId, 'completed', resultEvent.seq)
+        } catch (error) { run.toolOutcomeUnknown = true; throw error }
+        const shellFailure = this.stopForShellFailure(run, params.name, result)
+        if (shellFailure) throw shellFailure
+        const content = await toMcpContent(result.content, run.media)
+        const additionalContexts = []
+        if (result.isError === true && typeof result.error?.info?.code === 'string'
+          && /^[A-Z0-9_]{1,80}$/.test(result.error.info.code)) {
+          additionalContexts.push(`[桥接插件工具说明] ${params.name}（${params.callId}）返回错误码 ${result.error.info.code}。请依据实际工具结果调整做法；错误本身不能证明操作未生效。涉及先前副作用时先只读核实，并遵守用户停止和审批结果。`)
+        }
+        for (const additional of result.additionalContexts ?? []) {
+          const blocks = await toSdkPrompt([additional], run.media)
+          if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_TOOL_CONTEXT', '工具附加上下文含有当前无法转换的内容。')
+          additionalContexts.push(blocks.map(block => block.text).join('\n'))
+          agent.session.append('user/message', additional, { surfaceOp: 'append' })
+          this.diagnostics.event('tool.context_converted', { runId: run.runId, callId: params.callId, toolName: params.name })
+        }
+        if (result.concludesTurn) run.concluded = true
+        this.diagnostics.event('tool.completed', { runId: run.runId, callId: params.callId, toolName: params.name,
+          durationMs: Date.now() - startedAt, status: result.isError ? 'error' : 'ok' })
+        return { content, isError: Boolean(result.isError),
+          ...(additionalContexts.length ? { additionalContexts } : {}),
+          ...(result.concludesTurn ? { concludesTurn: true } : {}),
+        }
+      } finally { finishTiming() }
     })
     run.calls.set(params.callId, operation)
     run.toolQueue = operation.then(() => {}, () => {})

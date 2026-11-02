@@ -49,6 +49,7 @@ import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
+import { createClientTimingRecorder } from '../src/client-timing-diagnostics.mjs';
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
@@ -68,6 +69,7 @@ let ClaudeBridgeService = (() => {
     let _clearConnection_decorators;
     let _planUsage_decorators;
     let _syncSession_decorators;
+    let _recordClientTiming_decorators;
     let _refreshCatalog_decorators;
     let _modelPreferences_decorators;
     let _visibleModels_decorators;
@@ -81,6 +83,7 @@ let ClaudeBridgeService = (() => {
             _clearConnection_decorators = [Remote('clearConnection')];
             _planUsage_decorators = [Remote('planUsage')];
             _syncSession_decorators = [Remote('syncSession')];
+            _recordClientTiming_decorators = [Remote('recordClientTiming')];
             _refreshCatalog_decorators = [Remote('refreshCatalog')];
             _modelPreferences_decorators = [Remote('modelPreferences')];
             _visibleModels_decorators = [Remote('visibleModels')];
@@ -91,6 +94,7 @@ let ClaudeBridgeService = (() => {
             __esDecorate(this, null, _clearConnection_decorators, { kind: "method", name: "clearConnection", static: false, private: false, access: { has: obj => "clearConnection" in obj, get: obj => obj.clearConnection }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _planUsage_decorators, { kind: "method", name: "planUsage", static: false, private: false, access: { has: obj => "planUsage" in obj, get: obj => obj.planUsage }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _syncSession_decorators, { kind: "method", name: "syncSession", static: false, private: false, access: { has: obj => "syncSession" in obj, get: obj => obj.syncSession }, metadata: _metadata }, null, _instanceExtraInitializers);
+            __esDecorate(this, null, _recordClientTiming_decorators, { kind: "method", name: "recordClientTiming", static: false, private: false, access: { has: obj => "recordClientTiming" in obj, get: obj => obj.recordClientTiming }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _refreshCatalog_decorators, { kind: "method", name: "refreshCatalog", static: false, private: false, access: { has: obj => "refreshCatalog" in obj, get: obj => obj.refreshCatalog }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _modelPreferences_decorators, { kind: "method", name: "modelPreferences", static: false, private: false, access: { has: obj => "modelPreferences" in obj, get: obj => obj.modelPreferences }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _visibleModels_decorators, { kind: "method", name: "visibleModels", static: false, private: false, access: { has: obj => "visibleModels" in obj, get: obj => obj.visibleModels }, metadata: _metadata }, null, _instanceExtraInitializers);
@@ -263,6 +267,23 @@ let ClaudeBridgeService = (() => {
             if (agent.session.header.agentPreset !== CLAUDE_PRESET)
                 return { status: 'not-remote' };
             return this.backend.syncSession(agent);
+        }
+        async recordClientTiming(value) {
+            this.assertOwner();
+            this.clientTimingRecorder ??= createClientTimingRecorder({
+                isRemoteSession: id => (this.ctx.sessions.get(id) ?? this.ctx.agents.get(id)?.session)
+                    ?.header.agentPreset === CLAUDE_PRESET,
+                record: (event, fields) => this.backend.diagnostics.event(event, fields),
+            });
+            try {
+                return this.clientTimingRecorder(value);
+            }
+            catch (error) {
+                if (error.code === 'INVALID_CLIENT_TIMING') {
+                    throw new RemoteError('claude-bridge/invalid-client-timing', '客户端耗时诊断格式无效。', {});
+                }
+                throw error;
+            }
         }
         async refreshCatalog() {
             this.assertOwner();

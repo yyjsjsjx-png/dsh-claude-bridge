@@ -265,7 +265,11 @@ test('云端性能日志独立落盘，区分思考与正文并仅保存白名�
   assert.doesNotMatch(body, /PRIVATE_|unknown_duration_ms|prompt|account/)
   const rows = body.trim().split('\n').map(JSON.parse)
   const marks = rows.filter(row => row.event === 'perf.remote').map(row => row.stage)
-  assert.deepEqual(marks, ['start', 'hooks_verified', 'toolset_verified', 'first_model_event', 'first_token', 'first_text', 'completed'])
+  // Measuring flush itself queues its observation after that flush; it is also
+  // forwarded immediately, without adding another durability wait to query.
+  assert.deepEqual(marks.filter(stage => stage !== 'diagnostic_flush'), ['start', 'hooks_verified', 'toolset_verified',
+    'first_model_event', 'first_token', 'first_text', 'completed', 'callback_drain', 'recovery_save', 'lock_release'])
+  assert.equal(f.state.notifications.filter(row => row.method === 'diagnostic' && row.params.stage === 'diagnostic_flush').length, 1)
   assert.equal(rows.find(row => row.event === 'perf.sdk' && row.stage === 'ttft_stream_ms').durationMs, 120)
   assert.equal(rows.find(row => row.event === 'perf.sdk' && row.stage === 'duration_api_ms').durationMs, 9000)
 })
@@ -1151,6 +1155,37 @@ test('取消后 settle 等待 SDK 和回调实际收尾', async (t) => {
   assert.equal(JSON.stringify(f.state.notifications).includes('晚到文字'), false)
 })
 
+test('远端审批与收尾分段只记录数值，样本身份稳定且诊断转发失败不改变结算', async t => {
+  let release, started
+  const gate = new Promise(resolve => { release = resolve })
+  const waiting = new Promise(resolve => { started = resolve })
+  const f = await fixture(t, async function* ({ options }) {
+    assert.equal((await options.canUseTool('mcp__dsh__local_command', { command: 'PRIVATE_COMMAND' },
+      { toolUseID: 'toolu_timing' })).behavior, 'deny')
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+  })
+  f.peer.request = async method => {
+    assert.equal(method, 'approval.request'); started(); await gate
+    return { behavior: 'deny', message: 'PRIVATE_APPROVAL_BODY' }
+  }
+  const notify = f.peer.notify
+  f.peer.notify = (method, params) => {
+    notify(method, params)
+    if (params.sampleId !== undefined) throw new Error('PRIVATE_DIAGNOSTIC_ERROR')
+  }
+  const pending = f.worker.handlers.query(f.params, f.context)
+  await waiting
+  assert.equal(f.state.notifications.some(row => row.params.stage === 'approval_wait'), false)
+  release()
+  assert.equal((await pending).status, 'completed')
+  const phases = f.state.notifications.filter(row => row.method === 'diagnostic' && row.params.sampleId !== undefined).map(row => row.params)
+  assert.deepEqual(phases.map(row => row.stage), ['approval_wait', 'callback_drain', 'recovery_save', 'lock_release', 'diagnostic_flush'])
+  assert.deepEqual(phases.map(row => row.sampleId), ['phase-1', 'phase-2', 'phase-3', 'phase-4', 'phase-5'])
+  assert.ok(phases.every(row => row.event === 'perf.remote' && row.runId === f.params.runId && row.durationMs >= 0))
+  assert.equal(phases[0].callId, 'toolu_timing')
+  assert.doesNotMatch(JSON.stringify(phases), /PRIVATE/)
+})
+
 test('SDK 成功但恢复保存失败时 query 和 settle 保留未知，已有运行记录不伪装完成', async t => {
   const store = createRunStore()
   let candidate, saves = 0
@@ -1172,6 +1207,8 @@ test('SDK 成功但恢复保存失败时 query 和 settle 保留未知，已有�
   const saved = JSON.parse(await readFile(join(f.state.queries[0].options.cwd, 'bridge-runs.json'), 'utf8'))
   assert.equal(saved.runs[f.params.runId].status, 'running')
   assert.equal(saved.runs[f.params.runId].finishedAt, undefined)
+  assert.equal(f.state.notifications.filter(row => row.params.stage === 'recovery_save').length, 1)
+  assert.equal(f.state.notifications.filter(row => row.params.stage === 'lock_release').length, 1)
 })
 
 test('锁释放失败优先于先前保存失败，修正记录后才发布 query 与 settle 终态', async t => {
@@ -1196,6 +1233,8 @@ test('锁释放失败优先于先前保存失败，修正记录后才发布 quer
     })
     const response = await f.worker.handlers.query(f.params, f.context)
     assert.deepEqual(sequence, ['save:completed:', 'release', 'save:unknown:LOCK_RELEASE_FAILED'])
+    assert.equal(f.state.notifications.filter(row => row.params.stage === 'recovery_save').length, 2)
+    assert.equal(f.state.notifications.filter(row => row.params.stage === 'lock_release').length, 1)
     assert.equal(response.status, 'unknown')
     assert.equal(response.code, 'LOCK_RELEASE_FAILED')
     assert.equal(response.toolMayHaveExecuted, true)
