@@ -1,7 +1,7 @@
 /** DSH wiring: mount RPC first, then create one controller set per child scope. */
 export function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -85,10 +85,9 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
 };
 
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
-exports.installUsageProjection = createUsageProjectionBridge({ React });
+exports.installUsageProjection = createUsageProjectionBridge({ React, getClientTiming: () => exports.clientReceiveTiming });
 
 exports.apply = async function apply(ctx) {
-  ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
   ctx.inject(['uiConversation'], ctx => {
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
   });
@@ -99,6 +98,18 @@ exports.apply = async function apply(ctx) {
   });
   const disposeRemote = await ctx.remote.$mount({ package: 'dsh-claude-bridge-ui', descriptors: [
     descriptor('status'),
+    descriptor('recordClientTiming', [{ name: 'value', wire: 'value', source: 'json', codec: {
+      mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ClientTiming',
+      create: () => z.object({ version: z.literal(1), requestId: z.string().min(1).max(160),
+        sessionId: z.string().min(1).max(160), metric: z.enum(['submission', 'first-output']),
+        quality: z.enum(['precise', 'unknown']), durationMs: z.number().finite().min(0).max(1800000).optional(),
+        reason: z.enum(['BACKGROUND', 'QUEUED', 'STEERING', 'OVERLAPPING_SUBMISSION', 'HISTORY_REPLACED',
+          'STREAM_REBASELINE', 'SUBMISSION_FAILED', 'TURN_ENDED_WITHOUT_OUTPUT', 'SESSION_DISPOSED',
+          'OBSERVER_DISPOSED', 'TIMING_TIMEOUT', 'TIMING_UNAVAILABLE', 'REQUEST_UNCORRELATED',
+          'REMOTE_SESSION_CHANGED']).optional(),
+        condition: z.enum(['foreground', 'background', 'queued', 'steering']),
+        source: z.literal('client-session-receive'), clock: z.literal('client-monotonic') }).strict(),
+    } }]),
     descriptor('planUsage', [{ name: 'refresh', wire: 'refresh', source: 'json', codec: {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#RefreshPlanUsage', create: () => z.boolean(),
     } }]),
@@ -126,6 +137,13 @@ exports.apply = async function apply(ctx) {
   // outer inject list would deadlock. Its child scope owns every UI closure.
   ctx.inject(['remote.claudeBridge'], (ctx) => {
   const rpc = ctx.remote.claudeBridge;
+  if (typeof createClientReceiveTiming === 'function') ctx.effect(() => {
+    const timing = createClientReceiveTiming({ report: row => rpc.recordClientTiming(row) });
+    exports.clientReceiveTiming = timing;
+    timing.install(ctx.sessions);
+    return () => { timing.dispose(); if (exports.clientReceiveTiming === timing) delete exports.clientReceiveTiming; };
+  }, '远程会话客户端接收计时');
+  ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');
   const settings = createSettingsController({ rpc, createStore, textError, createModelController,
     onConnectionChange: () => { quota.reset(); picker.close(); } });
   const quota = createQuotaController({ rpc, createStore,
