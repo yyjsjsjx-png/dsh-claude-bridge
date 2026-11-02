@@ -226,10 +226,10 @@ const SETTINGS_CSS = `
         state.message && h('p', { role: 'status', className: 'dcb-notice' }, state.message),
         (state.error || state.statusError) && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.error || state.statusError)),
       h('div', { className: 'dcb-card' },
-        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '可选模型'),
+        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '显示的模型'),
           state.modelsLoaded && state.models.length > 0
             && h('span', { className: 'dcb-card-meta' }, `已选 ${selectedCount} / ${state.models.length}`)),
-        h('p', { className: 'dcb-card-desc' }, '勾选主会话列表与子代理显式选型可用的模型。取消勾选后，子代理不能再显式选择该型号；已有会话与默认继承继续使用原配置。正在使用的型号可能暂时保留在原生列表中。'),
+        h('p', { className: 'dcb-card-desc' }, '选择主会话与子代理列表中显示的模型。隐藏不限制显式指定真实可用的型号，也不停止已有会话；正在使用的模型可能暂时保留在原生列表中。'),
         !state.configured && h('p', { className: 'dcb-hint' }, '请先保存连接设置，再读取账号模型。'),
         state.modelsLoading && h('p', { className: 'dcb-hint' }, '正在读取模型…'),
         state.modelCatalog?.status === 'failed' && h('p', { role: 'alert', 'aria-label': '模型目录刷新状态',
@@ -246,7 +246,7 @@ const SETTINGS_CSS = `
           state.models.length === 0 && h('p', { className: 'dcb-hint' }, '账号当前没有返回可用模型。'),
           h('div', { className: 'dcb-actions' },
             h('button', { type: 'button', className: 'dcb-btn', 'data-variant': 'primary', disabled: state.busy || state.modelsLoading,
-              onClick: () => { void saveModels(); } }, '保存模型设置'))),
+              onClick: () => { void saveModels(); } }, '保存模型显示设置'))),
         state.configured && !state.modelsLoading && !state.modelsLoaded
           && h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', disabled: state.busy,
             onClick: () => { void loadModels(); } }, '读取模型列表'))),

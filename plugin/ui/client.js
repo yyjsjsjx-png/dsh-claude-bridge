@@ -212,7 +212,7 @@ function createModelController({ rpc, store, updateSettings, textError,
       const response = await rpc.saveModelPreferences({ enabledIds: state.selectedModelIds });
       if (!response.ok) throw new Error(response.error.message);
       await loadModelPreferences(true);
-      updateSettings({ message: '模型设置已保存。' });
+      updateSettings({ message: '模型显示设置已保存。' });
     } catch (error) { updateSettings({ modelError: textError(error) }); }
     finally { updateSettings({ busy: false }); }
   }
@@ -605,27 +605,35 @@ function compactTokens(value) {
           : React.createElement('p', { style: { margin: '8px 0 0' } }, '完成一轮对话后更新。')), document.body));
   }
 
-  /** Read-only child label: lastUsed is folded from request/header, while next
-   * may still be an unsent selection. Catalog names never authorize execution. */
-  function ChildModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
+  /** Requested selection and per-response SDK evidence are independent. */
+  function SessionModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
     const bridge = useProjection('claudeBridge');
     const selected = useProjection('modelSelection')?.lastUsed;
+    const observation = useProjection('claudeBridgeModelObservation')?.current;
     const session = useSession(value => value);
     const summary = useSessions(value => value)?.byId?.[sessionId];
     const directory = useModelDirectory(value => value);
-    if (bridge == null || (session?.subagent == null && summary?.origin !== 'subagent')) return null;
+    if (bridge == null) return null;
+    const child = session?.subagent != null || summary?.origin === 'subagent';
     const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
+    const actual = known && observation?.requestedModel === selected.model ? observation?.actualModel : null;
+    if (!child && !actual) return null;
     const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
       ?.find(row => row.id === selected.model) : undefined;
     const name = model?.name || (known ? selected.model : '型号待确认');
     const effort = known ? selected.reasoningEffort || '模型默认' : '强度待确认';
-    const title = known
-      ? `此子代理最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
+    const requestTitle = known
+      ? `最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
       : '此子代理尚无原生 request/header；不会用父选型或待发送选型代替。';
+    const title = `${requestTitle}\n${actual
+      ? `本响应 SDK 返回型号：${actual}；来源：${observation.source}；响应：${observation.responseId ?? '未提供 ID'}。\n型号别名展开或字符串差异不等于降级；SDK 未报告实际思考等级。`
+      : '本响应尚无 SDK 返回型号；不会用请求配置、初始化信息或旧响应代替。'}`;
+    const text = `${child ? `${name} · ${effort}` : ''}${actual ? `${child ? ' ｜ ' : ''}SDK 返回：${actual}` : ''}`;
     return React.createElement('span', { className: 'dsh-claude-child-model', role: 'status', title,
-      'aria-label': `子代理请求型号 ${name}，思考强度 ${effort}`,
+      'aria-label': `${child ? `子代理请求型号 ${name}，请求思考强度 ${effort}。` : ''}${actual ? `本响应 SDK 返回型号 ${actual}` : ''}`,
       style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #666)',
-        maxWidth: '320px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, `${name} · ${effort}`);
+        minWidth: 0, maxWidth: '320px', flexShrink: 1,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, text);
   }
 
   function QuotaMeter({ useBridgeStatus, useQuota, readQuota }) {
@@ -788,7 +796,7 @@ function compactTokens(value) {
               : new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
-  return { SessionMeter, QuotaMeter, ChildModelBadge };
+  return { SessionMeter, QuotaMeter, SessionModelBadge };
 }
 
 function createFormViews({ React }) {
@@ -1018,10 +1026,10 @@ const SETTINGS_CSS = `
         state.message && h('p', { role: 'status', className: 'dcb-notice' }, state.message),
         (state.error || state.statusError) && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.error || state.statusError)),
       h('div', { className: 'dcb-card' },
-        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '可选模型'),
+        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '显示的模型'),
           state.modelsLoaded && state.models.length > 0
             && h('span', { className: 'dcb-card-meta' }, `已选 ${selectedCount} / ${state.models.length}`)),
-        h('p', { className: 'dcb-card-desc' }, '勾选主会话列表与子代理显式选型可用的模型。取消勾选后，子代理不能再显式选择该型号；已有会话与默认继承继续使用原配置。正在使用的型号可能暂时保留在原生列表中。'),
+        h('p', { className: 'dcb-card-desc' }, '选择主会话与子代理列表中显示的模型。隐藏不限制显式指定真实可用的型号，也不停止已有会话；正在使用的模型可能暂时保留在原生列表中。'),
         !state.configured && h('p', { className: 'dcb-hint' }, '请先保存连接设置，再读取账号模型。'),
         state.modelsLoading && h('p', { className: 'dcb-hint' }, '正在读取模型…'),
         state.modelCatalog?.status === 'failed' && h('p', { role: 'alert', 'aria-label': '模型目录刷新状态',
@@ -1038,7 +1046,7 @@ const SETTINGS_CSS = `
           state.models.length === 0 && h('p', { className: 'dcb-hint' }, '账号当前没有返回可用模型。'),
           h('div', { className: 'dcb-actions' },
             h('button', { type: 'button', className: 'dcb-btn', 'data-variant': 'primary', disabled: state.busy || state.modelsLoading,
-              onClick: () => { void saveModels(); } }, '保存模型设置'))),
+              onClick: () => { void saveModels(); } }, '保存模型显示设置'))),
         state.configured && !state.modelsLoading && !state.modelsLoaded
           && h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', disabled: state.busy,
             onClick: () => { void loadModels(); } }, '读取模型列表'))),
@@ -1622,7 +1630,7 @@ exports.apply = async function apply(ctx) {
     onAuthenticationRequired: settings.authenticationRequired });
   const picker = createPickerController({ rpc, workspaces: ctx.workspaces, sessions: ctx.sessions,
     uiWorkspace: ctx.uiWorkspace, createStore, textError });
-  const { SessionMeter, QuotaMeter, ChildModelBadge } = createMeterViews({ React, createPortal,
+  const { SessionMeter, QuotaMeter, SessionModelBadge } = createMeterViews({ React, createPortal,
     useAnchoredPosition, useDismissOnOutsidePointer });
   const { MenuItem, HeroButton, Picker, Settings } = createFormViews({ React });
   const historyTasks = new Map();
@@ -1669,7 +1677,7 @@ exports.apply = async function apply(ctx) {
       try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
       return { sessionId, hooks: { modelDirectory: directory ?? ABSENT_STATUS } };
     },
-  }, ChildModelBadge));
+  }, SessionModelBadge));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,
