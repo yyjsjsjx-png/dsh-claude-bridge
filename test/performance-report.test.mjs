@@ -6,6 +6,47 @@ import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { analyzePerformance, formatPerformanceReport, sanitizePerformanceRecord } from '../src/performance-report.mjs'
 
+test('详细诊断保留有误差的网络估计、每请求覆盖和有界RPC聚合，双端转发不重复', () => {
+  const rows = [
+    { event: 'perf.network', stage: 'sample', roundTripMs: 102, serverResidenceMs: 2, networkRoundTripMs: 100,
+      clockOffsetMs: -20, offsetLowerMs: -70, offsetUpperMs: 30, oneWayEstimateMs: 50, uncertaintyMs: 50,
+      assumption: 'symmetric-path', token: 'PRIVATE', url: 'https://PRIVATE/' },
+    { event: 'perf.network', stage: 'unsupported', code: 'NETWORK_TIMING_UNSUPPORTED' },
+    { event: 'perf.network', stage: 'timeout' },
+    { event: 'perf.client', stage: 'submission', requestId: 'private-r1', sessionId: 'private-session', quality: 'precise', durationMs: 0 },
+    { event: 'perf.client', stage: 'first-output', requestId: 'private-r1', quality: 'precise', durationMs: 400, condition: 'background' },
+    { event: 'perf.client', stage: 'submission', requestId: 'private-r2', quality: 'precise', durationMs: 0 },
+    { event: 'perf.client', stage: 'first-output', requestId: 'private-r2', quality: 'unknown', code: 'SUBMISSION_FAILED' },
+    { event: 'perf.client', stage: 'submission', requestId: 'private-r3', quality: 'precise', durationMs: 0 },
+    { event: 'perf.rpc', stage: 'notification_handle', method: 'sdk.message', runId: 'private-run',
+      durationMs: 50, samples: 10, maxMs: 9, bytes: 1000, source: 'host-rpc' },
+    { event: 'perf.remote', stage: 'approval_wait', runId: 'private-run', sampleId: 'private-sample', durationMs: 200,
+      time: '2026-11-03T00:00:00.000Z' },
+    { event: 'perf.remote', stage: 'approval_wait', runId: 'private-run', sampleId: 'private-sample', durationMs: 200,
+      time: '2026-11-03T00:00:01.000Z' },
+  ]
+  const report = analyzePerformance(rows), detail = report.details
+  assert.equal(detail.network.samples, 1)
+  assert.equal(detail.network.unsupported, 1)
+  assert.equal(detail.network.timeouts, 1)
+  assert.equal(detail.network.minimumRttProbe.clockOffsetMs, -20)
+  assert.equal(detail.network.aggregates.oneWayEstimateMs.p50Ms, 50)
+  assert.equal(detail.client.submissions, 3)
+  assert.equal(detail.client.samples, 1)
+  assert.equal(detail.client.unknown, 1)
+  assert.equal(detail.client.pendingOrIncomplete, 1)
+  assert.deepEqual(detail.client.reasonCounts, { SUBMISSION_FAILED: 1 })
+  assert.equal(detail.intervals.find(row => row.event === 'perf.rpc').meanMs, 5)
+  assert.equal(detail.intervals.find(row => row.stage === 'approval_wait').samples, 1)
+  const sanitized = rows.map(sanitizePerformanceRecord)
+  assert.doesNotMatch(JSON.stringify(sanitized), /PRIVATE|private-|sessionId/)
+  assert.deepEqual(analyzePerformance(sanitized).details, detail)
+  const text = formatPerformanceReport(report)
+  assert.match(text, /单程值假定上下行对称/)
+  assert.match(text, /不是丢包率/)
+  assert.match(text, /观察到提交 3 次，有效 1 次/)
+})
+
 test('两端耗时按匿名轮次对应，思考与正文分开，SDK 累计耗时不冒充单轮推理', () => {
   const mark = (event, stage, durationMs) => ({ event, stage, durationMs, runId: '11111111-1111-4111-8111-111111111111', model: 'haiku', effort: 'high' })
   const rows = [mark('perf.local', 'start', 0), mark('perf.local', 'connected', 20),

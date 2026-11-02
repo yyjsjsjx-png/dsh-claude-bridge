@@ -1,14 +1,15 @@
 import { createHash } from 'node:crypto'
+import { analyzeTimingDetails, formatTimingDetails, sanitizeTimingDetail } from './performance-detail.mjs'
 
-const EVENTS = /^(?:perf\.(?:local|remote|sdk)|run\.[a-z_]+|history\.[a-z_]+|connection\.state|step\.[a-z_]+|tool\.[a-z_]+|diagnostics\.failed|websocket_(?:connect_failed|disconnected|close_timeout)|rpc_(?:request_failed|handler_failed)|start|complete|reserved|resumed|ready|hooks-verified|toolset-verified|dispatch|received|iterator-exited|failed|completed|lock-release-failed)$/
+const EVENTS = /^(?:perf\.(?:local|remote|sdk|network|rpc|client)|run\.[a-z_]+|history\.[a-z_]+|connection\.state|step\.[a-z_]+|tool\.[a-z_]+|diagnostics\.failed|websocket_(?:connect_failed|disconnected|close_timeout)|rpc_(?:request_failed|handler_failed)|start|complete|reserved|resumed|ready|hooks-verified|toolset-verified|dispatch|received|iterator-exited|failed|completed|lock-release-failed)$/
 const STAGES = new Set(['start', 'connected', 'history_checked', 'request_sent', 'first_model_event', 'first_token',
   'first_text', 'completed', 'hooks_verified', 'toolset_verified', 'ttft_ms', 'ttft_stream_ms',
   'time_to_request_ms', 'first_content_frame_ms', 'duration_ms', 'duration_api_ms',
   'query', 'validation', 'session', 'mcp', 'sdk', 'tool', 'cancel', 'compact', 'pre-step', 'execute',
   'tools_converted', 'prompt_prepared', 'journal_prepared', 'checkpointed'])
 const NUMBERS = ['durationMs', 'bytes', 'inputBytes', 'outputBytes', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']
-const anonymous = value => /^run-[a-f0-9]{12}$/.test(value) ? value
-  : `run-${createHash('sha256').update(value).digest('hex').slice(0, 12)}`
+const anonymous = (value, prefix = 'run') => new RegExp(`^${prefix}-[a-f0-9]{12}$`).test(value) ? value
+  : `${prefix}-${createHash('sha256').update(value).digest('hex').slice(0, 12)}`
 
 /** Export an allowlist, never the raw application log or an SDK transcript. */
 export function sanitizePerformanceRecord(value) {
@@ -22,10 +23,11 @@ export function sanitizePerformanceRecord(value) {
   if (/^[A-Z][A-Z0-9_]{1,79}$/.test(value.code ?? '')) output.code = value.code
   if (['connected', 'connecting', 'reconnecting', 'disconnected', 'closed', 'ready', 'completed', 'failed', 'cancelled', 'unknown'].includes(value.status)) output.status = value.status
   if (['query', 'compact', 'text-delta', 'reasoning-delta', 'tool-call-delta', 'initialize', 'history',
-    'catalog', 'planUsage', 'authStatus', 'settle', 'tool.execute', 'approval.request', 'step.prepare'].includes(value.method)) output.method = value.method
+    'catalog', 'planUsage', 'authStatus', 'settle', 'tool.execute', 'approval.request', 'step.prepare', 'sdk.message', 'diagnostic'].includes(value.method)) output.method = value.method
   if (typeof value.model === 'string' && /^[a-z][a-z0-9_.:-]{0,100}$/i.test(value.model)
     && !/token|key|bearer|secret|password/i.test(value.model)) output.model = value.model
   if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(value.effort)) output.effort = value.effort
+  sanitizeTimingDetail(value, output, anonymous)
   return output
 }
 
@@ -51,7 +53,7 @@ const METRICS = {
 
 /** Match elapsed times by run ID, without subtracting two machines' wall clocks. */
 export function analyzePerformance(input) {
-  const runs = new Map(), events = new Map(), seen = new Set()
+  const runs = new Map(), events = new Map(), seen = new Set(), detailRows = []
   let accepted = 0
   for (const raw of input) {
     const row = sanitizePerformanceRecord(raw)
@@ -59,6 +61,7 @@ export function analyzePerformance(input) {
     const key = JSON.stringify(row)
     if (seen.has(key)) continue
     seen.add(key); accepted++
+    detailRows.push(row)
     events.set(row.event, (events.get(row.event) ?? 0) + 1)
     if (!row.runId) continue
     if (!runs.has(row.runId)) runs.set(row.runId, { id: row.runId, local: {}, remote: {}, sdk: {}, status: 'incomplete' })
@@ -70,7 +73,7 @@ export function analyzePerformance(input) {
       run.firstObservedAt = !run.firstObservedAt || row.time < run.firstObservedAt ? row.time : run.firstObservedAt
       run.lastObservedAt = !run.lastObservedAt || row.time > run.lastObservedAt ? row.time : run.lastObservedAt
     }
-    if (/^perf\./.test(row.event) && row.stage && Number.isFinite(row.durationMs)) {
+    if (['perf.local', 'perf.remote', 'perf.sdk'].includes(row.event) && row.stage && Number.isFinite(row.durationMs)) {
       const side = row.event.slice(5)
       // Client and cloud copies describe the same remote mark. Keep one.
       run[side][row.stage] ??= row.durationMs
@@ -119,7 +122,7 @@ export function analyzePerformance(input) {
       cancelled: queries.filter(run => run.status === 'cancelled').length, failed: queries.filter(run => run.status === 'failed').length,
       pairedFirstToken: queries.filter(run => Number.isFinite(run.metrics.transportResidualMs)).length,
       missingFirstToken: queries.filter(run => !Number.isFinite(run.metrics.localFirstTokenMs) && !Number.isFinite(run.metrics.remoteFirstTokenMs)).length },
-    aggregates, groups: [...groups].map(([name, entries]) => ({ name, runs: entries.length,
+    details: analyzeTimingDetails(detailRows, summary), aggregates, groups: [...groups].map(([name, entries]) => ({ name, runs: entries.length,
       remoteFirstToken: summary(entries.map(run => run.metrics.remoteFirstTokenMs)),
       thinkingToText: summary(entries.map(run => run.metrics.thinkingToTextMs)) })), eventCounts: Object.fromEntries(events),
     limitations: ['首 token 是首次收到可用思考、文字或工具参数的观测点；SDK 缺少增量时以完整消息为准，首段正文单独计时。',
@@ -139,6 +142,7 @@ export function formatPerformanceReport(report) {
   lines.push('', '## 每轮记录', '', '| 匿名轮次 | 模型 / effort | 状态 | 本地准备 / ms | 云端首 token / ms | 云端首正文 / ms |',
     '| --- | --- | --- | ---: | ---: | ---: |')
   for (const run of report.runs) lines.push(`| ${run.id} | ${run.model ?? '未知'} / ${run.effort ?? '未知'} | ${run.status} | ${run.metrics.localPreparationMs ?? '—'} | ${run.metrics.remoteFirstTokenMs ?? '—'} | ${run.metrics.remoteFirstTextMs ?? '—'} |`)
+  if (report.details) lines.push(...formatTimingDetails(report.details))
   lines.push('', '## 数据边界', '', ...report.limitations.map(line => `- ${line}`), '')
   return lines.join('\n')
 }
