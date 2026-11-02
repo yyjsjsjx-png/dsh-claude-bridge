@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { BridgeBackend } from '../src/backend.mjs'
 import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } from '../src/catalog-display.mjs'
 import { createClaudeCatalogAdapter } from '../plugin/catalog-adapter.mjs'
+import { MODEL_CATALOG_CACHE_MS } from '../src/catalog-cache-policy.mjs'
 
 const provider = 'claude-sdk-remote'
 const models = [{ value: 'haiku', displayName: 'Haiku', resolvedModel: 'claude-haiku-5-5',
@@ -107,7 +108,7 @@ test('后台失败隔离并退避，手动刷新恢复状态且未变化目录�
   assert.deepEqual(f.backend.displayCatalogStatus, { status: 'ready' })
   assert.equal(f.backend.displayCatalogRefreshAfter, retryAfter)
   assert.equal(catalogs, 2); assert.equal(notifications, 1)
-  f.backend.catalogCache.time = Date.now() - 31_000
+  f.backend.catalogCache.time = Date.now() - MODEL_CATALOG_CACHE_MS - 1
   f.backend.displayCatalogRefreshAfter = 0
   await adapter.listModels(provider)
   await f.backend.displayCatalogRefreshPending
