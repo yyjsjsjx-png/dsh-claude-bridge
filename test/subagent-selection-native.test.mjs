@@ -58,15 +58,25 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     const haiku = { value: 'haiku', displayName: 'Fixture Haiku', supportedEffortLevels: ['low', 'high'] };
     const sonnet = { value: 'sonnet', displayName: 'Fixture Sonnet', supportedEffortLevels: ['medium', 'high'] };
     let catalog = { status: 'ok', models: [haiku, sonnet] };
-    const queries = [];
+    const queries = [], historyReads = [], cloudHistory = new Map();
+    let historyFailure;
     backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers: {
       ...runtime, appendPluginRecord, resolveDshHome: () => directory,
     }, createTransport: async options => ({ peer: {
       async request(method, params) {
-        if (method === 'initialize') return { protocolVersion: 1, authenticated: true };
+        if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { historySync: true } };
         if (method === 'settle') return { status: 'cancelled', toolMayHaveExecuted: false };
+        if (method === 'history') {
+          historyReads.push(params);
+          if (historyFailure) throw historyFailure;
+          return { status: 'ok', sessionId: params.sessionId, records: cloudHistory.get(params.sessionId) ?? [],
+            runs: {}, nextOffset: 1, lastUuid: 'synthetic-history', done: true };
+        }
         assert.equal(method, 'query');
         queries.push(params);
+        cloudHistory.set(params.sessionId, [{ type: 'assistant', uuid: 'synthetic-history',
+          apiId: `fixture-${queries.length}`, model: params.model,
+          content: [{ type: 'text', text: 'synthetic child answer' }] }]);
         await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'assistant',
           message: { id: `fixture-${queries.length}`, model: params.model, content: [{ type: 'text', text: 'synthetic child answer' }] } } });
         await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'result', subtype: 'success' } });
@@ -206,5 +216,83 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       assert.equal(inherited.query.effort, 'high');
       const recovered = await create('remote-recovered', 'low');
       assert.ok(definition(recovered).parameters.properties.reasoning_effort);
+    });
+    await t.test('原生ordinary resolver拒绝live子代理，bridge历史同步复用真实owner且不改变续聊入口', async () => {
+      const { SessionController } = await import(resolveDshModule('@deepseek-ai/dsh-api-session-controller'));
+      const { ClaudeBridgeService } = await import('../plugin/index.mjs');
+      // Only inert gateway/file-upload registration is supplied. The actual
+      // installed controller constructs and owns its native Agent resolver.
+      class Typert extends Service {
+        constructor(inner) {
+          super(inner, 'typert');
+          this.resources = { register() {} };
+          this.lookups = { configure() {} };
+          this.contexts = { configureHost() {} };
+        }
+      }
+      class Uploads extends Service {
+        constructor(inner) { super(inner, 'fileUploads'); }
+        registerAgentResolver() { return () => {}; }
+      }
+      class Queries extends Service {
+        constructor(inner) { super(inner, 'sessionQuery'); }
+        async observeSession(sessionId) {
+          assert.equal(sessionId, 'cold-persisted-child');
+          return { header: { id: sessionId, agentPreset: 'claude-sdk-remote', origin: 'subagent',
+            parentSession: a.id, cwd: directory }, [Symbol.dispose]() {} };
+        }
+      }
+      await ctx.plugin(Typert);
+      await ctx.plugin(Uploads);
+      await ctx.plugin(Queries);
+      let controller;
+      const controllerOwner = ctx.plugin({ inject: ['typert', 'sessions', 'agents', 'sessionProjections', 'fileUploads', 'sessionQuery'],
+        apply: inner => { controller = new SessionController(inner, {}); } });
+      await controllerOwner;
+      const child = ctx.agents.list().find(agent => agent.session.header.origin === 'subagent');
+      assert.ok(child);
+      const nativeRejection = await controller.resolveAgent(child.id);
+      assert.equal(nativeRejection.error.code, 'session/agent-busy');
+      assert.equal(nativeRejection.error.details.reason, 'use subagent delivery for this child session');
+      const host = Object.create(ClaudeBridgeService.prototype);
+      Object.defineProperty(host, 'ctx', { value: ctx });
+      host.backend = backend;
+      host.assertOwner = () => {}; // No transport/principal is involved in this fixture.
+      const queryCount = queries.length;
+      const first = await host.syncSession(child.id);
+      assert.equal(first.status, 'ready');
+      assert.equal(first.added, 0);
+      assert.equal(child._bridgeStatus.recovery.status, 'ready');
+      assert.equal(historyReads.at(-1).dshSessionId, child.id);
+      assert.equal(ctx.agents.get(child.id), child);
+      assert.equal((await host.syncSession(child.id)).added, 0);
+      assert.equal(queries.length, queryCount);
+      assert.equal((await controller.resolveAgent(child.id)).error.code, 'session/agent-busy');
+      assert.equal((await host.syncSession(ordinary.id)).status, 'not-remote');
+      assert.equal((await controller.resolveAgent(a.id)).agent, a);
+      historyFailure = Object.assign(new Error('synthetic history failure'), { code: 'FIXTURE_HISTORY_UNAVAILABLE' });
+      await assert.rejects(host.syncSession(child.id), { code: 'FIXTURE_HISTORY_UNAVAILABLE' });
+      assert.equal(child._bridgeStatus.recovery.status, 'unavailable');
+      assert.equal(child._bridgeStatus.recovery.code, 'FIXTURE_HISTORY_UNAVAILABLE');
+      historyFailure = undefined;
+      assert.equal((await host.syncSession(child.id)).status, 'ready');
+      assert.equal(child._bridgeStatus.recovery.code, undefined);
+
+      // An attached cold child has a Session, never a replacement Agent or a
+      // fabricated idle phase. Its existing history is explicitly read-only.
+      const cold = ctx.sessions.create('cold-remote-child', { meta: { agentPreset: 'claude-sdk-remote',
+        origin: 'subagent', parentSession: a.id, cwd: directory, delegationDepth: 1 } });
+      assert.equal(ctx.agents.get(cold.id), undefined);
+      const readsBeforeCold = historyReads.length;
+      assert.deepEqual(await host.syncSession(cold.id), { status: 'read-only' });
+      assert.equal(ctx.agents.get(cold.id), undefined);
+      assert.equal(historyReads.length, readsBeforeCold);
+      await backend.state.binding('cold-persisted-child', directory);
+      assert.equal(ctx.sessions.get('cold-persisted-child'), undefined);
+      assert.deepEqual(await host.syncSession('cold-persisted-child'), { status: 'read-only' });
+      assert.equal(ctx.agents.get('cold-persisted-child'), undefined);
+      assert.equal(historyReads.length, readsBeforeCold);
+      assert.equal((await host.syncSession(a.id)).status, 'ready');
+      await controllerOwner.dispose();
     });
   });
