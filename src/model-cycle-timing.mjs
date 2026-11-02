@@ -29,7 +29,7 @@ export function createModelCycleTiming({ now = () => performance.now(), onTiming
     const record = { version: 1, runId: run.id, responseId: response.id, metric,
       source: 'host-model-cycle', clock: 'local-monotonic', quality: reason ? 'unknown' : 'precise',
       ...(response.boundary ? { startBoundary: response.boundary } : {}),
-      ...(endBoundary ? { endBoundary } : {}), ...(kind ? { kind } : {}),
+      ...(endBoundary && !reason ? { endBoundary } : {}), ...(kind ? { kind } : {}),
       ...(reason ? { reason } : { durationMs: at - response.at }) }
     try { Promise.resolve(onTiming(record)).catch(() => {}) } catch { /* Observation cannot affect execution. */ }
   }
