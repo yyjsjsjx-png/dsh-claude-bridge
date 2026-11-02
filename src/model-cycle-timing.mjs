@@ -13,13 +13,15 @@ export const MODEL_CYCLE_REASONS = Object.freeze(['CYCLE_START_MISSING', 'TOOL_R
 /** Local application boundaries, not the SDK's unobservable upstream dispatch.
  * One response owns independent first-output and duration records. A batch's
  * final tool-result write starts the next cycle; prepare only confirms it.
+ * prepare(runId, enteredAt) optionally preserves the Host model-request
+ * preparation entry before query is written; it never creates a response.
  * Call finish in the owning run's finally, including exceptional termination. */
 export function createModelCycleTiming({ now = () => performance.now(), onTiming = () => {},
   maximumRuns = 128, maximumResponses = 1024, maximumCalls = 4096 } = {}) {
   for (const value of [maximumRuns, maximumResponses, maximumCalls]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new TypeError('MODEL_CYCLE_LIMIT_INVALID')
   }
-  const runs = new Map()
+  const runs = new Map(), anchors = new Map()
   const atOf = event => event.at === undefined ? now() : event.at
   function publish(run, response, metric, at, { reason, kind, endBoundary } = {}) {
     if (response.emitted.has(metric)) return
@@ -34,6 +36,7 @@ export function createModelCycleTiming({ now = () => performance.now(), onTiming
     try { Promise.resolve(onTiming(record)).catch(() => {}) } catch { /* Observation cannot affect execution. */ }
   }
   function finish(runId, reason) {
+    anchors.delete(runId)
     const run = runs.get(runId)
     if (!run) return
     const terminal = ['CANCELLED', 'CONNECTION_CLOSED'].includes(reason) ? reason : undefined
@@ -157,14 +160,24 @@ export function createModelCycleTiming({ now = () => performance.now(), onTiming
     run.unboundTool = false
   }
   return {
+    prepare(runId, at) {
+      if (!identifier(runId) || !clock(at) || runs.has(runId)) return false
+      if (anchors.has(runId)) return true
+      if (anchors.size >= maximumRuns) return false
+      anchors.set(runId, at)
+      return true
+    },
     observe(event) {
       const { direction, message, origin = {} } = event
       if (!object(message)) return
       const at = atOf(event)
       if (direction === 'sent' && message.method === 'query' && identifier(message.params?.runId)) {
         const id = message.params.runId
+        const prepared = anchors.has(id), enteredAt = anchors.get(id)
+        anchors.delete(id)
         if (runs.has(id) || runs.size >= maximumRuns) return
-        runs.set(id, { id, queryId: message.id, next: { at, boundary: 'query' },
+        runs.set(id, { id, queryId: message.id,
+          next: { at: prepared ? enteredAt : at, boundary: prepared ? 'query-preparation' : 'query' },
           responses: new Map(), incoming: new Map(), toolOwners: new Map() })
         return
       }
@@ -180,6 +193,6 @@ export function createModelCycleTiming({ now = () => performance.now(), onTiming
       else if (direction === 'received' && origin.method === 'query' && message.id === run.queryId) finish(run.id)
     },
     finish,
-    close() { for (const id of [...runs.keys()]) finish(id, 'CONNECTION_CLOSED') },
+    close() { anchors.clear(); for (const id of [...runs.keys()]) finish(id, 'CONNECTION_CLOSED') },
   }
 }

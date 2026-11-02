@@ -170,3 +170,33 @@ test('CLI合成占位不冒充模型响应，观察回调失败不影响下一�
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(rows.length, 2)
 })
+
+test('Host准备入口锚点纳入初始TTFT，发送之前不造响应且旧调用方边界保持明确', () => {
+  const f = fixture(), run = 'run-one'
+  assert.equal(f.timing.prepare(run, 0), true)
+  assert.equal(f.rows.length, 0)
+  assert.equal(f.timing.prepare(run, 50), true, '重复准备保留首个入口')
+  f.at(100); f.query(run)
+  assert.equal(f.timing.prepare(run, 150), false, '已发送后不回溯改时钟')
+  f.at(200); f.start(run, 'one'); f.at(300); f.text(run); f.at(400); f.stop(run)
+  assert.deepEqual(f.rows.map(r => [r.metric, r.startBoundary, r.durationMs]), [
+    ['first-output', 'query-preparation', 300], ['duration', 'query-preparation', 400],
+  ])
+  f.finish(run)
+  f.at(500); f.query(run); f.start(run, 'two'); f.at(600); f.text(run)
+  assert.equal(f.rows.at(-1).startBoundary, 'query'); assert.equal(f.rows.at(-1).durationMs, 100)
+  f.finish(run)
+})
+
+test('未发送的准备锚点有界，并随finish或close清理', () => {
+  const rows = [], timing = createModelCycleTiming({ maximumRuns: 1, onTiming: row => rows.push(row) })
+  assert.equal(timing.prepare('run-invalid', NaN), false)
+  assert.equal(timing.prepare('run-a', 0), true)
+  assert.equal(timing.prepare('run-b', 1), false)
+  timing.finish('run-a')
+  assert.equal(timing.prepare('run-b', 1), true)
+  timing.close()
+  assert.equal(timing.prepare('run-a', 2), true)
+  timing.close()
+  assert.equal(rows.length, 0, 'prepare/finish/close均不能虚构模型response')
+})
