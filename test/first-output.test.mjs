@@ -9,7 +9,7 @@ const delta = (type, content, parent = null) => ({ type: 'stream_event', parent_
   event: { type: 'content_block_delta', delta: { type, ...content } } })
 const metadata = (responseId, ms, kind) => ({ version: 1, responseId, ms, kind, source: 'sdk-first-output-estimate' })
 
-test('远端首非空思考才附估算：头帧、空增量、心跳、签名、工具名均不触发', () => {
+test('远端首非空思考附估算：消息头、空增量、心跳、签名、缺ID工具头均不触发', () => {
   const o = createFirstOutputObserver()
   const h = header('main', 30)
   assert.equal(o.observe(h, 100), h)
@@ -29,6 +29,28 @@ test('远端首非空思考才附估算：头帧、空增量、心跳、签名�
   o.observe({ type: 'stream_event', event: { type: 'message_stop' } }, 230)
   o.observe(header('stopped-empty'), 240)
   assert.equal(o.observe(delta('text_delta', { text: 'replayed after stop' }), 250).bridge_first_output, undefined)
+})
+
+test('合法空参数工具的开始帧立即计首输出，后续参数不挪锚点且沿既有tool-name契约投影', () => {
+  const o = createFirstOutputObserver()
+  const start = block => ({ type: 'stream_event', event: { type: 'content_block_start', content_block: block } })
+  o.observe(header('tool-api', 30), 100)
+  for (const block of [{ type: 'tool_use', name: '', id: 'toolu_1', input: {} },
+    { type: 'tool_use', name: 'mcp__dsh__empty', id: '', input: {} },
+    { type: 'tool_use', id: 'toolu_1', input: {} }]) {
+    assert.equal(o.observe(start(block), 110).bridge_first_output, undefined)
+  }
+  const tool = start({ type: 'tool_use', name: 'mcp__dsh__empty', id: 'toolu_1', input: {} })
+  const measured = o.observe(tool, 125)
+  assert.deepEqual(measured.bridge_first_output, metadata('tool-api', 55, 'tool-name'))
+  assert.equal(tool.bridge_first_output, undefined)
+  assert.equal(o.observe(delta('input_json_delta', { partial_json: '{}' }), 160).bridge_first_output, undefined)
+  assert.equal(o.observe(delta('text_delta', { text: 'later' }), 180).bridge_first_output, undefined)
+  const samples = [], tokens = []
+  observeResponseTiming({ sourceTtft: value => samples.push(value), token: value => tokens.push(value),
+    failCapture() {}, responseCompleted() {} }, measured, { id: 'tool-api' }, 999)
+  assert.deepEqual(samples, [{ responseId: 'tool-api', ms: 55 }])
+  assert.deepEqual(tokens.map(value => value.kind), ['tool-name'])
 })
 
 test('非空 text/thinking 起始内容与 JSON 增量有效，响应分别绑定且重放不移动锚点', () => {

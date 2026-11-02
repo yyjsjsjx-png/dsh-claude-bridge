@@ -43,6 +43,29 @@ test('本机计时在RPC通知排队前观察有效思考，排除头帧与重�
   assert.equal(rows.at(-1).model, 'unknown')
 })
 
+test('Host首输出在合法空参数工具开始帧采样，不等待JSON增量且不记录工具内容', () => {
+  let clock = 10
+  const rows = []
+  const timing = createLocalRunTiming({ now: () => clock, wall: () => 1000, onTiming: row => rows.push(row) })
+  timing.observe({ direction: 'sent', message: { id: 'query-tool', method: 'query', params: {
+    runId: 'run-tool', sessionId: 'sdk-tool' } } })
+  const output = event => timing.observe({ direction: 'received', message: { method: 'sdk.message', params: {
+    runId: 'run-tool', message: { type: 'stream_event', parent_tool_use_id: null, event } } } })
+  clock = 20
+  output({ type: 'message_start', message: { id: 'api-tool' } })
+  output({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'PRIVATE_TOOL', input: {} } })
+  assert.equal(rows.length, 0)
+  clock = 30
+  output({ type: 'content_block_start', content_block: { type: 'tool_use', name: 'PRIVATE_TOOL', id: 'toolu_1', input: {} } })
+  assert.equal(rows.length, 1); assert.equal(rows[0].durationMs, 20)
+  clock = 40
+  output({ type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{}' } })
+  timing.finish('run-tool')
+  assert.equal(rows.filter(row => row.metric === 'first-output').length, 1)
+  assert.equal(rows.at(-1).durationMs, 30)
+  assert.doesNotMatch(JSON.stringify(rows), /PRIVATE_TOOL|toolu_1|partial_json/)
+})
+
 test('额度当前窗口与历史缓存分开，长时间空闲和已重置窗口仍可核对上次读数', () => {
   const observedAt = 1_700_000_000_000
   const snapshot = { status: 'available', source: 'sdk-plan-usage', observedAt, expiresAt: observedAt + 120_000,
