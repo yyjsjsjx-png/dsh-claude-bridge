@@ -63,7 +63,7 @@ function compactTokens(value) {
       try { result = await syncSession(); } catch { result = { status: 'unavailable' }; }
       if (bindingRef.current === binding) {
         if (result?.status === 'unavailable') setSyncFailure(binding);
-        else if (['ready', 'empty', 'not-remote'].includes(result?.status)) setSyncFailure(null);
+        else if (['ready', 'empty', 'not-remote', 'read-only'].includes(result?.status)) setSyncFailure(null);
       }
       return result;
     };
@@ -73,14 +73,15 @@ function compactTokens(value) {
     }, [syncSession]);
     React.useEffect(() => {
       if (state == null || !syncSession || ['running', 'compacting', 'stopping'].includes(state.phase)) return;
-      let cancelled = false, timer, failures = 0, inFlight = false;
+      let cancelled = false, readOnly = false, timer, failures = 0, inFlight = false;
       const sync = async () => {
         clearTimeout(timer);
-        if (cancelled || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
+        if (cancelled || readOnly || inFlight || document.hidden || (typeof navigator !== 'undefined' && navigator.onLine === false)) return;
         inFlight = true;
         let result;
         try { result = await synchronize(); }
         finally { inFlight = false; }
+        if (result?.status === 'read-only') { readOnly = true; return; }
         if (!cancelled) {
           const retry = ['waiting', 'unavailable', 'active'].includes(result?.status);
           if (!retry) failures = 0;
@@ -176,6 +177,28 @@ function compactTokens(value) {
                 'aria-hidden': true, style: { background: row.color } }), row.name),
               React.createElement('dd', null, `~${compactTokens(row.tokens)}`)))))
           : React.createElement('p', { style: { margin: '8px 0 0' } }, '完成一轮对话后更新。')), document.body));
+  }
+
+  /** Read-only child label: lastUsed is folded from request/header, while next
+   * may still be an unsent selection. Catalog names never authorize execution. */
+  function ChildModelBadge({ sessionId, isSubagent = false, useBridgeStatus, useModelSelection, useSessionList, useModelDirectory }) {
+    const bridge = useBridgeStatus(value => value);
+    const selected = useModelSelection(value => value)?.lastUsed;
+    const summary = useSessionList(value => value)?.byId?.[sessionId];
+    const directory = useModelDirectory(value => value);
+    if (bridge == null || (!isSubagent && summary?.origin !== 'subagent')) return null;
+    const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
+    const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
+      ?.find(row => row.id === selected.model) : undefined;
+    const name = model?.name || (known ? selected.model : '型号待确认');
+    const effort = known ? selected.reasoningEffort || '模型默认' : '强度待确认';
+    const title = known
+      ? `此子代理最近一次请求配置：${selected.model}；思考强度：${selected.reasoningEffort || '模型默认（未指定具体等级）'}。\n名称来自已加载目录；来源为原生 request/header，不代表 SDK 解析型号回执。`
+      : '此子代理尚无原生 request/header；不会用父选型或待发送选型代替。';
+    return React.createElement('span', { className: 'dsh-claude-child-model', role: 'status', title,
+      'aria-label': `子代理请求型号 ${name}，思考强度 ${effort}`,
+      style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #666)',
+        maxWidth: '320px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, `${name} · ${effort}`);
   }
 
   function QuotaMeter({ useBridgeStatus, useQuota, readQuota }) {
@@ -338,5 +361,5 @@ function compactTokens(value) {
               : new Date(observedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}${staleSampling ? ' · 缓存读数 · 非实时' : ''}`)), document.body));
   }
 
-  return { SessionMeter, QuotaMeter };
+  return { SessionMeter, QuotaMeter, ChildModelBadge };
 }

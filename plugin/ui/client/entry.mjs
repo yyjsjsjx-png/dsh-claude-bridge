@@ -133,7 +133,7 @@ exports.apply = async function apply(ctx) {
     onAuthenticationRequired: settings.authenticationRequired });
   const picker = createPickerController({ rpc, workspaces: ctx.workspaces, sessions: ctx.sessions,
     uiWorkspace: ctx.uiWorkspace, createStore, textError });
-  const { SessionMeter, QuotaMeter } = createMeterViews({ React, createPortal,
+  const { SessionMeter, QuotaMeter, ChildModelBadge } = createMeterViews({ React, createPortal,
     useAnchoredPosition, useDismissOnOutsidePointer });
   const { MenuItem, HeroButton, Picker, Settings } = createFormViews({ React });
   const historyTasks = new Map();
@@ -171,6 +171,21 @@ exports.apply = async function apply(ctx) {
       ctx.sessions.binding?.(sessionId)?.session.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
       quota: quota.store }, readQuota: quota.readPlanUsage }),
   }, QuotaMeter));
+  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+    name: 'conversation.session.header.utilities', id: 'dsh-claude-child-model', order: 20,
+    inject: sessionId => {
+      const session = ctx.sessions.binding?.(sessionId)?.session;
+      let directory;
+      // directoryFor subscribes to the native shared catalog. Never call load
+      // from this label: opening a child must not fetch models or change them.
+      try { directory = ctx.get?.('modelDirectories')?.directoryFor(sessionId).store; } catch {}
+      return { sessionId, isSubagent: ctx.sessions.subagentAddress?.(sessionId) !== undefined, hooks: {
+        bridgeStatus: session?.projections.faceOf('claudeBridge') ?? ABSENT_STATUS,
+        modelSelection: session?.projections.faceOf('modelSelection') ?? ABSENT_STATUS,
+        sessionList: ctx.sessions.list ?? ABSENT_STATUS, modelDirectory: directory ?? ABSENT_STATUS,
+      } };
+    },
+  }, ChildModelBadge));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,
