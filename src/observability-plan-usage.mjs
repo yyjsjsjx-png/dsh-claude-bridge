@@ -12,13 +12,19 @@ export function retainedPlanUsage(view, now = Date.now()) {
       ? { code: failure.code, observedAt: failure.observedAt } : null,
     inFlight: view?.inFlight === true }
   sampling.active = view?.active === true
-  if (!raw || !Number.isSafeInteger(raw.observedAt) || raw.observedAt > now + 30_000 || now >= raw.observedAt + retainMs) {
+  if (!raw || !Number.isSafeInteger(raw.observedAt) || raw.observedAt > now + 30_000) {
     return { status: 'unavailable', code: sampling.error?.code ?? 'PLAN_LIMITS_UNAVAILABLE', sampling }
   }
   const valid = sanitizePlanUsage(raw, raw.observedAt)
   if (valid.status !== 'available') return { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', sampling }
+  // Validate at the real observation time. Keep that historical reading even
+  // after its display TTL or reset; it is never a claim about today's balance.
+  const lastKnown = valid
   const windows = valid.windows.filter(row => row.resetsAt === null || row.resetsAt > now)
-  if (!windows.length) return { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', sampling }
-  return { ...valid, windows, expiresAt: raw.observedAt + retainMs,
+  if (now >= raw.observedAt + retainMs || !windows.length) {
+    return { status: 'unavailable', code: sampling.error?.code ?? 'PLAN_LIMITS_UNAVAILABLE',
+      sampling: { ...sampling, fresh: false }, lastKnown }
+  }
+  return { ...valid, windows, expiresAt: raw.observedAt + retainMs, lastKnown,
     sampling: { ...sampling, fresh: sampling.fresh && now < raw.expiresAt && now < raw.observedAt + 120_000 } }
 }

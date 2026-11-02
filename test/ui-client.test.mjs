@@ -592,6 +592,21 @@ test('额度底栏同时显示 5h 和有效周剩余，浮层保留明细，过�
   quota = { ...fullQuota, expiresAt: clock - 1 };
   assert.match(textOf(render()), /5h 待刷新/);
   assert.doesNotMatch(textOf(render()), /12%|24%|60%|100%/);
+  const historicalAt = clock - 2 * 86_400_000;
+  quota = { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', windows: [],
+    sampling: { active: false, fresh: false, lastObservedAt: historicalAt },
+    lastKnown: { ...fullQuota, observedAt: historicalAt, expiresAt: historicalAt + 120_000,
+      windows: fullQuota.windows.map(row => ({ ...row, resetsAt: row.id === 'five_hour' ? clock - 86_400_000 : clock + 86_400_000 })) } };
+  assert.equal(textOf(render()).trim(), '5h 上次剩余 12% · 周上次剩余 24%');
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
+  assert.match(textOf(render()), /无运行任务，暂停查询；仅显示缓存读数/);
+  assert.match(textOf(render()), /历史缓存，不代表当前额度/);
+  assert.match(textOf(render()), /原窗口已过重置时间，当前额度待刷新/);
+  assert.match(textOf(render()), /原重置时间/);
+  assert.ok(textOf(render()).includes(new Date(historicalAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })));
+  assert.doesNotMatch(textOf(render()), /暂时无法获取有效额度|刷新失败|100%/);
+  assert.ok(nodesOf(render()).find(node => node.props?.['aria-label'] === '5 小时上次剩余额度'));
+  nodesOf(render()).find(node => node.type === 'button').props.onClick();
   quota = { status: 'unavailable', paused: 'version', code: 'CLIENT_UPDATE_REQUIRED',
     minimumClientVersion: '0.2.5', windows: [] };
   assert.equal(textOf(render()).trim(), '客户端需更新');
@@ -777,6 +792,44 @@ test('旧服务端额度刷新保留退避，新采样目录遵守服务端冷�
   assert.equal(quota.hooks.quota.getSnapshot().status, 'unavailable');
   assert.equal(quota.hooks.quota.getSnapshot().sampling.active, false);
   assert.equal(quota.hooks.quota.getSnapshot().nextRefreshAt, sampling.nextAllowedAt);
+});
+
+test('额度控制器保留Host验证的历史缓存，连接变化和认证门禁清除旧身份读数', async () => {
+  const { createQuotaController } = await import('../plugin/ui/client/quota-controller.mjs');
+  const { retainedPlanUsage } = await import('../src/observability-plan-usage.mjs');
+  const observedAt = Date.now() - 3 * 86_400_000;
+  const lastKnown = { status: 'available', source: 'sdk-plan-usage', observedAt, expiresAt: observedAt + 120_000,
+    windows: [{ id: 'five_hour', name: '5 小时', scope: 'session', usedPercent: 88, resetsAt: observedAt + 3_600_000 }] };
+  const historicalReply = { status: 'unavailable', code: 'PLAN_LIMITS_UNAVAILABLE', lastKnown,
+    sampling: { active: false, fresh: false, lastObservedAt: observedAt } };
+  let reply = historicalReply;
+  let reads = 0;
+  const controller = createQuotaController({ rpc: { async planUsage() { reads++; return { ok: true, value: reply }; } },
+    createStore(value) { return { getSnapshot: () => value, set(next) { value = next; } }; } });
+  await controller.readPlanUsage('manual');
+  assert.equal(controller.store.getSnapshot().status, 'unavailable');
+  assert.deepEqual(controller.store.getSnapshot().lastKnown, lastKnown);
+  reply = { status: 'unavailable', code: 'NETWORK' };
+  await controller.readPlanUsage('manual');
+  assert.deepEqual(controller.store.getSnapshot().lastKnown, lastKnown);
+  for (const [code, paused] of [['AUTH_EXPIRED', 'auth'], ['CLIENT_UPDATE_REQUIRED', 'version']]) {
+    const at = Date.now();
+    reply = retainedPlanUsage({ snapshot: { ...lastKnown, observedAt: at, expiresAt: at + 120_000,
+      windows: lastKnown.windows.map(row => ({ ...row, resetsAt: at + 3_600_000 })) },
+      error: { code, observedAt: at } }, at);
+    assert.equal(reply.status, 'available'); // The actual Host shape still contains the old snapshot.
+    await controller.readPlanUsage('manual');
+    assert.equal(controller.store.getSnapshot().paused, paused);
+    assert.equal(controller.store.getSnapshot().lastKnown, undefined);
+    assert.equal(controller.store.getSnapshot().windows.length, 0);
+  }
+  reply = historicalReply;
+  await controller.readPlanUsage('manual');
+  assert.deepEqual(controller.store.getSnapshot().lastKnown, lastKnown);
+  controller.reset();
+  assert.equal(controller.store.getSnapshot().lastKnown, undefined);
+  assert.equal(reads, 5);
+  controller.dispose();
 });
 
 test('前台空闲每 30 秒核对历史，合并请求，离线隐藏及执行中暂停并清理', async () => {
