@@ -73,7 +73,7 @@ export function analyzePerformance(input) {
       run.firstObservedAt = !run.firstObservedAt || row.time < run.firstObservedAt ? row.time : run.firstObservedAt
       run.lastObservedAt = !run.lastObservedAt || row.time > run.lastObservedAt ? row.time : run.lastObservedAt
     }
-    if (['perf.local', 'perf.remote', 'perf.sdk'].includes(row.event) && row.stage && Number.isFinite(row.durationMs)) {
+    if (['perf.local', 'perf.remote', 'perf.sdk'].includes(row.event) && STAGES.has(row.stage) && Number.isFinite(row.durationMs)) {
       const side = row.event.slice(5)
       // Client and cloud copies describe the same remote mark. Keep one.
       run[side][row.stage] ??= row.durationMs

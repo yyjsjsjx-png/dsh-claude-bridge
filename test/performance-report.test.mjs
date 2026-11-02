@@ -38,6 +38,7 @@ test('详细诊断保留有误差的网络估计、每请求覆盖和有界RPC�
   assert.deepEqual(detail.client.reasonCounts, { SUBMISSION_FAILED: 1 })
   assert.equal(detail.intervals.find(row => row.event === 'perf.rpc').meanMs, 5)
   assert.equal(detail.intervals.find(row => row.stage === 'approval_wait').samples, 1)
+  assert.equal(report.runs[0].remote.approval_wait, undefined)
   const sanitized = rows.map(sanitizePerformanceRecord)
   assert.doesNotMatch(JSON.stringify(sanitized), /PRIVATE|private-|sessionId/)
   assert.deepEqual(analyzePerformance(sanitized).details, detail)

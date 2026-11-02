@@ -1,8 +1,10 @@
 /** Reuse the desktop's usage component with a remote-only numerical projection. */
-export function createUsageProjectionBridge({ React }) {
+export function createUsageProjectionBridge({ React, getClientTiming = () => undefined }) {
   return function installUsageProjection(ctx) {
     if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return () => {};
     const wrappers = new Set();
+    const emptyTiming = Object.freeze({ submissions: 0, samples: 0, totalMs: 0, unknown: 0, pending: 0 });
+    const emptySnapshot = () => emptyTiming, emptySubscribe = () => () => {};
     let closed = false;
     const mount = (slot, field, id) => {
       let native, dispose, reconciling = false;
@@ -22,10 +24,13 @@ export function createUsageProjectionBridge({ React }) {
             const remote = props.useProjection('claudeBridge') != null;
             const measured = props.useProjection('claudeBridgeResponseStats');
             const original = props.useProjection('sessionStats');
+            const store = getClientTiming()?.getStore(props.clientTimingSessionId);
+            const client = React.useSyncExternalStore(store?.subscribe ?? emptySubscribe,
+              store?.getSnapshot ?? emptySnapshot, store?.getSnapshot ?? emptySnapshot);
             const stats = {
               turns: original?.turns ?? 0, steps: original?.steps ?? 0,
               llmMs: original?.llmMs ?? 0, toolMs: original?.toolMs ?? 0,
-              ttftMs: measured?.ttftMs ?? 0, ttftSteps: measured?.ttftSteps ?? 0,
+              ttftMs: client.totalMs, ttftSteps: client.samples,
               decodeMs: measured?.decodeMs ?? 0, decodeTokens: measured?.decodeTokens ?? 0,
             };
             const alias = (key, selector, equal) => {
@@ -41,7 +46,7 @@ export function createUsageProjectionBridge({ React }) {
             // Keep all other translation calls and ordinary sessions native.
             const translate = (key, ...args) => key === 'stats.dialog.ttft'
               ? React.createElement('span', { title:
-                `SDK 首帧时长，加上远端同机观察首帧到首个有效输出的间隔，再按样本取平均；非空正文、思考和工具参数 JSON 增量均算有效输出，排除开始帧、心跳、签名和工具名。此估算含 SDK 缓冲与调度误差，非精确上游计时；${ttftSamples}/${count} 个响应有计时样本，缺证据的响应不计入平均。` }, '首 Token 平均（TTFT）')
+                `客户端提交至同请求首个有效模型输出被 ClientSession 接收处理的平均耗时，含本机准备、队列、网络及服务端等待；非空正文、思考和工具参数增量均算有效输出，排除开始帧、心跳、签名和工具名。不是像素绘制耗时。当前窗口提交 ${client.submissions} 次，有效 ${client.samples} 次，不可测 ${client.unknown} 次，待完成 ${client.pending} 次；旧历史不补造客户端样本，也不混入 SDK 数值。SDK 估算仍单独保留，${ttftSamples}/${count} 个响应有 SDK 样本。` }, '首 Token 平均（TTFT）')
               : key === 'stats.dialog.speed' ? React.createElement('span', { title:
                 `将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有完整接收样本。` }, '接收速度（TPS）')
                 : props.t(key, ...args);
@@ -70,8 +75,13 @@ export function createUsageProjectionBridge({ React }) {
           }
           const component = id === 'activity' ? RemoteActivity : RemoteUsage;
           wrappers.add(component);
+          // Reuse the native injection unchanged, adding only the pane identity
+          // needed to read the same per-window receive-timing store.
+          const inject = id !== 'activity' ? next.inject : function(sessionId, ...args) {
+            return { ...next.inject?.call(this, sessionId, ...args), clientTimingSessionId: sessionId };
+          };
           dispose = ctx.slots.register({ name: slot, ...next.options,
-            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject: next.inject }, component);
+            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject }, component);
         } finally { reconciling = false; }
     };
     const unsubscribe = ctx.slots.subscribe(slot, reconcile);

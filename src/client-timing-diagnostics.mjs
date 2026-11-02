@@ -3,7 +3,7 @@ const REASONS = new Set(['BACKGROUND', 'QUEUED', 'STEERING', 'OVERLAPPING_SUBMIS
   'SESSION_DISPOSED', 'OBSERVER_DISPOSED', 'TIMING_TIMEOUT', 'TIMING_UNAVAILABLE',
   'REQUEST_UNCORRELATED', 'REMOTE_SESSION_CHANGED'])
 const KEYS = new Set(['version', 'sessionId', 'requestId', 'metric', 'quality', 'durationMs', 'reason', 'source', 'clock', 'condition'])
-const identifier = value => typeof value === 'string' && /^[a-zA-Z0-9_.:-]{1,160}$/.test(value)
+const identifier = value => typeof value === 'string' && /^[a-zA-Z0-9_.:/-]{1,160}$/.test(value) && !value.includes('://')
 
 /** Owner-side numeric diagnostics, independent of SDK connections and usage UI. */
 export function createClientTimingRecorder({ isRemoteSession, record, limit = 2048 }) {
