@@ -1,7 +1,7 @@
 // Detailed diagnostics stay independent of the legacy cumulative run-stage report.
 export const DETAIL_STAGES = new Set(['sample', 'unsupported', 'timeout', 'submission', 'first-output',
   'encode', 'write', 'receive', 'notification_wait', 'notification_handle', 'tool_total', 'tool_pipeline',
-  'run_finalize', 'approval_wait', 'callback_drain', 'recovery_save', 'lock_release', 'diagnostic_flush'])
+  'run_finalize', 'approval_wait', 'callback_drain', 'recovery_save', 'lock_release', 'diagnostic_flush', 'duration', 'usage', 'identity', 'receive-span'])
 export const NETWORK_NUMBERS = ['roundTripMs', 'serverResidenceMs', 'networkRoundTripMs',
   'clockOffsetMs', 'offsetLowerMs', 'offsetUpperMs', 'oneWayEstimateMs', 'uncertaintyMs']
 const SIGNED = new Set(['clockOffsetMs', 'offsetLowerMs', 'offsetUpperMs'])
@@ -11,11 +11,17 @@ export function sanitizeTimingDetail(value, output, anonymous) {
   for (const key of [...NETWORK_NUMBERS, 'samples', 'maxMs']) {
     if (Number.isFinite(value[key]) && (SIGNED.has(key) || value[key] >= 0)) output[key] = value[key]
   }
-  for (const key of ['requestId', 'sampleId']) {
-    if (typeof value[key] === 'string' && value[key].length <= 256) output[key] = anonymous(value[key], key === 'requestId' ? 'request' : 'sample')
+  for (const key of ['requestId', 'sampleId', 'responseId']) {
+    if (typeof value[key] === 'string' && value[key].length <= 256) output[key] = anonymous(value[key], key === 'requestId' ? 'request' : key === 'responseId' ? 'response' : 'sample')
   }
-  if (['precise', 'unknown'].includes(value.quality)) output.quality = value.quality
-  if (['client-session-receive', 'host-rpc'].includes(value.source)) output.source = value.source
+  for (const key of ['turn', 'step']) if (Number.isSafeInteger(value[key]) && value[key] >= 0) output[key] = value[key]
+  if (['precise', 'estimated', 'unknown'].includes(value.quality)) output.quality = value.quality
+  if (['client-session-receive', 'host-rpc', 'host-model-cycle', 'sdk-first-output-estimate', 'sdk-stream-receive', 'sdk-message-start', 'sdk-assistant'].includes(value.source)) output.source = value.source
+  if (['query-preparation', 'query', 'tool-results', 'step-prepare'].includes(value.startBoundary)) output.startBoundary = value.startBoundary
+  if (value.endBoundary === 'message-stop') output.endBoundary = value.endBoundary
+  if (['text', 'thinking', 'tool-input', 'tool-name'].includes(value.kind)) output.kind = value.kind
+  if (typeof value.requestedModel === 'string' && /^[a-z][a-z0-9_.:-]{0,100}$/i.test(value.requestedModel)
+    && !/token|key|bearer|secret|password/i.test(value.requestedModel)) output.requestedModel = value.requestedModel
   if (value.clock === 'client-monotonic') output.clock = value.clock
   if (value.assumption === 'symmetric-path') output.assumption = value.assumption
   if (['foreground', 'background', 'queued', 'steering'].includes(value.condition)) output.condition = value.condition

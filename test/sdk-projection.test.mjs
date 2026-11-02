@@ -14,10 +14,70 @@ import { HISTORY_ASSISTANT } from '../src/history-records.mjs'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 import { RESPONSE_TIMING_RECORD, createResponseTimingProjection } from '../src/response-timing.mjs'
 import { MODEL_OBSERVATION_RECORD, createModelObservationProjection } from '../src/model-observation.mjs'
+import { BridgeBackend } from '../src/backend.mjs'
+import { createModelCycleTiming } from '../src/model-cycle-timing.mjs'
+import { createModelCycleProjection, CLIENT_MODEL_TIMING_RECORD, modelCycleRows } from '../src/model-cycle-projection.mjs'
+import { diagnosticRecord } from '../src/diagnostics.mjs'
+import { analyzePerformance } from '../src/performance-report.mjs'
 
 // Run in the installed DSH Electron executable with ELECTRON_RUN_AS_NODE=1.
 // The ordinary Node test suite skips these cases if its ASAR reader is absent.
 const available = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
+
+test('实际rc5投影接线：首步准备与工具续步均落请求记录，四桶/CSV来源保留且未知不丢', { skip: !available }, async () => {
+  const f = await fixture(), runId = 'cycle-run', diagnostics = []
+  const backend = Object.assign(Object.create(BridgeBackend.prototype), { helpers: f.helpers,
+    diagnostics: { event: (event, fields) => diagnostics.push(diagnosticRecord(event, fields)) },
+    runs: new Map(), retiredRuns: new Set(), ctx: { sessions: { async flush() { return true } } } })
+  let step = 0
+  const run = { runId, agent: f.agent, timing() {}, requestedModel: 'haiku', requestedEffort: 'low' }
+  run.projection = new SdkProjection({ agent: f.agent, helpers: f.helpers, runId, turn: 1, step: 1, model: 'haiku',
+    onModelStart: () => ++step, onResponseRecord: (type, data) => backend.recordResponseDiagnostic(run, type, data) })
+  backend.runs.set(runId, run)
+  const cycles = createModelCycleTiming({ onTiming: row => backend.recordModelCycle(row) })
+  const observe = (direction, at, message, origin) => cycles.observe({ direction, at, message, origin })
+  const sdk = async (at, event) => {
+    const params = { runId, message: { type: 'stream_event', event } }
+    observe('received', at, { method: 'sdk.message', params })
+    await backend.notification('sdk.message', params)
+  }
+  cycles.prepare(runId, 0)
+  observe('sent', 20, { method: 'query', id: 'query', params: { runId } })
+  await sdk(30, { type: 'message_start', message: { id: 'response-1', model: 'wire-haiku', usage: {
+    input_tokens: 2, cache_read_input_tokens: 30, cache_creation_input_tokens: 4, output_tokens: 0 } } })
+  await sdk(50, { type: 'content_block_start', index: 0, content_block: {
+    type: 'tool_use', id: 'call-1', name: 'mcp__dsh__fixture', input: {} } })
+  await sdk(60, { type: 'content_block_stop', index: 0 })
+  await sdk(65, { type: 'message_delta', usage: { output_tokens: 5 } })
+  await sdk(70, { type: 'message_stop' })
+  observe('received', 80, { method: 'tool.execute', id: 'tool', params: { runId, callId: 'call-1' } })
+  observe('sent', 100, { id: 'tool', result: { content: [] } }, { method: 'tool.execute', runId, callId: 'call-1' })
+  observe('received', 120, { method: 'step.prepare', id: 'prepare', params: { runId } })
+  observe('sent', 150, { id: 'prepare', result: {} }, { method: 'step.prepare', runId })
+  await sdk(200, { type: 'message_start', message: { id: 'response-2', model: 'wire-haiku', usage: {
+    input_tokens: 3, cache_read_input_tokens: 35, cache_creation_input_tokens: 4, output_tokens: 0 } } })
+  await sdk(220, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+  await sdk(250, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '合成结束' } })
+  await sdk(260, { type: 'content_block_stop', index: 0 })
+  await sdk(280, { type: 'message_delta', usage: { output_tokens: 7 } })
+  await sdk(300, { type: 'message_stop' })
+  cycles.finish(runId)
+  const { z } = await import(resolveDshModule('zod')), projection = createModelCycleProjection(z)
+  const state = f.records.reduce(projection.apply, projection.init({ agentPreset: 'claude-sdk-remote' }))
+  projection.stateSchema.parse(state)
+  const view = projection.wire.viewSchema.parse(projection.wire.view(state))
+  assert.equal(view.responseCount, 2); assert.equal(view.ttftSamples, 2); assert.equal(view.durationSamples, 2)
+  assert.equal(view.ttftMs, 200); assert.equal(view.durationMs, 270)
+  assert.equal(f.records.filter(row => row.type === CLIENT_MODEL_TIMING_RECORD).length, 4)
+  const rows = modelCycleRows(state)
+  assert.deepEqual(rows.map(row => row.usage.outputTokens), [5, 7])
+  assert.deepEqual(rows.map(row => row.usage.cacheWriteTokens), [4, 4])
+  const exported = analyzePerformance(diagnostics).modelRequests
+  assert.equal(exported.length, 2)
+  assert.deepEqual(exported.map(row => row.hostTtftMs), [50, 150])
+  assert.deepEqual(exported.map(row => row.inputContextTokens), [36, 42])
+  assert.equal(diagnostics.some(row => row.code === 'MODEL_TIMING_RECORD_FAILED'), false)
+})
 
 test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订阅逐增量抵达客户端', { skip: !available, timeout: 5000 }, async t => {
   const f = await fixture()

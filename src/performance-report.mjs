@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { analyzeTimingDetails, formatTimingDetails, sanitizeTimingDetail } from './performance-detail.mjs'
+import { analyzeModelRequests } from './model-request-report.mjs'
 
-const EVENTS = /^(?:perf\.(?:local|remote|sdk|network|rpc|client)|run\.[a-z_]+|history\.[a-z_]+|connection\.state|step\.[a-z_]+|tool\.[a-z_]+|diagnostics\.failed|websocket_(?:connect_failed|disconnected|close_timeout)|rpc_(?:request_failed|handler_failed)|start|complete|reserved|resumed|ready|hooks-verified|toolset-verified|dispatch|received|iterator-exited|failed|completed|lock-release-failed)$/
+const EVENTS = /^(?:perf\.(?:local|remote|sdk|network|rpc|client|model_cycle|model_usage|model_sdk|model_identity)|run\.[a-z_]+|history\.[a-z_]+|connection\.state|step\.[a-z_]+|tool\.[a-z_]+|diagnostics\.failed|websocket_(?:connect_failed|disconnected|close_timeout)|rpc_(?:request_failed|handler_failed)|start|complete|reserved|resumed|ready|hooks-verified|toolset-verified|dispatch|received|iterator-exited|failed|completed|lock-release-failed)$/
 const STAGES = new Set(['start', 'connected', 'history_checked', 'request_sent', 'first_model_event', 'first_token',
   'first_text', 'completed', 'hooks_verified', 'toolset_verified', 'ttft_ms', 'ttft_stream_ms',
   'time_to_request_ms', 'first_content_frame_ms', 'duration_ms', 'duration_api_ms',
@@ -122,7 +123,7 @@ export function analyzePerformance(input) {
       cancelled: queries.filter(run => run.status === 'cancelled').length, failed: queries.filter(run => run.status === 'failed').length,
       pairedFirstToken: queries.filter(run => Number.isFinite(run.metrics.transportResidualMs)).length,
       missingFirstToken: queries.filter(run => !Number.isFinite(run.metrics.localFirstTokenMs) && !Number.isFinite(run.metrics.remoteFirstTokenMs)).length },
-    details: analyzeTimingDetails(detailRows, summary), aggregates, groups: [...groups].map(([name, entries]) => ({ name, runs: entries.length,
+    modelRequests: analyzeModelRequests(detailRows), details: analyzeTimingDetails(detailRows, summary), aggregates, groups: [...groups].map(([name, entries]) => ({ name, runs: entries.length,
       remoteFirstToken: summary(entries.map(run => run.metrics.remoteFirstTokenMs)),
       thinkingToText: summary(entries.map(run => run.metrics.thinkingToTextMs)) })), eventCounts: Object.fromEntries(events),
     limitations: ['首 token 是首次收到可用思考、文字或工具参数的观测点；SDK 缺少增量时以完整消息为准，首段正文单独计时。',

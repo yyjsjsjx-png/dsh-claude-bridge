@@ -130,8 +130,10 @@ test('实际rc5 zod：新projection状态/事件/wire schema可用，质量与me
   const unknown = host('run-a', 'response-b', 1, 2, 'duration', { quality: 'unknown', durationMs: undefined,
     endBoundary: undefined, reason: 'RUN_FINISHED' })
   state = projection.apply(state, unknown)
+  state = projection.apply(state, host('run-a', 'response-c', 1, 3, 'first-output', {
+    quality: 'unknown', durationMs: undefined, startBoundary: undefined, reason: 'CYCLE_START_MISSING' }))
   projection.stateSchema.parse(state)
-  assert.equal(projection.wire.view(state).responseCount, 2)
+  assert.equal(projection.wire.view(state).responseCount, 3)
   const corrupted = structuredClone(state)
   corrupted.records[JSON.stringify(['run-a', 'response-a'])].firstOutput.metric = 'duration'
   assert.equal(projection.stateSchema.safeParse(corrupted).success, false)

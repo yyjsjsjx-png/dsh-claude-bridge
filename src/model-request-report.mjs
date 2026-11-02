@@ -13,7 +13,7 @@ const identity = (value, prefix) => {
     : `${prefix}-${createHash('sha256').update(value).digest('hex').slice(0, 12)}`
 }
 const buckets = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens']
-const boundaries = new Set(['query', 'tool-results', 'step-prepare'])
+const boundaries = new Set(['query-preparation', 'query', 'tool-results', 'step-prepare'])
 const kinds = new Set(['text', 'thinking', 'tool-input', 'tool-name'])
 
 const columns = ['runId', 'responseId', 'turn', 'step', 'requestedModel', 'actualModel', 'requestedEffort',

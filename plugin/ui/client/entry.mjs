@@ -98,6 +98,11 @@ exports.apply = async function apply(ctx) {
   });
   const disposeRemote = await ctx.remote.$mount({ package: 'dsh-claude-bridge-ui', descriptors: [
     descriptor('status'),
+    descriptor('modelRequestStats', [{ name: 'value', wire: 'value', source: 'json', codec: {
+      mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ModelRequestStats',
+      create: () => z.object({ sessionId: z.string().min(1).max(160), offset: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(200).optional() }).strict(),
+    } }]),
     descriptor('recordClientTiming', [{ name: 'value', wire: 'value', source: 'json', codec: {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ClientTiming',
       create: () => z.object({ version: z.literal(1), requestId: z.string().min(1).max(160),

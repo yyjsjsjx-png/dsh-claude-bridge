@@ -19,6 +19,12 @@ import { contextSnapshot, initialSessionStatus, reconcileSessionStatus, SESSION_
 import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { retainedPlanUsage } from './observability-plan-usage.mjs'
 import { createLocalRunTiming, startLocalRunPhase } from './local-run-timing.mjs'
+import { createModelCycleTiming } from './model-cycle-timing.mjs'
+import { CLIENT_MODEL_TIMING_RECORD } from './model-cycle-projection.mjs'
+import { RESPONSE_TIMING_RECORD } from './response-timing.mjs'
+import { RESPONSE_USAGE_RECORD } from './response-usage.mjs'
+import { MODEL_OBSERVATION_RECORD } from './model-observation.mjs'
+import { MODEL_CATALOG_CACHE_MS, isModelCatalogAuthFailure } from './catalog-cache-policy.mjs'
 import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult,
   verifiedCloudToolResult, recoveryToolUpdate, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
 import { readHistoryPages } from './history-reader.mjs'
@@ -70,6 +76,7 @@ export class BridgeBackend {
       this.diagnostics.event('host.compatibility', { stage: check.id, evidence: check.evidence, status: check.status })
     }
     this.runs = new Map()
+    this.modelCycles = createModelCycleTiming({ onTiming: row => this.recordModelCycle(row) })
     this.localTiming = createLocalRunTiming({ onTiming: row => {
       if (this.initialized?.capabilities?.observability !== true) return
       const unavailable = () => this.notification('observability.warning', { code: 'OBSERVABILITY_UPLOAD_FAILED', observedAt: Date.now(), gap: true })
@@ -207,6 +214,7 @@ export class BridgeBackend {
 
   async refreshAuthentication() {
     this.planUsageCache = undefined
+    this.catalogCache = undefined
     const identity = this.connectionContext.capture()
     const transport = await this.connect()
     try {
@@ -219,7 +227,10 @@ export class BridgeBackend {
       if (status.loggedIn !== true) throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
       return status
     } catch (error) {
-      if (this.connectionContext.current(identity)) this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
+      if (this.connectionContext.current(identity)) {
+        this.authentication = ['AUTH_REQUIRED', 'AUTH_EXPIRED'].includes(error.code) ? 'login-required' : 'verification-failed'
+        this.catalogCache = undefined
+      }
       throw error
     }
   }
@@ -242,9 +253,10 @@ export class BridgeBackend {
           'step.prepare': (params, context) => this.prepareStep(params, context),
         },
         onNotification: (method, params) => this.notification(method, params),
-        onTraffic: event => this.localTiming.observe(event),
+        onTraffic: event => { this.localTiming.observe(event); this.modelCycles.observe(event) },
         onClose: () => {
           if (this.connectionContext.disconnected(identity, transport)) {
+            this.modelCycles.close()
             this.historyGeneration++
             this.planUsageCache = undefined
           }
@@ -300,7 +312,9 @@ export class BridgeBackend {
 
   async catalog({ refresh = false } = {}) {
     if (this.disposed) throw failure('BRIDGE_DISPOSED', '桥接服务已关闭。')
-    if (!refresh && this.catalogCache && Date.now() - this.catalogCache.time < 30000) return structuredClone(this.catalogCache.reply)
+    if (!refresh && this.authentication === 'login-required') throw failure('AUTH_REQUIRED', '请在服务器上重新完成 Claude 官方登录。')
+    if (!refresh && this.authentication !== 'verification-failed' && this.catalogCache
+      && Date.now() - this.catalogCache.time < MODEL_CATALOG_CACHE_MS) return structuredClone(this.catalogCache.reply)
     if (this.catalogPending) {
       if (!refresh || this.catalogPendingRefresh) return this.catalogPending
       const identity = this.connectionContext.capture()
@@ -325,7 +339,10 @@ export class BridgeBackend {
     })()
     this.catalogPending = pending
     this.catalogPendingRefresh = refresh
-    try { return await pending } finally {
+    try { return await pending } catch (error) {
+      if (this.connectionContext.current(identity) && isModelCatalogAuthFailure(error.code)) this.catalogCache = undefined
+      throw error
+    } finally {
       if (this.catalogPending === pending) { this.catalogPending = undefined; this.catalogPendingRefresh = undefined }
     }
   }
@@ -527,6 +544,7 @@ export class BridgeBackend {
     }
     const before = run.agent.session.seq
     await run.projection.accept(params.message)
+    this.flushModelCycles(run)
     const after = run.agent.session.seq
     // Live deltas only update the renderer. Flush each new durable record,
     // and conservatively retain the old behavior without a monotonic counter.
@@ -538,6 +556,53 @@ export class BridgeBackend {
   async checkpoint(session) {
     if (typeof this.ctx.sessions?.flush !== 'function' || await this.ctx.sessions.flush(session) !== true) {
       throw failure('DURABILITY_UNAVAILABLE', '无法确认本机会话已可靠保存，已停止派发。')
+    }
+  }
+
+  recordModelCycle(row) {
+    const run = this.runs.get(row.runId)
+    if (!run || run.kind === 'compact' || !row.responseId) return
+    run.modelCyclePending ??= new Map()
+    run.modelCyclePending.set(JSON.stringify([row.responseId, row.metric]), row)
+    this.flushModelCycles(run)
+  }
+
+  flushModelCycles(run) {
+    if (!run.modelCyclePending) return
+    for (const [key, row] of run.modelCyclePending) {
+      const response = run.projection?.responses.get(row.responseId)
+      if (!response) continue
+      const data = { version: 1, runId: run.runId, responseId: row.responseId, turn: response.turn, step: response.step,
+        metric: row.metric, quality: row.quality, source: 'host-model-cycle', clock: 'local-monotonic',
+        ...(row.startBoundary ? { startBoundary: row.startBoundary } : {}),
+        ...(row.endBoundary ? { endBoundary: row.endBoundary } : {}), ...(row.kind ? { kind: row.kind } : {}),
+        ...(row.quality === 'precise' ? { durationMs: row.durationMs } : { reason: row.reason }) }
+      try { this.helpers.appendPluginRecord(run.agent.session, CLIENT_MODEL_TIMING_RECORD, data) }
+      catch { this.diagnostics.event('diagnostics.failed', { runId: run.runId, code: 'MODEL_TIMING_RECORD_FAILED' }) }
+      this.diagnostics.event('perf.model_cycle', { runId: row.runId, responseId: row.responseId, turn: response.turn, step: response.step,
+        stage: row.metric, quality: row.quality, durationMs: row.durationMs, code: row.reason,
+        source: row.source, startBoundary: row.startBoundary, endBoundary: row.endBoundary, kind: row.kind })
+      run.modelCyclePending.delete(key)
+    }
+  }
+
+  recordResponseDiagnostic(run, type, data) {
+    const base = { runId: run.runId, responseId: data.responseId, turn: data.turn, step: data.step,
+      requestedModel: run.requestedModel, effort: run.requestedEffort }
+    if (type === RESPONSE_USAGE_RECORD) {
+      const u = data.usage
+      this.diagnostics.event('perf.model_usage', { ...base, stage: 'usage', inputTokens: u.uncachedInputTokens,
+        cacheReadTokens: u.cacheReadTokens, cacheWriteTokens: u.cacheWriteTokens, outputTokens: u.outputTokens })
+    } else if (type === MODEL_OBSERVATION_RECORD) {
+      this.diagnostics.event('perf.model_identity', { ...base, stage: 'identity', requestedModel: data.requestedModel,
+        model: data.actualModel, source: data.source })
+    } else if (type === RESPONSE_TIMING_RECORD) {
+      this.diagnostics.event('perf.model_sdk', { ...base, stage: 'first-output', source: 'sdk-first-output-estimate',
+        quality: data.ttft.status === 'known' ? 'estimated' : 'unknown',
+        durationMs: data.ttft.ms, code: data.ttft.status === 'known' ? undefined : 'SDK_TTFT_UNAVAILABLE' })
+      this.diagnostics.event('perf.model_sdk', { ...base, stage: 'receive-span', source: 'sdk-stream-receive',
+        quality: data.tps.status === 'known' ? 'precise' : 'unknown', durationMs: data.tps.durationMs,
+        outputTokens: data.tps.outputTokens, code: data.tps.status === 'known' ? undefined : 'SDK_RECEIVE_SPAN_UNAVAILABLE' })
     }
   }
 
@@ -952,7 +1017,7 @@ export class BridgeBackend {
     const run = { runId, agent, turn, steps, get step() { return steps.current },
       signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
-      compatibility: converted.compatibility,
+      compatibility: converted.compatibility, requestedModel: selected.model, requestedEffort: selected.reasoningEffort,
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
     let onStop, startedAt
     await this.state.beginRun(agent.id, runId, 'query', { turn, step })
@@ -974,6 +1039,7 @@ export class BridgeBackend {
         writeStatus: patch => this.sessionStatus(agent, patch),
         writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
       run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
+        onResponseRecord: (type, data) => this.recordResponseDiagnostic(run, type, data),
         onStarted: () => this.state.markStarted(agent.id),
         onProgress: event => run.progress.accept(event),
         onFirstToken: type => timing('first_token', type),
@@ -999,6 +1065,7 @@ export class BridgeBackend {
       }
       this.listenForRunStop(run, onStop)
       this.diagnostics.event('run.started', { runId, sessionId: agent.id, deviceId: binding.deviceId, stage: 'query' })
+      this.modelCycles.prepare(runId, enteredAt)
       startedAt = Date.now()
       await this.checkpoint(agent.session)
       signal.throwIfAborted()
@@ -1042,8 +1109,10 @@ export class BridgeBackend {
       startedAt ??= Date.now()
       if (run.preparationError && !signal.aborted) error = run.preparationError
       run.progress?.close()
+      if (isModelCatalogAuthFailure(error.code)) this.catalogCache = undefined
       if (['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_FLOW_FAILED'].includes(error.code)) {
         this.authentication = error.code === 'AUTH_FLOW_FAILED' ? 'verification-failed' : 'login-required'
+        this.catalogCache = undefined
       }
       if (signal.aborted) {
         await run.stopPersistence
@@ -1076,6 +1145,8 @@ export class BridgeBackend {
         errorName: error.name, durationMs: Date.now() - startedAt })
       throw error
     } finally {
+      this.modelCycles.finish(runId, signal.aborted ? 'CANCELLED' : 'RUN_FINISHED')
+      this.flushModelCycles(run)
       await this.detachRun(run, onStop)
       this.localTiming.finish(runId)
       await this.finishRunResources(run, Boolean(run.toolOutcomeUnknown || run.journalError))

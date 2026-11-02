@@ -13,6 +13,7 @@ import { HISTORY_ASSISTANT, HISTORY_TOOL_RESULT } from '../src/history-records.m
 import { createHash } from 'node:crypto'
 import { requiredShellName } from '../src/remote-capabilities.mjs'
 import { prepareRequestMessages } from '../src/request-preparation.mjs'
+import { MODEL_CATALOG_CACHE_MS } from '../src/catalog-cache-policy.mjs'
 
 const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
@@ -656,8 +657,17 @@ test('目录解析并发与短期重复读取只请求一次，手动刷新另�
   await Promise.all(Array.from({ length: 20 }, () => f.backend.catalog()))
   await f.backend.catalog()
   assert.equal(catalogs, 1); assert.equal(auth, 0)
+  f.backend.catalogCache.time = Date.now() - 31_000
+  await f.backend.catalog()
+  assert.equal(catalogs, 1)
+  f.backend.catalogCache.time = Date.now() - MODEL_CATALOG_CACHE_MS - 1
+  await f.backend.catalog()
+  assert.equal(catalogs, 2)
   await f.backend.catalog({ refresh: true })
-  assert.equal(catalogs, 2); assert.equal(auth, 1)
+  assert.equal(catalogs, 3); assert.equal(auth, 1)
+  f.backend.authentication = 'login-required'
+  await assert.rejects(f.backend.catalog(), { code: 'AUTH_REQUIRED' })
+  assert.equal(catalogs, 3)
 })
 
 test('用量按轮次累加 token，SDK 累计费用每会话只取最近一次', () => {
@@ -1565,7 +1575,7 @@ test('失败和取消后必须核对历史，已收到 completed 但通知 drain
   assert.deepEqual(f.counters, { history: 3, query: 7 })
 })
 
-test('步骤复用当轮图片能力快照，目录超过30秒只在下一轮重新读取', async t => {
+test('步骤复用当轮图片能力快照，目录超过缓存有效期只在下一轮重新读取', async t => {
   let catalogs = 0, queries = 0
   const f = await fixture(t, async options => ({ peer: { async request(method, params) {
     if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
@@ -1574,7 +1584,7 @@ test('步骤复用当轮图片能力快照，目录超过30秒只在下一轮重
     assert.equal(method, 'query'); queries++
     assert.equal(params.tools.some(tool => tool.name === 'read_image'), queries === 1)
     if (queries === 1) {
-      f.backend.catalogCache.time = Date.now() - 31_000
+      f.backend.catalogCache.time = Date.now() - MODEL_CATALOG_CACHE_MS - 1
       f.backend.catalogCache.reply.models[0].inputModalities = ['text']
       assert.deepEqual(await options.handlers['step.prepare']({ runId: params.runId },
         { signal: new AbortController().signal }), {})

@@ -1295,7 +1295,8 @@ function createClientReceiveTiming({ now = () => performance.now(), document: do
           if (arrival.type !== 'assistant-stream' || result?.type !== 'transient') return;
           const event = result.entry?.event, chunk = event?.data?.chunk;
           if (event?.type === 'assistant/live-chunk' && (['text-delta', 'reasoning-delta'].includes(chunk?.type)
-            && nonempty(chunk.text) || chunk?.type === 'tool-call-delta' && nonempty(chunk.argumentsDelta))) {
+            && nonempty(chunk.text) || chunk?.type === 'tool-call-delta'
+              && (nonempty(chunk.argumentsDelta) || nonempty(chunk.id) && nonempty(chunk.name)))) {
             output(event.data, arrival.at, true);
           }
         });
@@ -1394,12 +1395,10 @@ function createClientReceiveTiming({ now = () => performance.now(), document: do
     subscribe: (sessionId, listener) => getStore(sessionId).subscribe(listener) };
 }
 
-function createUsageProjectionBridge({ React, getClientTiming = () => undefined }) {
+function createUsageProjectionBridge({ React }) {
   return function installUsageProjection(ctx) {
     if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return () => {};
     const wrappers = new Set();
-    const emptyTiming = Object.freeze({ submissions: 0, samples: 0, totalMs: 0, unknown: 0, pending: 0 });
-    const emptySnapshot = () => emptyTiming, emptySubscribe = () => () => {};
     let closed = false;
     const mount = (slot, field, id) => {
       let native, dispose, reconciling = false;
@@ -1419,13 +1418,11 @@ function createUsageProjectionBridge({ React, getClientTiming = () => undefined 
             const remote = props.useProjection('claudeBridge') != null;
             const measured = props.useProjection('claudeBridgeResponseStats');
             const original = props.useProjection('sessionStats');
-            const store = getClientTiming()?.getStore(props.clientTimingSessionId);
-            const client = React.useSyncExternalStore(store?.subscribe ?? emptySubscribe,
-              store?.getSnapshot ?? emptySnapshot, store?.getSnapshot ?? emptySnapshot);
+            const cycles = props.useProjection('claudeBridgeModelStats');
             const stats = {
               turns: original?.turns ?? 0, steps: original?.steps ?? 0,
               llmMs: original?.llmMs ?? 0, toolMs: original?.toolMs ?? 0,
-              ttftMs: client.totalMs, ttftSteps: client.samples,
+              ttftMs: cycles?.ttftMs ?? 0, ttftSteps: cycles?.ttftSamples ?? 0,
               decodeMs: measured?.decodeMs ?? 0, decodeTokens: measured?.decodeTokens ?? 0,
             };
             const alias = (key, selector, equal) => {
@@ -1441,7 +1438,7 @@ function createUsageProjectionBridge({ React, getClientTiming = () => undefined 
             // Keep all other translation calls and ordinary sessions native.
             const translate = (key, ...args) => key === 'stats.dialog.ttft'
               ? React.createElement('span', { title:
-                `客户端提交至同请求首个有效模型输出被 ClientSession 接收处理的平均耗时，含本机准备、队列、网络及服务端等待；非空正文、思考和工具参数增量均算有效输出，排除开始帧、心跳、签名和工具名。不是像素绘制耗时。当前窗口提交 ${client.submissions} 次，有效 ${client.samples} 次，不可测 ${client.unknown} 次，待完成 ${client.pending} 次；旧历史不补造客户端样本，也不混入 SDK 数值。SDK 估算仍单独保留，${ttftSamples}/${count} 个响应有 SDK 样本。` }, '首 Token 平均（TTFT）')
+                `按每个模型请求／响应周期统计本机 Host 首有效输出往返：首步从本机请求准备入口起计，工具续步从该批最后一个工具结果交给输出流起计，并经续步准备确认；含本机准备、上传、远端处理、SDK 等待及下行接收。正文、思考、合法工具调用开始均算有效输出，排除心跳、签名和空内容；不是浏览器绘制或上游精确发包时间。${cycles?.ttftSamples ?? 0}/${cycles?.responseCount ?? count} 个模型响应有客户端样本，缺起点或历史记录不补猜、不混入 SDK。SDK 估算单独保留，${ttftSamples}/${count} 个响应有 SDK 样本。` }, '首 Token 平均（TTFT）')
               : key === 'stats.dialog.speed' ? React.createElement('span', { title:
                 `将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有完整接收样本。` }, '接收速度（TPS）')
                 : props.t(key, ...args);
@@ -1470,13 +1467,8 @@ function createUsageProjectionBridge({ React, getClientTiming = () => undefined 
           }
           const component = id === 'activity' ? RemoteActivity : RemoteUsage;
           wrappers.add(component);
-          // Reuse the native injection unchanged, adding only the pane identity
-          // needed to read the same per-window receive-timing store.
-          const inject = id !== 'activity' ? next.inject : function(sessionId, ...args) {
-            return { ...next.inject?.call(this, sessionId, ...args), clientTimingSessionId: sessionId };
-          };
           dispose = ctx.slots.register({ name: slot, ...next.options,
-            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject }, component);
+            priority: (next.options.priority ?? 0) - 1, locale: next.locale, inject: next.inject }, component);
         } finally { reconciling = false; }
     };
     const unsubscribe = ctx.slots.subscribe(slot, reconcile);
@@ -1588,6 +1580,11 @@ exports.apply = async function apply(ctx) {
   });
   const disposeRemote = await ctx.remote.$mount({ package: 'dsh-claude-bridge-ui', descriptors: [
     descriptor('status'),
+    descriptor('modelRequestStats', [{ name: 'value', wire: 'value', source: 'json', codec: {
+      mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ModelRequestStats',
+      create: () => z.object({ sessionId: z.string().min(1).max(160), offset: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(200).optional() }).strict(),
+    } }]),
     descriptor('recordClientTiming', [{ name: 'value', wire: 'value', source: 'json', codec: {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ClientTiming',
       create: () => z.object({ version: z.literal(1), requestId: z.string().min(1).max(160),

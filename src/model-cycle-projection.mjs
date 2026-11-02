@@ -71,7 +71,7 @@ const timingMetadata = row => row ? { quality: row.quality, startBoundary: row.s
 /** Metadata only; no transcript, model prose, tool arguments or aggregate run
  * usage is used to invent response rows. Missing reasoning/effort stays unknown. */
 export function modelCycleRows(state) {
-  if (state === null) return []
+  if (state == null) return []
   const usage = Object.fromEntries(Object.values(state.sdkUsage.responses).map(row => [keyOf(row), row.usage]))
   return Object.entries(coordinates(state)).map(([key, row]) => {
     const metrics = state.records[key] ?? {}, sdk = state.sdkTiming.records[key], model = state.models[key]?.current
@@ -102,9 +102,9 @@ export function createModelCycleProjection(z) {
     durationMs: ms.optional(), reason: reason.optional(),
     kind: z.enum(['text', 'thinking', 'tool-input', 'tool-name']).optional(),
     source: z.literal('host-model-cycle'), clock: z.literal('local-monotonic'),
-    startBoundary: z.enum(['query', 'tool-results', 'step-prepare']),
+    startBoundary: z.enum(['query-preparation', 'query', 'tool-results', 'step-prepare']).optional(),
     endBoundary: z.literal('message-stop').optional() }).strict()
-    .refine(row => row.quality === 'precise' ? row.durationMs !== undefined && row.reason === undefined
+    .refine(row => row.quality === 'precise' ? row.durationMs !== undefined && row.startBoundary !== undefined && row.reason === undefined
       : row.reason !== undefined && row.durationMs === undefined && row.endBoundary === undefined,
     { message: '模型请求计时缺少对应质量的证据' })
     .refine(row => row.metric !== 'duration' || row.quality !== 'precise' || row.endBoundary === 'message-stop',

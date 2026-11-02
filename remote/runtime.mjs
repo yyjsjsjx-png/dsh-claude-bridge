@@ -13,6 +13,7 @@ import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { validateContextPreferences } from '../src/context-preferences.mjs'
 import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
 import { createFirstOutputObserver } from './first-output.mjs'
+import { firstOutputKind } from '../src/sdk-output-kind.mjs'
 import { createRunObservations } from './run-observations.mjs'
 import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
@@ -1075,12 +1076,10 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
             || (message?.type === 'assistant' && !isNoResponsePlaceholder(message.message)))) {
             if (!firstModelEvent) { firstModelEvent = true; timing('first_model_event') }
             const delta = message.event?.type === 'content_block_delta' ? message.event.delta : undefined
-            const token = delta?.type === 'text_delta' ? delta.text : delta?.type === 'thinking_delta'
-              ? delta.thinking : delta?.type === 'input_json_delta' ? delta.partial_json : undefined
             const full = message.type === 'assistant' ? message.message?.content : undefined
-            if (!firstToken && ((typeof token === 'string' && token.length)
+            if (!firstToken && (firstOutputKind(message.event)
               || full?.some(block => (block.type === 'text' && block.text?.length)
-                || (block.type === 'thinking' && block.thinking?.length) || block.type === 'tool_use'))) {
+                || (block.type === 'thinking' && block.thinking?.length) || block.type === 'tool_use' && block.id?.length && block.name?.length))) {
               firstToken = true; timing('first_token')
             }
             if (!firstText && ((delta?.type === 'text_delta' && delta.text?.length)

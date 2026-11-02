@@ -1,9 +1,9 @@
 import { mkdir, appendFile, rename, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const STRING_FIELDS = new Set(['stage', 'code', 'method', 'requestId', 'sessionId', 'deviceId', 'runId', 'callId', 'toolName', 'status', 'signal', 'errorName', 'model', 'effort', 'quality', 'source', 'clock', 'assumption', 'condition', 'sampleId'])
+const STRING_FIELDS = new Set(['stage', 'code', 'method', 'requestId', 'sessionId', 'deviceId', 'runId', 'callId', 'toolName', 'status', 'signal', 'errorName', 'model', 'effort', 'quality', 'source', 'clock', 'assumption', 'condition', 'sampleId', 'responseId', 'requestedModel', 'startBoundary', 'endBoundary', 'kind'])
 const NUMBER_FIELDS = new Set(['durationMs', 'bytes', 'inputBytes', 'outputBytes', 'exitCode', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
-  'roundTripMs', 'serverResidenceMs', 'networkRoundTripMs', 'clockOffsetMs', 'offsetLowerMs', 'offsetUpperMs', 'oneWayEstimateMs', 'uncertaintyMs', 'samples', 'maxMs'])
+  'roundTripMs', 'serverResidenceMs', 'networkRoundTripMs', 'clockOffsetMs', 'offsetLowerMs', 'offsetUpperMs', 'oneWayEstimateMs', 'uncertaintyMs', 'samples', 'maxMs', 'turn', 'step'])
 const EVIDENCE_LEVELS = new Set(['interface', 'synthetic', 'desktop', 'real-sdk'])
 
 function safeLabel(value) {
