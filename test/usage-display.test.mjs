@@ -113,11 +113,11 @@ test('速度复用原生统计组件，运行中采样即更新，旧会话缺�
   assert.equal(active.props.useProjection('sessionStats', state => state.decodeTokens), 1200)
   const ttftLabel = active.props.t('stats.dialog.ttft'), tpsLabel = active.props.t('stats.dialog.speed')
   assert.equal(ttftLabel.type, 'span')
-  assert.equal(ttftLabel.children[0], '首 Token 平均（TTFT）')
+  assert.equal(ttftLabel.children[0], 'stats.dialog.ttft')
   assert.equal(tpsLabel.children[0], '接收速度（TPS）')
-  assert.match(ttftLabel.props.title, /SDK 首帧时长.*远端同机.*首个有效输出.*平均/)
-  assert.match(ttftLabel.props.title, /非空正文、思考和工具参数 JSON 增量.*排除开始帧、心跳、签名和工具名/)
-  assert.match(ttftLabel.props.title, /SDK 缓冲与调度误差.*非精确上游计时.*2\/2/)
+  assert.match(ttftLabel.props.title, /客户端观察不可用或暂无样本，当前显示 SDK 首有效输出/)
+  assert.match(ttftLabel.props.title, /独立 SDK 首有效输出均值：2.5 s，2\/2/)
+  assert.match(ttftLabel.props.title, /包含缓冲与调度误差.*非精确上游计时.*两套分母独立.*不混合平均/)
   assert.match(tpsLabel.props.title, /同一完整响应的输出 Token.*原始 SDK message_start.*最后有效内容帧/)
   assert.match(tpsLabel.props.title, /汇总后计算接收速度.*本机观察窗口.*思考阶段和缓冲影响.*不代表上游生成测速.*2\/2/)
   assert.equal(active.props.t('stats.dialog.title'), 'stats.dialog.title')
@@ -141,7 +141,7 @@ test('速度复用原生统计组件，运行中采样即更新，旧会话缺�
   assert.equal(entries.length, 1)
 })
 
-test('远程弹窗独立显示客户端与SDK均值，缺客户端观察保持未知，普通及紧凑模式仍委托原生', () => {
+test('原生TTFT只映射客户端均值，无样本明确回退SDK，原生布局及其它数字源保留', () => {
   const Native = () => {}, NativeAssistant = () => {}, entries = [], callbacks = new Map(), calls = []
   const nativeInject = id => ({ nativeSession: id })
   entries.push({ options: { id: 'activity' }, locale: 'chat', inject: nativeInject, component: Native, slot: 'conversation.composer.dock' },
@@ -159,13 +159,10 @@ test('远程弹窗独立显示客户端与SDK均值，缺客户端观察保持�
     },
   } }
   const React = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
-    useMemo: fn => fn(), useSyncExternalStore: (_subscribe, get) => get(), useState: () => [true, () => {}],
-    useRef: () => ({ current: null }), useEffect() {},
-  }
-  const previousDocument = globalThis.document
-  globalThis.document = { body: {} }
-  const dispose = createUsageProjectionBridge({ React, createPortal: content => content,
-    useAnchoredPosition: () => ({ left: 10, top: 10 }), useDismissOnOutsidePointer() {},
+    useSyncExternalStore: (_subscribe, get) => get() }
+  const dispose = createUsageProjectionBridge({ React,
+    createPortal: () => assert.fail('统计界面必须由NativeUsage绘制'),
+    useAnchoredPosition: () => assert.fail('不得自制浮层'), useDismissOnOutsidePointer: () => assert.fail('不得自制浮层'),
     createClientFirstOutput: () => ({ bind(...args) { calls.push(args); return observer }, dispose() { disposed = true } }),
   })(ctx)
   try {
@@ -175,32 +172,47 @@ test('远程弹窗独立显示客户端与SDK均值，缺客户端观察保持�
     assert.equal(injection.clientFirstOutput, observer)
     assert.deepEqual(calls[0], ['session', session, scope])
     let remote = true, mode = 'standard'
+    let measured = { responseCount: 5, ttftMs: 148, ttftSteps: 4, decodeMs: 1000, decodeTokens: 20, tpsSamples: 3 }
     const props = { ...injection, usePerformanceUsage: () => mode, t: key => key,
       useProjection(key) {
         if (key === 'claudeBridge') return remote ? {} : null
-        if (key === 'claudeBridgeResponseStats') return { responseCount: 5, ttftMs: 148, ttftSteps: 4, decodeMs: 1000, decodeTokens: 20, tpsSamples: 3 }
-        return { turns: 2, steps: 7, llmMs: 3000, toolMs: 1000 }
+        if (key === 'claudeBridgeResponseStats') return measured
+        return { turns: 2, steps: 7, llmMs: 3000, toolMs: 1000, ttftMs: 9999, ttftSteps: 9,
+          decodeMs: 250, decodeTokens: 500 }
       },
     }
-    const render = () => { const view = activity.component(props); return view.type === Native ? view : view.type(view.props) }
-    const find = (node, predicate) => !node || typeof node !== 'object' ? undefined
-      : predicate(node) ? node : node.children?.map(child => find(child, predicate)).find(Boolean)
-    const pairs = tree => {
-      const list = find(tree, node => node.type === 'dl').children, result = new Map()
-      for (let i = 0; i < list.length; i += 2) result.set(list[i].children[0], { value: list[i + 1].children[0], title: list[i].props.title })
-      return result
+    const render = () => {
+      const view = activity.component(props)
+      assert.equal(view.type, Native)
+      assert.deepEqual(view.children, []) // No bridge button, portal, icon or layout.
+      assert.equal(view.props.usePerformanceUsage, props.usePerformanceUsage)
+      assert.equal(view.props.t('stats.dialog.title'), 'stats.dialog.title')
+      return view
     }
-    let values = pairs(render())
-    assert.equal(values.size, 5)
-    assert.equal(values.get('客户端首字显示（观察）').value, '220 ms')
-    assert.match(values.get('客户端首字显示（观察）').title, /2\/3 次客户端提交.*旧历史缺观察为未知/)
-    assert.equal(values.get('SDK 首有效输出（估算）').value, '37 ms')
-    assert.match(values.get('SDK 首有效输出（估算）').title, /4\/5 个响应.*分母独立/)
-    assert.equal(values.get('接收速度（TPS）').value, '20 tok/s')
+    let view = render(), stats = view.props.useProjection('sessionStats')
+    assert.deepEqual(stats, { turns: 2, steps: 7, llmMs: 3000, toolMs: 1000,
+      ttftMs: 440, ttftSteps: 2, decodeMs: 1000, decodeTokens: 20 })
+    assert.equal(stats.ttftMs / stats.ttftSteps, 220)
+    assert.equal(view.props.useProjection('sessionStats', value => value.ttftMs), 440)
+    assert.equal(view.props.useProjection('claudeBridgeResponseStats'), measured)
+    let label = view.props.t('stats.dialog.ttft')
+    assert.equal(label.children[0], 'stats.dialog.ttft') // Original native locale text.
+    assert.match(label.props.title, /当前显示客户端首字显示（观察）.*客户端 2\/3/)
+    assert.match(label.props.title, /独立 SDK 首有效输出均值：37 ms，4\/5.*两套分母独立/)
     snapshot = { version: 1, submissions: 1, samples: 0, totalMs: 0 }
-    values = pairs(render())
-    assert.equal(values.get('客户端首字显示（观察）').value, '未知')
-    assert.equal(values.get('SDK 首有效输出（估算）').value, '37 ms')
+    view = render(); stats = view.props.useProjection('sessionStats')
+    assert.equal(stats.ttftMs, 148)
+    assert.equal(stats.ttftSteps, 4)
+    assert.match(view.props.t('stats.dialog.ttft').props.title, /暂无样本，当前显示 SDK.*客户端 0\/1/)
+    measured = null
+    view = render(); stats = view.props.useProjection('sessionStats')
+    assert.equal(stats.ttftMs, 0)
+    assert.equal(stats.ttftSteps, 0) // No fake divisor; native rc5 omits an unknown row.
+    assert.match(view.props.t('stats.dialog.ttft').props.title, /SDK 首有效输出均值：未知.*均无证据时为未知/)
+    measured = { responseCount: 5, ttftMs: 148, ttftSteps: 4, decodeMs: 1000, decodeTokens: 20, tpsSamples: 3 }
+    delete props.clientFirstOutput
+    assert.equal(render().props.useProjection('sessionStats').ttftMs, 148)
+    assert.match(render().props.t('stats.dialog.ttft').props.title, /当前显示 SDK.*客户端 0\/0/)
     mode = 'compact'
     assert.equal(render().type, Native)
     remote = false
@@ -209,7 +221,7 @@ test('远程弹窗独立显示客户端与SDK均值，缺客户端观察保持�
     const assistant = entries.find(entry => entry.slot === 'conversation.chat.node' && entry.component !== NativeAssistant)
     assert.equal(assistant.component(props).type, NativeAssistant)
     assert.equal(assistant.component(props).props, props)
-  } finally { dispose(); globalThis.document = previousDocument }
+  } finally { dispose() }
   assert.equal(disposed, true)
   assert.equal(entries.length, 2)
 })

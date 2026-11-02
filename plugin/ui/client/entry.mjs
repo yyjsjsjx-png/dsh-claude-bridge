@@ -85,8 +85,7 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
 };
 
 exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'remote.session'];
-exports.installUsageProjection = createUsageProjectionBridge({ React, createClientFirstOutput, createPortal,
-  useAnchoredPosition, useDismissOnOutsidePointer });
+exports.installUsageProjection = createUsageProjectionBridge({ React, createClientFirstOutput });
 
 exports.apply = async function apply(ctx) {
   ctx.effect(() => exports.installUsageProjection(ctx), '远程会话用量展示');

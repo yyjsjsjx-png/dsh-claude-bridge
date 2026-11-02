@@ -179,7 +179,7 @@ function compactTokens(value) {
           : React.createElement('p', { style: { margin: '8px 0 0' } }, '完成一轮对话后更新。')), document.body));
   }
 
-  /** Requested selection and per-response SDK evidence are independent. */
+  /** Child-only label; requested selection and SDK evidence are independent. */
   function SessionModelBadge({ sessionId, useProjection, useSession, useSessions, useModelDirectory }) {
     const bridge = useProjection('claudeBridge');
     const selected = useProjection('modelSelection')?.lastUsed;
@@ -187,11 +187,10 @@ function compactTokens(value) {
     const session = useSession(value => value);
     const summary = useSessions(value => value)?.byId?.[sessionId];
     const directory = useModelDirectory(value => value);
-    if (bridge == null) return null;
     const child = session?.subagent != null || summary?.origin === 'subagent';
+    if (bridge == null || !child) return null;
     const known = selected?.provider === 'claude-sdk-remote' && typeof selected.model === 'string' && selected.model;
     const actual = known && observation?.requestedModel === selected.model ? observation?.actualModel : null;
-    if (!child && !actual) return null;
     const model = known ? directory?.groups?.find(group => group.id === selected.provider)?.models
       ?.find(row => row.id === selected.model) : undefined;
     const name = model?.name || (known ? selected.model : '型号待确认');
@@ -202,9 +201,9 @@ function compactTokens(value) {
     const title = `${requestTitle}\n${actual
       ? `本响应 SDK 返回型号：${actual}；来源：${observation.source}；响应：${observation.responseId ?? '未提供 ID'}。\n型号别名展开或字符串差异不等于降级；SDK 未报告实际思考等级。`
       : '本响应尚无 SDK 返回型号；不会用请求配置、初始化信息或旧响应代替。'}`;
-    const text = `${child ? `${name} · ${effort}` : ''}${actual ? `${child ? ' ｜ ' : ''}SDK 返回：${actual}` : ''}`;
+    const text = `${name} · ${effort}${actual ? ` ｜ SDK 返回：${actual}` : ''}`;
     return React.createElement('span', { className: 'dsh-claude-child-model', role: 'status', title,
-      'aria-label': `${child ? `子代理请求型号 ${name}，请求思考强度 ${effort}。` : ''}${actual ? `本响应 SDK 返回型号 ${actual}` : ''}`,
+      'aria-label': `子代理请求型号 ${name}，请求思考强度 ${effort}。${actual ? `本响应 SDK 返回型号 ${actual}` : ''}`,
       style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #666)',
         minWidth: 0, maxWidth: '320px', flexShrink: 1,
         whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, text);

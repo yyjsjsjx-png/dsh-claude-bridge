@@ -1,61 +1,15 @@
 /** Reuse the desktop's usage component with a remote-only numerical projection. */
-export function createUsageProjectionBridge({ React, createClientFirstOutput, createPortal,
-  useAnchoredPosition, useDismissOnOutsidePointer }) {
+export function createUsageProjectionBridge({ React, createClientFirstOutput }) {
   return function installUsageProjection(ctx) {
     if (typeof ctx.slots.entries !== 'function' || typeof ctx.slots.subscribe !== 'function') return () => {};
     const wrappers = new Set();
     const firstOutput = createClientFirstOutput?.();
+    const clientTimingAvailable = Boolean(firstOutput && typeof React.useSyncExternalStore === 'function');
+    const emptyClientTiming = { submissions: 0, samples: 0, totalMs: 0 };
+    const emptyClientSource = { getSnapshot: () => emptyClientTiming, subscribe: () => () => {} };
     let closed = false;
     const duration = value => value == null || !Number.isFinite(value) ? '未知'
       : value < 1000 ? `${Math.round(value)} ms` : `${Math.round(value / 100) / 10} s`;
-    function RemoteStats({ nativeProps, stats, measured, observer, NativeUsage }) {
-      const mode = nativeProps.usePerformanceUsage?.(value => value);
-      const empty = React.useMemo(() => ({ version: 1, submissions: 0, samples: 0, totalMs: 0 }), []);
-      const client = React.useSyncExternalStore(observer?.subscribe ?? (() => () => {}),
-        observer?.getSnapshot ?? (() => empty));
-      const [open, setOpen] = React.useState(false);
-      const rootRef = React.useRef(null), panelRef = React.useRef(null);
-      const position = useAnchoredPosition({ open, anchorRef: rootRef, panelRef, side: 'top', gap: 8, margin: 12 });
-      useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef);
-      React.useEffect(() => {
-        if (!open) return;
-        const close = event => { if (event.key === 'Escape') setOpen(false); };
-        document.addEventListener('keydown', close);
-        return () => document.removeEventListener('keydown', close);
-      }, [open]);
-      if (mode === 'compact') return React.createElement(NativeUsage, nativeProps);
-      if (!stats.steps && !client.submissions) return null;
-      const count = measured?.responseCount ?? 0, sdkSamples = measured?.ttftSteps ?? 0;
-      const speed = stats.decodeMs > 0 ? `${Math.round(stats.decodeTokens / stats.decodeMs * 10000) / 10} tok/s` : '未知';
-      const counts = nativeProps.t('stats.counts', { turns: stats.turns, steps: stats.steps });
-      const label = speed === '未知' ? counts : `${counts} · ${speed}`;
-      const rows = [
-        ['客户端首字显示（观察）', duration(client.samples ? client.totalMs / client.samples : null),
-          `本窗口客户端提交前开始，原生正文或思考内容实际可见后观察；包括本机准备、网络和渲染等待，不是显示器物理 paint 精确时间。${client.samples}/${client.submissions} 次客户端提交有样本；排队、插话、后台或无法关联时不计，旧历史缺观察为未知。`],
-        ['SDK 首有效输出（估算）', duration(sdkSamples ? measured.ttftMs / sdkSamples : null),
-          `SDK 首帧时长，加上远端同机观察首帧到有效正文、思考或工具参数的间隔；含 SDK 缓冲和调度误差，非精确上游计时。${sdkSamples}/${count} 个响应有样本，与客户端提交的分母独立。`],
-        [nativeProps.t('stats.dialog.llmTime'), duration(stats.llmMs)],
-        [nativeProps.t('stats.dialog.toolTime'), duration(stats.toolMs)],
-        ['接收速度（TPS）', speed,
-          `同一完整响应输出 Token / 本机接收首帧至最后有效内容的时长，包含思考和缓冲影响；${measured?.tpsSamples ?? 0}/${count} 个响应有完整样本。`],
-      ];
-      return React.createElement('span', { ref: rootRef, 'data-composer-stat': 'activity', style: { display: 'inline-flex' } },
-        React.createElement('button', { type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': open,
-          'aria-label': String(label), onClick: () => setOpen(!open),
-          style: { border: 0, background: 'transparent', color: 'var(--dsw-alias-label-tertiary)',
-            font: 'inherit', cursor: 'pointer', padding: '1px 4px', fontVariantNumeric: 'tabular-nums' } }, label),
-        open && createPortal(React.createElement('div', { ref: panelRef, role: 'dialog',
-          'aria-label': '远程会话耗时与速度',
-          style: { position: 'fixed', zIndex: 1100, minWidth: 270, padding: 12, borderRadius: 12,
-            background: 'var(--dsw-specific-menu, #fafafa)', color: 'var(--dsw-alias-label-secondary)',
-            boxShadow: 'var(--dsw-elevation-prominent, 0 4px 20px #0002)',
-            fontSize: 12, ...(position ?? { visibility: 'hidden', left: 0, top: 0 }) } },
-          React.createElement('strong', null, '远程会话耗时与速度'),
-          React.createElement('dl', { 'data-session-stats-details': true,
-            style: { display: 'grid', gridTemplateColumns: '1fr auto', gap: '6px 16px', marginBottom: 0 } },
-          ...rows.flatMap(([name, value, title]) => [React.createElement('dt', { key: `${name}:label`, title }, name),
-            React.createElement('dd', { key: `${name}:value`, title, style: { margin: 0, fontVariantNumeric: 'tabular-nums' } }, value)]))), document.body));
-    }
     function ObservedAssistant({ nativeProps, NativeAssistant }) {
       const root = React.useRef(null), seat = React.useRef(null);
       React.useLayoutEffect(() => {
@@ -87,10 +41,17 @@ export function createUsageProjectionBridge({ React, createClientFirstOutput, cr
             const remote = props.useProjection('claudeBridge') != null;
             const measured = props.useProjection('claudeBridgeResponseStats');
             const original = props.useProjection('sessionStats');
+            const observer = props.clientFirstOutput ?? emptyClientSource;
+            // Capability is fixed for this installation, so ordinary/remote
+            // switching retains the same hook order. NativeUsage owns all UI.
+            const client = clientTimingAvailable
+              ? React.useSyncExternalStore(observer.subscribe, observer.getSnapshot) : emptyClientTiming;
+            const useClient = client.samples > 0;
             const stats = {
               turns: original?.turns ?? 0, steps: original?.steps ?? 0,
               llmMs: original?.llmMs ?? 0, toolMs: original?.toolMs ?? 0,
-              ttftMs: measured?.ttftMs ?? 0, ttftSteps: measured?.ttftSteps ?? 0,
+              ttftMs: useClient ? client.totalMs : measured?.ttftMs ?? 0,
+              ttftSteps: useClient ? client.samples : measured?.ttftSteps ?? 0,
               decodeMs: measured?.decodeMs ?? 0, decodeTokens: measured?.decodeTokens ?? 0,
             };
             const alias = (key, selector, equal) => {
@@ -100,17 +61,16 @@ export function createUsageProjectionBridge({ React, createClientFirstOutput, cr
                 : typeof selector === 'function' ? selector(stats) : stats;
             };
             if (!remote) return React.createElement(NativeUsage, props);
-            if (firstOutput && createPortal && useAnchoredPosition && useDismissOnOutsidePointer) {
-              return React.createElement(RemoteStats, { nativeProps: { ...props, useProjection: alias },
-                stats, measured, observer: props.clientFirstOutput, NativeUsage });
-            }
             const ttftSamples = measured?.ttftSteps ?? 0, tpsSamples = measured?.tpsSamples ?? 0;
             const count = measured?.responseCount ?? 0;
+            const sdkMean = duration(ttftSamples ? measured.ttftMs / ttftSamples : null);
+            const ttftSource = useClient ? '当前显示客户端首字显示（观察）：从本窗口提交前至原生正文或思考内容实际可见后的双帧观察，包括本机准备、网络和渲染等待，不是显示器物理 paint 精确时间。'
+              : '客户端观察不可用或暂无样本，当前显示 SDK 首有效输出（估算）；没有用 SDK 记录补造客户端样本。';
             // rc.5 renders these two locale values only as <dt> children.
             // Keep all other translation calls and ordinary sessions native.
             const translate = (key, ...args) => key === 'stats.dialog.ttft'
               ? React.createElement('span', { title:
-                `SDK 首帧时长，加上远端同机观察首帧到首个有效输出的间隔，再按样本取平均；非空正文、思考和工具参数 JSON 增量均算有效输出，排除开始帧、心跳、签名和工具名。此估算含 SDK 缓冲与调度误差，非精确上游计时；${ttftSamples}/${count} 个响应有计时样本，缺证据的响应不计入平均。` }, '首 Token 平均（TTFT）')
+                `${ttftSource} 客户端 ${client.samples}/${client.submissions} 次提交有样本，排队、插话、后台、旧历史或无法关联时不计。独立 SDK 首有效输出均值：${sdkMean}，${ttftSamples}/${count} 个响应有计时样本。SDK 首帧时长加上远端同机首帧到有效正文、思考或工具参数的间隔，包含缓冲与调度误差，非精确上游计时。两套分母独立，不相加、不混合平均；均无证据时为未知，按原生行为不显示 TTFT 行。` }, props.t(key, ...args))
               : key === 'stats.dialog.speed' ? React.createElement('span', { title:
                 `将同一完整响应的输出 Token，与本机收到原始 SDK message_start 至最后有效内容帧的时长配对，汇总后计算接收速度；该本机观察窗口包含思考阶段和缓冲影响，不代表上游生成测速；${tpsSamples}/${count} 个响应有完整接收样本。` }, '接收速度（TPS）')
                 : props.t(key, ...args);
