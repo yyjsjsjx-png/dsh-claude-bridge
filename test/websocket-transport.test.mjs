@@ -139,3 +139,108 @@ test('非单行数据与认证超时关闭连接', async () => {
     connectTimeoutMs: 20, webSocketFactory: silent.factory,
   }), { code: 'CONNECT_TIMEOUT' })
 })
+
+test('恢复心跳携带四时间戳，重复或无效扩展不影响RPC或泄露内容', async t => {
+  const recoveryId = randomUUID(), rows = []
+  let clock = 1000, pong, pings = 0
+  const holder = factoryWith((value, socket) => {
+    const frame = JSON.parse(value)
+    if (frame.type === 'auth') return queueMicrotask(() => socket.receive(JSON.stringify({ type: 'auth.ok', protocol: 1,
+      recovery: { protocol: 'resume-v1', id: recoveryId, graceMs: 90000 } })))
+    if (frame.type === 'recovery.negotiate') return queueMicrotask(() => socket.receive(JSON.stringify({
+      type: 'recovery.ready', protocol: 1, id: recoveryId, ack: 0 })))
+    if (frame.type === 'recovery.ping') {
+      pings++
+      assert.equal(frame.timing.version, 1)
+      pong = { type: 'recovery.pong', protocol: 1, timing: { ...frame.timing, t2: 1110, t3: 1114 } }
+      clock = 1024
+      return queueMicrotask(() => socket.receive(JSON.stringify(pong)))
+    }
+    if (frame.jsonrpc) queueMicrotask(() => socket.receive(`${JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: 'ok',
+      _bridge: { sequence: 1, ack: frame._bridge.sequence } })}\n`))
+  })
+  const transport = await createWebSocketTransport({ url: 'ws://127.0.0.1:18944/', token: 'T'.repeat(43),
+    deviceId: randomUUID(), webSocketFactory: holder.factory, networkNow: () => clock, onDiagnostic: row => rows.push(row) })
+  t.after(() => transport.close())
+  assert.equal(pings, 1)
+  const sample = rows.find(row => row.event === 'perf.network')
+  assert.equal(sample.stage, 'sample')
+  assert.equal(sample.roundTripMs, 24)
+  assert.equal(sample.networkRoundTripMs, 20)
+  holder.socket.receive(JSON.stringify(pong))
+  holder.socket.receive(JSON.stringify({ ...pong, timing: { version: 1, probeId: 1, t1: 'bad' } }))
+  assert.equal(rows.filter(row => row.event === 'perf.network').length, 1)
+  assert.equal(await transport.peer.request('echo', { text: 'PRIVATE_BODY' }), 'ok')
+  assert.equal(transport.connected, true)
+  assert.doesNotMatch(JSON.stringify(rows), /PRIVATE_BODY|T{43}|127\.0\.0\.1|t1|probeId/)
+})
+
+test('旧服务普通pong明确unsupported，探测超时不触发重连，丢失attempt清除deadline', async t => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
+  const recoveryId = randomUUID(), rows = [], sockets = []
+  let mode = 'legacy', clock = 1000
+  const transport = await createWebSocketTransport({ url: 'ws://127.0.0.1:18944/', token: 'T'.repeat(43), deviceId: randomUUID(),
+    heartbeatMs: 20, heartbeatTimeoutMs: 1000, reconnectDelays: [1], networkNow: () => clock,
+    onDiagnostic: row => rows.push(row),
+    webSocketFactory() {
+      const socket = new FakeSocket((value, active) => {
+        const frame = JSON.parse(value)
+        if (frame.type === 'auth') return queueMicrotask(() => active.receive(JSON.stringify({ type: 'auth.ok', protocol: 1,
+          recovery: { protocol: 'resume-v1', id: recoveryId, graceMs: 90000, resumed: sockets.length > 1 } })))
+        if (frame.type === 'recovery.negotiate') return queueMicrotask(() => active.receive(JSON.stringify({
+          type: 'recovery.ready', protocol: 1, id: recoveryId, ack: 0 })))
+        if (frame.type === 'recovery.ping' && mode === 'legacy') queueMicrotask(() => active.receive('{"type":"recovery.pong","protocol":1}'))
+      })
+      sockets.push(socket); setImmediate(() => socket.open()); return socket
+    },
+  })
+  t.after(() => transport.close())
+  assert.equal(rows.find(row => row.event === 'perf.network').stage, 'unsupported')
+  mode = 'silent'; clock += 20
+  t.mock.timers.tick(20)
+  t.mock.timers.tick(20)
+  assert.ok(rows.some(row => row.event === 'perf.network' && row.stage === 'timeout'))
+  assert.equal(transport.connected, true)
+  assert.equal(sockets.length, 1)
+  const count = rows.filter(row => row.event === 'perf.network').length
+  await transport.close()
+  t.mock.timers.tick(100)
+  assert.equal(rows.filter(row => row.event === 'perf.network').length, count)
+})
+
+test('恢复后旧socket的晚pong不能占用新attempt样本', { timeout: 3000 }, async t => {
+  const recoveryId = randomUUID(), rows = [], sockets = [], pings = []
+  let clock = 1000, connected = 0, acceptSecond
+  const second = new Promise(resolve => { acceptSecond = resolve })
+  const transport = await createWebSocketTransport({ url: 'ws://127.0.0.1:18944/', token: 'T'.repeat(43), deviceId: randomUUID(),
+    reconnectDelays: [1], networkNow: () => clock, onDiagnostic: row => rows.push(row),
+    onConnectionState: state => { if (state === 'connected' && ++connected === 2) acceptSecond() },
+    webSocketFactory() {
+      const number = sockets.length + 1
+      const socket = new FakeSocket((value, active) => {
+        const frame = JSON.parse(value)
+        if (frame.type === 'auth') {
+          clock = number * 1000
+          return queueMicrotask(() => active.receive(JSON.stringify({ type: 'auth.ok', protocol: 1,
+            recovery: { protocol: 'resume-v1', id: recoveryId, graceMs: 90000, resumed: number > 1 } })))
+        }
+        if (frame.type === 'recovery.negotiate') return queueMicrotask(() => active.receive(JSON.stringify({
+          type: 'recovery.ready', protocol: 1, id: recoveryId, ack: 0 })))
+        if (frame.type === 'recovery.ping') pings.push(frame.timing)
+      })
+      sockets.push(socket); setImmediate(() => socket.open()); return socket
+    },
+  })
+  t.after(() => transport.close())
+  sockets[0].close(1006)
+  await second
+  const timing = pings.at(-1)
+  const pong = JSON.stringify({ type: 'recovery.pong', protocol: 1, timing: { ...timing, t2: 2110, t3: 2114 } })
+  clock = 2024
+  sockets[0].receive(pong)
+  assert.equal(rows.filter(row => row.event === 'perf.network').length, 0)
+  sockets[1].receive(pong)
+  assert.equal(rows.filter(row => row.event === 'perf.network' && row.stage === 'sample').length, 1)
+  assert.equal(transport.connected, true)
+  assert.equal(sockets.length, 2)
+})
