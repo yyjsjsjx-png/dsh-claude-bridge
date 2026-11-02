@@ -20,6 +20,7 @@ import { sanitizePlanUsage, planUsageFreshUntil } from './plan-usage.mjs'
 import { retainedPlanUsage } from './observability-plan-usage.mjs'
 import { createLocalRunTiming } from './local-run-timing.mjs'
 import { localHistory, coalesceHistory, restoreAssistant, assistantPrefix, knownToolResult, UNKNOWN_TOOL_TEXT } from './history-sync.mjs'
+import { readHistoryPages } from './history-reader.mjs'
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
@@ -580,45 +581,20 @@ export class BridgeBackend {
           local = localHistory(agent.session)
           local.turn = pending.findLast(run => Number.isSafeInteger(run.turn))?.turn
             ?? Math.max(1, local.turn - (withinRun ? 1 : 0))
-          let bytes = 0, reset = false, done = false, readStart = cursor, lastApi
-          const assistantPages = new Map()
-          const records = []
-          for (let page = 0; page < 3200; page++) {
-            combined.throwIfAborted()
-            const pageCursor = cursor
-            const reply = await transport.peer.request('history', { deviceId: binding.deviceId,
+          const history = await readHistoryPages({ sessionId: binding.sdkSessionId, cursor, signal: combined,
+            readPage: cursor => transport.peer.request('history', { deviceId: binding.deviceId,
               dshSessionId: agent.id, sessionId: binding.sdkSessionId, projectPath: binding.projectPath,
-              offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 })
-            if (reply.status === 'busy') {
-              this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
-                interrupted: true, updatedAt: Date.now() } })
-              return { status: 'waiting' }
-            }
-            if (reply.status === 'cursor-reset' && !reset) {
-              cursor = readStart = { offset: 0, lastUuid: null }; records.length = 0; bytes = 0
-              assistantPages.clear(); lastApi = undefined; reset = true; continue
-            }
-            if (reply.status !== 'ok' || reply.sessionId !== binding.sdkSessionId || !Array.isArray(reply.records)
-              || !Number.isSafeInteger(reply.nextOffset) || reply.nextOffset < cursor.offset
-              || (reply.nextOffset === cursor.offset && reply.done !== true)
-              || (reply.lastUuid !== null && typeof reply.lastUuid !== 'string')) {
-              throw failure(reply.code ?? 'HISTORY_INVALID', '云端记录尚未同步，未继续执行。')
-            }
-            bytes += Buffer.byteLength(JSON.stringify(reply.records))
-            if (bytes > 64 * 1024 * 1024) throw failure('HISTORY_TOO_LARGE', '本次恢复内容过大，已保留已同步记录。')
-            cloudRuns = reply.runs ?? {}
-            for (const record of reply.records) if (record.type === 'assistant') {
-              if (!assistantPages.has(record.apiId)) assistantPages.set(record.apiId, pageCursor)
-              lastApi = record.apiId
-            }
-            records.push(...reply.records)
-            cursor = { offset: reply.nextOffset, lastUuid: reply.lastUuid }
-            if (reply.done) { done = true; break }
+              offset: cursor.offset, ...(cursor.offset ? { afterUuid: cursor.lastUuid } : {}) }, { signal: combined, timeoutMs: 30_000 }) })
+          if (history.status === 'busy') {
+            this.sessionStatus(agent, { recovery: { status: 'waiting', added, unresolvedTools: 0,
+              interrupted: true, updatedAt: Date.now() } })
+            return { status: 'waiting' }
           }
-          if (!done) throw failure('HISTORY_TOO_LARGE', '云端记录超过本次同步上限，未静默省略。')
+          cursor = history.cursor
+          cloudRuns = history.runs
           cloudResults.clear()
           try {
-            for (const record of coalesceHistory(records)) {
+            for (const record of coalesceHistory(history.records)) {
               if (record.type === 'prompt' && binding.runs?.[record.uuid]?.turn) {
                 local.turn = binding.runs[record.uuid].turn; local.step = binding.runs[record.uuid].step
               } else if (record.type === 'assistant') {
@@ -631,10 +607,10 @@ export class BridgeBackend {
                 local.step++
               } else if (record.type === 'tool-result') cloudResults.set(record.callId, record)
             }
-            replay = assistantPages.get(lastApi) ?? readStart
+            replay = history.replay
             break
           } catch (error) {
-            if (error.code !== 'HISTORY_FRAGMENT_INCOMPLETE' || readStart.offset === 0 || attempt > 0) throw error
+            if (error.code !== 'HISTORY_FRAGMENT_INCOMPLETE' || history.readStart.offset === 0 || attempt > 0) throw error
             cursor = { offset: 0, lastUuid: null }
           }
         }

@@ -1032,6 +1032,45 @@ test('Host 崩溃窗口自动核实本机已落盘结果，补齐云端尾部，
   assert.equal(queries, 0); assert.equal(executed, 0)
 })
 
+test('恢复历史已checkpoint而台账提交失败后，重入不重复投影或云端工具结果', async t => {
+  let binding, executed = 0
+  const f = await fixture(t, async () => ({ peer: { async request(method) {
+    if (method === 'initialize') return { protocolVersion: 1, capabilities: { historySync: true } }
+    assert.equal(method, 'history')
+    return { status: 'ok', sessionId: binding.sdkSessionId, records: [
+      { type: 'assistant', uuid: 'cloud-answer', apiId: 'old-api', model: 'fixture',
+        content: [{ type: 'text', text: '合成输出开头以及漏收尾部' }, binding.content[1]] },
+      { type: 'tool-result', uuid: 'cloud-result', callId: 'old-call', isError: false,
+        content: [{ type: 'text', text: '合成工具回执' }] },
+    ], runs: { 'interrupted-run': { status: 'completed', tools: { 'old-call': {
+      name: 'local_command', argumentsSha256: createHash('sha256').update(binding.argumentsText).digest('hex'),
+    } } } }, nextOffset: 2, lastUuid: 'cloud-result', done: true }
+  } }, async close() {} }), async () => { executed++; return { content: [] } })
+  binding = await interruptedTool(f)
+  let checkpointed = false, failCommit = true
+  f.ctx.sessions.flush = async () => { checkpointed = true; return true }
+  const reconcile = f.backend.state.reconcileRecovery.bind(f.backend.state)
+  f.backend.state.reconcileRecovery = async (...args) => {
+    assert.equal(checkpointed, true)
+    if (failCommit) {
+      failCommit = false
+      throw Object.assign(new Error('合成台账提交失败'), { code: 'FIXTURE_COMMIT_FAILED' })
+    }
+    return reconcile(...args)
+  }
+  await assert.rejects(f.backend.syncSession(f.agent), { code: 'FIXTURE_COMMIT_FAILED' })
+  assert.equal(f.backend.verifiedHistory.has(f.agent.session), false)
+  assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor, undefined)
+  assert.equal(f.records.filter(record => record.type === HISTORY_ASSISTANT).length, 1)
+  assert.equal(f.records.filter(record => record.type === HISTORY_TOOL_RESULT).length, 1)
+  assert.equal((await f.backend.syncSession(f.agent)).added, 0)
+  assert.equal(f.records.filter(record => record.type === HISTORY_ASSISTANT).length, 1)
+  assert.equal(f.records.filter(record => record.type === HISTORY_TOOL_RESULT).length, 1)
+  assert.equal(f.backend.state.value.sessions[f.agent.id].historyCursor.offset, 2)
+  assert.equal((await f.backend.state.recoveryStatus(f.agent.id)).length, 0)
+  assert.equal(executed, 0)
+})
+
 test('未知工具仅用匹配的云端回执核实，未核实说明随下一条用户输入送达原生会话', async t => {
   let binding, verified = false, captured, executed = 0
   const f = await fixture(t, async () => ({ peer: { async request(method, params) {
