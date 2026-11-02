@@ -11,6 +11,7 @@ import { createRunStore } from '../remote/history.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { readSessionTitleMetadata } from '../remote/session-title-metadata.mjs'
+import { MODEL_CATALOG_CACHE_MS } from '../src/catalog-cache-policy.mjs'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
 const DEVICE = '36da88e2-bac2-4d4e-95b4-e688e7382724'
@@ -432,7 +433,8 @@ async function fixture(t, queryImplementation, overrides = {}) {
         yield { type: 'system', subtype: 'init', session_id: request.options.sessionId ?? request.options.resume ?? SESSION, tools: state.initTools ?? names }
         yield* inner
       })()
-      generator.initializationResult = async () => ({ hooks_applied: state.hooksApplied ?? true, commands: state.commands ?? [] })
+      generator.initializationResult = async () => ({ hooks_applied: state.hooksApplied ?? true, commands: state.commands ?? [],
+        ...(state.queryModels === undefined ? {} : { models: state.queryModels }) })
       if (state.contextSummary !== undefined || typeof state.contextReader === 'function') {
         generator.getContextUsage = async (options) => {
           state.contextRequest = options
@@ -1110,11 +1112,14 @@ test('SDK 结构化鉴权失败分类并脱敏，即使结果后抛异常', asyn
     yield { type: 'result', subtype: 'error_during_execution', session_id: SESSION, api_error_status: 401, errors: ['SECRET LOGIN URL'] }
     throw new Error('SECRET LOGIN URL')
   })
+  await f.worker.handlers.catalog({}, f.context)
   const result = await f.worker.handlers.query(f.params, f.context)
   assert.equal(result.code, 'AUTH_EXPIRED')
   assert.equal(result.apiErrorStatus, 401)
   assert.equal(JSON.stringify(f.state.notifications).includes('SECRET LOGIN URL'), false)
   assert.equal((await f.worker.handlers.settle({ runId: f.params.runId })).code, 'AUTH_EXPIRED')
+  await f.worker.handlers.catalog({}, f.context)
+  assert.equal(f.state.catalogQueries.length, 2, '真实鉴权失败必须丢弃此前成功目录')
 })
 
 test('SDK 认证流程报错不泄露认证链接，也不猜测具体原因', async (t) => {
@@ -1665,7 +1670,7 @@ test('普通目录冷读共享一次初始化，首个和后续调用者取消�
   assert.equal(f.state.queries.length, 0)
 })
 
-test('目录共享结果独立复制，三十秒有效期和预先取消仍生效', async t => {
+test('目录共享结果独立复制，跨31秒复用且6小时到期按需读取，预先取消仍生效', async t => {
   const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
   f.state.models[1].inputModalities = ['text', 'image']
   const { createCatalogReader } = await import('../remote/catalog.mjs')
@@ -1677,10 +1682,14 @@ test('目录共享结果独立复制，三十秒有效期和预先取消仍生�
   assert.deepEqual(second[1].inputModalities, ['text', 'image'])
   assert.deepEqual(second[1].supportedEffortLevels, ['low', 'high'])
   assert.equal(f.state.catalogQueries.length, 1)
-  time = 30_099
+  assert.equal(MODEL_CATALOG_CACHE_MS, 6 * 60 * 60 * 1000)
+  time = 31_100
   assert.deepEqual((await reader.read())[1].inputModalities, ['text', 'image'])
   assert.equal(f.state.catalogQueries.length, 1)
-  time = 30_100
+  time = 100 + MODEL_CATALOG_CACHE_MS - 1
+  await reader.read()
+  assert.equal(f.state.catalogQueries.length, 1)
+  time++
   await reader.read()
   assert.equal(f.state.catalogQueries.length, 2)
   const cancelled = new AbortController(); cancelled.abort()
@@ -1721,4 +1730,95 @@ test('共享目录查询失败后清除等待项，下次请求可重新读取',
   gate.requests[1].resolve({ models: f.state.models })
   assert.equal((await retry)[1].value, 'model-a')
   assert.equal(f.state.catalogCloses, 2)
+})
+
+test('目录初始化认证失败使有效缓存失效，网络刷新失败明确报错而不冒充新目录', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  const { createCatalogReader } = await import('../remote/catalog.mjs')
+  const reader = createCatalogReader(f.config)
+  await reader.read()
+  const gate = gateCatalogInitialization(f)
+  const rejected = assert.rejects(reader.read({ refresh: true }), { code: 'AUTH_EXPIRED' })
+  await gate.waitFor(1)
+  gate.requests[0].reject(Object.assign(new Error('PRIVATE_AUTH_ERROR'), { status: 401 }))
+  await rejected
+  const next = reader.read()
+  await gate.waitFor(2)
+  gate.requests[1].resolve({ models: [{ value: 'fresh', displayName: 'fresh' }] })
+  assert.equal((await next)[0].value, 'fresh')
+  assert.equal(f.state.catalogQueries.length, 3)
+  const network = assert.rejects(reader.read({ refresh: true }), { code: 'NETWORK' })
+  await gate.waitFor(3)
+  gate.requests[2].reject(Object.assign(new Error('PRIVATE_NETWORK_ERROR'), { code: 'ECONNRESET' }))
+  await network
+  assert.equal(f.state.queries.length, 0)
+})
+
+test('认证状态失效或读取失败清目录，requireAuth仍独立检查且不以缓存绕过', async t => {
+  let status = { loggedIn: true, authMethod: 'claude.ai' }
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') }, {
+    authReader: { async read() { if (status instanceof Error) throw status; return status } },
+  })
+  await f.worker.handlers.catalog({}, f.context)
+  assert.equal(f.state.catalogQueries.length, 1)
+  await f.worker.handlers.authStatus({ refresh: true })
+  await f.worker.handlers.catalog({}, f.context)
+  assert.equal(f.state.catalogQueries.length, 2, '成功重新验证登录也不能沿用另一账号的目录')
+  status = { loggedIn: false }
+  assert.deepEqual(await f.worker.handlers.authStatus({ refresh: true }), { loggedIn: false })
+  status = { loggedIn: true, authMethod: 'claude.ai' }
+  await f.worker.handlers.catalog({}, f.context)
+  assert.equal(f.state.catalogQueries.length, 3)
+  status = { loggedIn: false }
+  assert.equal((await f.worker.handlers.catalog({}, f.context)).code, 'AUTH_REQUIRED')
+  status = { loggedIn: true, authMethod: 'claude.ai' }
+  await f.worker.handlers.catalog({}, f.context)
+  assert.equal(f.state.catalogQueries.length, 4)
+  status = new Error('PRIVATE_AUTH_READ_FAILURE')
+  assert.equal((await f.worker.handlers.authStatus({ refresh: true })).code, 'AUTH_STATUS_UNAVAILABLE')
+  status = { loggedIn: true, authMethod: 'claude.ai' }
+  await f.worker.handlers.catalog({}, f.context)
+  assert.equal(f.state.catalogQueries.length, 5)
+  assert.equal(f.state.queries.length, 0)
+})
+
+test('目录自然remember不新建SDK查询，非法元数据不覆盖，旧冷读和clear后迟到都不能回暖', async t => {
+  const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') })
+  const gate = gateCatalogInitialization(f)
+  const { createCatalogReader } = await import('../remote/catalog.mjs')
+  const reader = createCatalogReader(f.config)
+  const old = reader.read()
+  await gate.waitFor(1)
+  const models = [{ value: 'natural', displayName: 'natural', inputModalities: ['text'] }]
+  assert.equal(reader.remember(models), true)
+  models[0].inputModalities.push('mutated')
+  assert.equal((await reader.read())[0].value, 'natural')
+  assert.deepEqual((await reader.read())[0].inputModalities, ['text'])
+  for (const invalid of [undefined, {}, [{ value: 'bad' }]]) assert.equal(reader.remember(invalid), false)
+  assert.equal((await reader.read())[0].value, 'natural')
+  assert.equal(gate.requests.length, 1)
+  gate.requests[0].resolve({ models: f.state.models })
+  await old
+  assert.equal((await reader.read())[0].value, 'natural')
+  reader.clear()
+  const stale = reader.read()
+  await gate.waitFor(2)
+  reader.clear()
+  gate.requests[1].resolve({ models: f.state.models })
+  await stale
+  const fresh = reader.read()
+  await gate.waitFor(3)
+  gate.requests[2].resolve({ models: [{ value: 'new', displayName: 'new' }] })
+  assert.equal((await fresh)[0].value, 'new')
+})
+
+test('正常Query已取得的初始化models自然更新目录，不额外开启元数据或模型查询', async t => {
+  const f = await fixture(t, async function* () { yield { type: 'result', subtype: 'success', session_id: SESSION } })
+  await f.worker.handlers.catalog({}, f.context)
+  f.state.queryModels = [...f.state.models, { value: 'model-c', displayName: '自然新增目录条目' }]
+  assert.equal((await f.worker.handlers.query({ ...f.params, model: 'model-a' }, f.context)).status, 'completed')
+  const result = await f.worker.handlers.catalog({}, f.context)
+  assert.equal(result.models.at(-1).value, 'model-c')
+  assert.equal(f.state.catalogQueries.length, 1)
+  assert.equal(f.state.queries.length, 1)
 })
