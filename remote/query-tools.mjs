@@ -219,7 +219,7 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     const additionalContexts = [...(response.additionalContexts ?? [])]
     if (saved.length) additionalContexts.push(
       'Claude saved large web tool output for these call IDs: ' + saved.join(', ')
-      + '. Call read_web_result with callId. Pass the returned nextOffset as offset for the next page. Do not use local read_file or refetch for pagination.')
+      + '. Call read_web_result with callId and query to find a keyword. Omit query and use a match offset to read there. Do not use local read_file or refetch for pagination.')
     return {
       ...(response.continue === false ? { continue: false, stopReason: 'DSH 已结束本轮。' } : {}),
       ...(additionalContexts.length ? { hookSpecificOutput: {
@@ -247,13 +247,13 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
       }
       throwIfAborted(controller.signal)
       if (pages && definition.name === WEB_RESULT_PAGE_TOOL) {
-        const page = await pages.read(args)
+        const result = await pages.read(args)
         throwIfAborted(controller.signal)
-        const text = page
-          ? `nextOffset: ${page.nextOffset}; totalBytes: ${page.totalBytes}\n\n${page.content}`
-          : '当前会话无此网页结果，或分页位置无效。'
-        await reportNativeResult(definition.name, callId, text, !page, true)
-        return { content: [{ type: 'text', text }], isError: !page }
+        let text = '当前会话无此网页结果，或搜索参数或偏移无效。'
+        if (result) text = result.matches ? JSON.stringify(result)
+          : `nextOffset: ${result.nextOffset}; totalBytes: ${result.totalBytes}\n\n${result.content}`
+        await reportNativeResult(definition.name, callId, text, !result, true)
+        return { content: [{ type: 'text', text }], isError: !result }
       }
       diagnose('tool', 'dispatch')
       run.inFlightTools++

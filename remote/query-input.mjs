@@ -171,10 +171,11 @@ export function prepareQueryPayload(params, compact, zod) {
   }
   if (params.nativeWebResultPages) definitions.push({
     name: WEB_RESULT_PAGE_TOOL,
-    description: 'Read a saved Claude WebFetch or WebSearch result in this session by tool call ID. Use nextOffset to read the next UTF-8 page. Never pass a filesystem path.',
+    description: 'Read a saved Claude WebFetch or WebSearch result in this session. Supply query for a case-sensitive literal search (up to 128 UTF-8 bytes), or omit it to read a page. Use a match offset without query to read there. Pass nextOffset as offset to continue in the same mode. Never pass a path.',
     schema: { type: 'object', additionalProperties: false, required: ['callId'], properties: {
       callId: { type: 'string', pattern: '^toolu_[A-Za-z0-9_-]{1,100}$' },
       offset: { type: 'integer', minimum: 0 },
+      query: { type: 'string', minLength: 1, maxLength: 128 },
     } },
   })
   // Validate conversion before reserving a durable session directory.
