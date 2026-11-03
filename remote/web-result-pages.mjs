@@ -10,13 +10,21 @@ const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 /** An SDK web result is readable only after its successful hook registers it for this session. */
 export function createWebResultPages({ configDir, cwd, sessionId }) {
-  const directory = join(configDir, 'projects', cwd.replace(/[^a-zA-Z0-9-]/g, '-'), sessionId, 'tool-results')
+  const location = join('projects', cwd.replace(/[^a-zA-Z0-9-]/g, '-'), sessionId, 'tool-results')
+  let root
+  async function canonicalDirectory() {
+    // The operator can configure a symlink for the config root. None of
+    // the project, session or result descendants may redirect elsewhere.
+    root ??= await realpath(configDir)
+    return join(root, location)
+  }
   const paths = id => ({
-    result: join(directory, id + '.txt'),
+    name: id + '.txt',
     grant: join(cwd, '.bridge-web-result-' + id),
   })
 
-  async function openResult(path) {
+  async function openResult(directory, name) {
+    const path = join(directory, name)
     if (await realpath(directory) !== directory || await realpath(path) !== path) throw new Error('unsafe path')
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     try {
@@ -29,16 +37,19 @@ export function createWebResultPages({ configDir, cwd, sessionId }) {
   return {
     async register(id, response, expectedHash) {
       if (!CALL_ID.test(id)) return false
-      const { result, grant } = paths(id)
+      const { name, grant } = paths(id)
       const text = Array.isArray(response) && response.length === 1 && response[0]?.type === 'text'
         ? response[0].text : response
       const marker = typeof text === 'string' && text.startsWith('<persisted-output>\n')
         && text.trimEnd().endsWith('</persisted-output>')
       const notice = marker ? text.split('\n', 2)[1] : ''
-      const boundMarker = /^Output (?:too large \(|exceeded the )/.test(notice) && notice.endsWith('saved to: ' + result)
-      if (!boundMarker && !expectedHash) return false
+      if (!marker && !expectedHash) return false
       try {
-        const { file, info } = await openResult(result)
+        const directory = await canonicalDirectory()
+        const boundMarker = /^Output (?:too large \(|exceeded the )/.test(notice)
+          && [join(directory, name), join(configDir, location, name)].some(path => notice.endsWith('saved to: ' + path))
+        if (!boundMarker && !expectedHash) return false
+        const { file, info } = await openResult(directory, name)
         try {
           if (!boundMarker && createHash('sha256').update(await file.readFile()).digest('hex') !== expectedHash) return false
           const after = await file.stat()
@@ -53,7 +64,7 @@ export function createWebResultPages({ configDir, cwd, sessionId }) {
 
     async read({ callId, offset = 0 }) {
       if (typeof callId !== 'string' || !CALL_ID.test(callId) || !Number.isSafeInteger(offset) || offset < 0) return null
-      const { result, grant } = paths(callId)
+      const { name, grant } = paths(callId)
       try {
         const mark = await open(grant, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
         let identity
@@ -62,7 +73,7 @@ export function createWebResultPages({ configDir, cwd, sessionId }) {
           if (!info.isFile() || info.nlink !== 1 || info.size > 256) return null
           identity = await mark.readFile('utf8')
         } finally { await mark.close() }
-        const { file, info } = await openResult(result)
+        const { file, info } = await openResult(await canonicalDirectory(), name)
         try {
           if (identity !== JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs]) || offset > info.size) return null
           const buffer = Buffer.alloc(Math.min(PAGE_BYTES, info.size - offset))

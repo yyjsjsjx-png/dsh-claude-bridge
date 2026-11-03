@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { link, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createWebResultPages } from '../remote/web-result-pages.mjs'
@@ -13,7 +13,9 @@ test('only registered web output for the bound session can be read, with UTF-8 p
   const folder = join(configDir, 'projects', cwd.replace(/[^a-zA-Z0-9-]/g, '-'), sessionId, 'tool-results')
   await mkdir(folder, { recursive: true })
   await mkdir(cwd)
-  const pages = createWebResultPages({ configDir, cwd, sessionId })
+  const configuredRoot = join(root, 'configured')
+  await symlink(configDir, configuredRoot, 'junction')
+  const pages = createWebResultPages({ configDir: configuredRoot, cwd, sessionId })
   const callId = 'toolu_fixture', file = join(folder, callId + '.txt')
   const text = 'x'.repeat(4094) + '汉字😀' + ' beyond preview'
   const marker = path => '<persisted-output>\nOutput too large (52KB). Full output saved to: ' + path + '\n\nPreview\n</persisted-output>'
@@ -38,6 +40,10 @@ test('only registered web output for the bound session can be read, with UTF-8 p
   assert.equal(await pages.register('toolu_link', marker(join(folder, 'toolu_link.txt'))), false)
   assert.equal(await pages.read({ callId }), null)
   await rm(join(folder, 'toolu_link.txt'))
+  const otherSession = join(folder, '..', '..', 'session-b')
+  await symlink(join(folder, '..'), otherSession, 'junction')
+  const throughLink = createWebResultPages({ configDir: configuredRoot, cwd, sessionId: 'session-b' })
+  assert.equal(await throughLink.register(callId, {}, createHash('sha256').update(text).digest('hex')), false)
   await writeFile(file, 'changed')
   assert.equal(await pages.read({ callId }), null)
 })
