@@ -125,7 +125,7 @@ test('cached raw-reader replay is not a successful new observation and close pre
   assert.equal(calls, 0)
 })
 
-test('two active runs share one account timer and the last inactive run stops polling', async t => {
+test('two active runs share one account timer and the last run schedules one final sample', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: start })
   let calls = 0
   const observations = []
@@ -151,21 +151,26 @@ test('two active runs share one account timer and the last inactive run stops po
   assert.equal(calls, 3)
   coordinator.setActive('device-b:run-b', false)
   assert.equal(coordinator.peek().active, false)
+  await tick(119_999)
+  assert.equal(calls, 3)
+  await tick(1)
+  assert.equal(calls, 4)
+  assert.equal(observations.at(-1).reason, 'run-end')
   await tick(900_000)
   const idle = await coordinator.request()
-  assert.equal(calls, 3)
-  assert.equal(observations.length, 3)
+  assert.equal(calls, 4)
+  assert.equal(observations.length, 4)
   assert.equal(idle.active, false)
   assert.equal(idle.fresh, false)
 })
 
-test('a run ending before detached sampling starts makes no read or observation', async () => {
+test('a worker disconnecting before detached sampling starts makes no read or observation', async () => {
   let calls = 0
   const observations = []
   const coordinator = createQuotaCoordinator({ now: () => start,
     fetchUsage: async () => { calls++; return snapshot() }, onObservation: row => observations.push(row) })
   coordinator.setActive('device-a:run-a', true)
-  coordinator.setActive('device-a:run-a', false)
+  coordinator.setActive('device-a:run-a', false, { sampleOnEnd: false })
   await delay(0)
   assert.equal(calls, 0)
   assert.equal(observations.length, 0)

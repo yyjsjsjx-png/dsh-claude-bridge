@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto'
 /** One private account store and quota gate for all device workers. */
 export function createObservabilityHost({ directory, onDiagnostic = () => {} }) {
   const endpoints = new Set(), active = new Map()
-  let warning = null, diagnosing = false
+  let warning = null, diagnosing = false, finalSource
   const diagnose = (event, broadcast = true) => {
     if (diagnosing) return
     diagnosing = true
@@ -17,8 +17,9 @@ export function createObservabilityHost({ directory, onDiagnostic = () => {} }) 
   }
   const ledger = createObservabilityLedger({ directory, onDiagnostic: diagnose })
   const quota = createQuotaCoordinator({ onDiagnostic: diagnose,
-    fetchUsage: ({ signal } = {}) => {
+    fetchUsage: ({ signal, reason } = {}) => {
       const source = [...active].find(([, keys]) => keys.size > 0)?.[0]
+        ?? (reason === 'run-end' ? finalSource : undefined)
       return source ? source.request('fetchQuota', {}).then(value => signal?.aborted ? { status: 'unavailable', code: 'CANCELLED' } : value)
         : Promise.resolve({ status: 'unavailable', code: 'SDK_QUOTA_UNAVAILABLE' })
     },
@@ -56,7 +57,8 @@ export function createObservabilityHost({ directory, onDiagnostic = () => {} }) 
             diagnose({ code: 'OBSERVABILITY_ACTIVITY_REFUSED' })
             return { status: 'unavailable', code: 'OBSERVABILITY_ACTIVITY_REFUSED' }
           }
-          if (params.active) keys.add(key); else keys.delete(key)
+          if (params.active) keys.add(key)
+          else if (keys.delete(key)) finalSource = endpoint
           return { status: 'ok' }
         },
         accountBoundary: () => {
@@ -69,7 +71,8 @@ export function createObservabilityHost({ directory, onDiagnostic = () => {} }) 
       const release = () => {
         if (released) return
         released = true
-        for (const key of keys) quota.setActive(key, false)
+        if (finalSource === endpoint) finalSource = undefined
+        for (const key of keys) quota.setActive(key, false, { sampleOnEnd: false })
         keys.clear(); active.delete(endpoint); endpoints.delete(endpoint); endpoint.close()
         child.removeListener('exit', release); child.removeListener('disconnect', release)
       }

@@ -8,6 +8,7 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
   let snapshot = null, error = null, nextAllowedAt = 0, inFlight, pollTimer, closed = false, failures = 0
   // restored: snapshot came from the ledger, never fresh. settledAccount: a live
   // observation or boundary already decided this process's account state.
+  let finalSample = false
   let restored = false, settledAccount = false, boundaryRecorded = false
   const report = (code, gap = false) => {
     try { Promise.resolve(onDiagnostic({ code, gap })).catch(() => {}) } catch {}
@@ -30,10 +31,13 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
   const stopTimer = () => { clearTimeout(pollTimer); pollTimer = undefined }
   function schedule() {
     stopTimer()
-    if (closed || !active.size || inFlight) return
+    if (closed || (!active.size && !finalSample) || inFlight) return
     pollTimer = setTimeout(() => {
       pollTimer = undefined
-      if (!closed && active.size && !inFlight) start('activity')
+      if (!closed && !inFlight) {
+        if (active.size) start('activity')
+        else if (finalSample) { finalSample = false; start('run-end') }
+      }
     }, Math.max(0, nextAllowedAt - now()))
     pollTimer.unref?.()
   }
@@ -87,9 +91,9 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
       schedule()
     }
     Promise.resolve().then(() => {
-      if (closed || !active.size || read.controller.signal.aborted) return skipped
+      if (closed || read.fenced || (!active.size && reason !== 'run-end') || read.controller.signal.aborted) return skipped
       read.started = true
-      return fetchUsage({ signal: read.controller.signal })
+      return fetchUsage({ signal: read.controller.signal, reason })
     }).then(settled,
       problem => settled({ status: 'unavailable', code: quotaFailureCode(problem?.code),
         retryAfterMs: problem?.retryAfterMs }))
@@ -125,6 +129,8 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
     clearAccount() {
       if (closed) return false
       settledAccount = true
+      finalSample = false
+      if (!active.size) stopTimer()
       if (inFlight) inFlight.fenced = true
       snapshot = null; error = null; restored = false
       if (!boundaryRecorded) {
@@ -146,13 +152,16 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
       if (now() < nextAllowedAt) return Promise.resolve(peek())
       return wait(start(reason), signal)
     },
-    setActive(key, value) {
+    setActive(key, value, { sampleOnEnd = true } = {}) {
       if (closed || typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:@+\[\]-]{0,255}$/.test(key)
         || typeof value !== 'boolean' || value && !active.has(key) && active.size >= 4096) return false
-      if (value) active.add(key)
-      else active.delete(key)
-      if (!active.size) stopTimer()
-      else if (!inFlight && now() >= nextAllowedAt) start('run-start')
+      if (value) {
+        active.add(key)
+        finalSample = false
+      } else if (active.delete(key) && !active.size) {
+        finalSample = sampleOnEnd
+      }
+      if (active.size && !inFlight && now() >= nextAllowedAt) start('run-start')
       else schedule()
       return true
     },
