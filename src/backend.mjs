@@ -1499,7 +1499,7 @@ export class BridgeBackend {
     let unresolved = false
     for (const [id, call] of run.projection.committedToolCalls) {
       if (call.step !== run.step || run.settledToolIds.has(id)) continue
-      const native = isNativeWebTool(call.name) || call.name === WEB_RESULT_PAGE_TOOL
+      const native = isNativeWebTool(call.name) || (run.nativeWebResultPages && call.name === WEB_RESULT_PAGE_TOOL)
       const unknown = native || run.callEvents.has(id)
       const text = unknown ? (native ? 'Claude Code 网页工具结果未知，请核实后再重试。' : UNKNOWN_TOOL_TEXT)
         : '桥接未派发此工具调用，已停止本轮。'

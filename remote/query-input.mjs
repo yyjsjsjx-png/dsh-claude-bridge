@@ -166,7 +166,7 @@ export function prepareQueryPayload(params, compact, zod) {
   if (params.nativeWebTools && definitions.some(({ name }) => DSH_WEB_TOOLS.includes(name))) {
     throw new WorkerError('INVALID_WEB_TOOLS', '不能同时使用 Claude Code 和本机 DSH 网页工具')
   }
-  if (definitions.some(({ name }) => name === WEB_RESULT_PAGE_TOOL)) {
+  if (params.nativeWebResultPages && definitions.some(({ name }) => name === WEB_RESULT_PAGE_TOOL)) {
     throw new WorkerError('INVALID_WEB_TOOLS', '网页结果分页工具名由桥接保留')
   }
   if (params.nativeWebResultPages) definitions.push({
