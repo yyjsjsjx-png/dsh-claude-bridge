@@ -189,3 +189,52 @@ test('原生离线迁移：旧损坏历史先备份、完整校验并原子写�
   assert.deepEqual(await readFile(path), after)
   assert.equal((await readdir(dirname(path))).length, 1)
 })
+
+
+test('原生离线迁移：跳过既有未闭合工具，迁移候选失败仍阻止更新', { skip: !available }, async t => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-bridge-history-gate-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const { Session } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const { createAssistantMessage } = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
+  const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'))
+  const backup = join(home, 'backup')
+  const create = id => Session.create(id, undefined, { version: 4, id, createdAt: 0,
+    delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+  const write = async session => {
+    const path = join(home, 'sessions', 'fixture', session.header.id, 'session.v4.jsonl.zstd')
+    const rows = [{ type: 'session', ...session.header }, ...session.snapshotEvents()]
+    const bytes = zstdCompressSync(Buffer.from(rows.map(row => JSON.stringify(row) + '\n').join('')))
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, bytes)
+    return { path, bytes }
+  }
+  const broken = create('broken-fixture')
+  const assistant = content => ({ turn: 1, step: 1, stream: [], message: {
+    ...createAssistantMessage({ content, source: { provider: 'claude-sdk-remote', model: 'fixture' } }),
+    id: assistantIdentity('fixture', content),
+  } })
+  broken.append('turn/start', { turn: 1 })
+  broken.append('step/start', { turn: 1, step: 1 })
+  broken.append('assistant/message', assistant([
+    { type: 'tool-call', id: 'call-fixture', name: 'local_command', arguments: '{}' },
+  ]), { surfaceOp: 'append' })
+  broken.append('tool/call', { turn: 1, step: 1, callId: 'call-fixture', name: 'local_command', arguments: '{}' })
+  broken.append('step/end', { turn: 1, step: 1 })
+  broken.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const bad = await write(broken)
+  const normal = create('normal-fixture')
+  normal.append('turn/start', { turn: 1 })
+  normal.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const good = await write(normal)
+  assert.deepEqual(await repairBridgeHistories({ home, backup, require }), {
+    checked: 2, repaired: 0, changedRecords: 0,
+    skipped: [{ sessionId: broken.header.id, code: 'PREEXISTING_UNRESOLVED_TOOL_CALL' }],
+  })
+  assert.deepEqual(await readFile(bad.path), bad.bytes)
+  assert.deepEqual(await readFile(good.path), good.bytes)
+
+  broken.append('assistant/message', assistant([{ type: 'text', text: '候选迁移用例' }]), { surfaceOp: 'append' })
+  const candidateFailure = await write(broken)
+  await assert.rejects(() => repairBridgeHistories({ home, backup, require }), /历史校验或迁移未完成：broken-fixture/)
+  assert.deepEqual(await readFile(candidateFailure.path), candidateFailure.bytes)
+})

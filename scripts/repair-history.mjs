@@ -98,7 +98,17 @@ export async function repairBridgeHistories({ home, backup, require }) {
           for (const row of candidateRows) restore.decodeRow(row)
           return restore.finish()
         }
-        if (!migrated.changed) { validate(rows); continue }
+        if (!migrated.changed) {
+          try { validate(rows) } catch (error) {
+            // Only the original journal can qualify. A rejected migration stays fatal.
+            if (error?.name !== 'SessionFormatError'
+              || !/^step\/end leaves unresolved tool call [^\s]+$/.test(error.message)) throw error
+            if (digest(await readFile(file)) !== digest(original)) throw error
+            report.skipped ??= []
+            report.skipped.push({ sessionId: item.name, code: 'PREEXISTING_UNRESOLVED_TOOL_CALL' })
+          }
+          continue
+        }
         validate(migrated.events.map(event => catalog.encodeCurrentEvent(event)))
         const candidate = encodeFrames(header, migrated.events, catalog)
         const [roundTripHeader, ...roundTrip] = decodeFrames(candidate)

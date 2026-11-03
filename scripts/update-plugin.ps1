@@ -82,6 +82,11 @@ try {
     if (-not $BridgeResult.updated) { throw '更新结果未确认，请检查更新日志。' }
     Write-Host ('已更新：' + $BridgeResult.previousVersion + ' -> ' + $BridgeResult.version)
     Write-Host ('安装元数据备份：' + $BridgeResult.backup)
+    if ($BridgeResult.PSObject.Properties['history'] -and $BridgeResult.history.PSObject.Properties['skipped']) {
+        foreach ($BridgeSkippedHistory in $BridgeResult.history.skipped) {
+            Write-Warning ('已跳过原有未闭合工具调用的会话，原文件已保留：' + $BridgeSkippedHistory.sessionId)
+        }
+    }
     Write-Host '会话、连接和设备身份保留。现在可重新启动 DSH。'
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $BridgePreviousElectron
