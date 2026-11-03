@@ -38,9 +38,16 @@ function base(input) {
 
 function usage(input, scope) {
   if (input == null) return undefined
-  shape(input, ['scope', ...buckets])
+  const ttl = scope === 'response-main-agent' ? ['cacheWrite5mTokens', 'cacheWrite1hTokens'] : []
+  shape(input, ['scope', ...buckets, ...ttl])
   if (input.scope !== scope || buckets.some(key => !integer(input[key]))) invalid()
-  return { scope, ...Object.fromEntries(buckets.map(key => [key, input[key]])) }
+  const result = { scope, ...Object.fromEntries(buckets.map(key => [key, input[key]])) }
+  if (ttl.some(key => Object.hasOwn(input, key))) {
+    if (!ttl.every(key => integer(input[key]))
+      || input.cacheWrite5mTokens + input.cacheWrite1hTokens !== input.cacheWriteTokens) invalid()
+    for (const key of ttl) result[key] = input[key]
+  }
+  return result
 }
 
 /** Keep an old observation intact without pretending that it is still fresh. */

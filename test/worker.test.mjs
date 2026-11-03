@@ -940,6 +940,41 @@ test('同一设备的不同会话可以同时执行且分别持有会话锁', { 
   assert.deepEqual((await Promise.all([first, second])).map(result => result.status), ['completed', 'completed'])
 })
 
+test('缓存有效期覆盖只作用于对应 Query，默认与不支持的服务均不传入', { timeout: 3000 }, async t => {
+  let release, started, count = 0
+  const blocked = new Promise(resolve => { release = resolve })
+  const ready = new Promise(resolve => { started = resolve })
+  t.after(release)
+  const f = await fixture(t, async function* ({ options }) {
+    if (++count === 2) started()
+    await blocked
+    yield { type: 'result', subtype: 'success', session_id: options.sessionId }
+  })
+  assert.equal((await f.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.promptCacheTtl, true)
+  const first = f.worker.handlers.query({ ...f.params, promptCacheTtl: '5m' }, f.context)
+  const second = f.worker.handlers.query({ ...f.params, runId: 'ttl-2', promptCacheTtl: '1h',
+    sessionId: '8d04801d-7b17-4c52-9535-e10a9cc9358a', dshSessionId: 'ttl-session-2' }, f.context)
+  await ready
+  release()
+  assert.deepEqual((await Promise.all([first, second])).map(result => result.status), ['completed', 'completed'])
+  await f.worker.handlers.query({ ...f.params, runId: 'ttl-default',
+    sessionId: '9d04801d-7b17-4c52-9535-e10a9cc9358a', dshSessionId: 'ttl-session-3' }, f.context)
+  for (const key of ['CLAUDE_CODE_PROMPT_CACHE_TTL', 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL']) {
+    const bySession = new Map(f.state.queries.map(({ options }) => [options.sessionId, options.env[key]]))
+    assert.equal(bySession.get(SESSION), '5m')
+    assert.equal(bySession.get('8d04801d-7b17-4c52-9535-e10a9cc9358a'), '1h')
+    assert.equal(bySession.get('9d04801d-7b17-4c52-9535-e10a9cc9358a'), undefined)
+    assert.equal(f.state.queries.length, 3)
+  }
+  const invalid = await f.worker.handlers.query({ ...f.params, runId: 'ttl-invalid', promptCacheTtl: '2h' }, f.context)
+  assert.equal(invalid.code, 'INVALID_PROMPT_CACHE_TTL')
+
+  const older = await fixture(t, async function* () { assert.fail('不支持的覆盖不能派发') }, { cliVersion: '2.1.293' })
+  assert.equal((await older.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.promptCacheTtl, undefined)
+  const refused = await older.worker.handlers.query({ ...older.params, promptCacheTtl: '1h' }, older.context)
+  assert.equal(refused.code, 'PROMPT_CACHE_TTL_UNSUPPORTED')
+})
+
 test('两个独立 worker 不能同时写入同一 SDK 会话', async (t) => {
   let started
   let finish

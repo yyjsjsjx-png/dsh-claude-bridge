@@ -18,6 +18,18 @@ export function responseUsageFromSdk(u) {
     cacheReadTokens: u.cache_read_input_tokens ?? 0, cacheWriteTokens: u.cache_creation_input_tokens ?? 0 }
 }
 
+/** TTL details are optional and only authoritative when they reconcile to the write total. */
+export function responseLedgerUsageFromSdk(u) {
+  const usage = responseUsageFromSdk(u)
+  if (!usage) return undefined
+  const five = u.cache_creation?.ephemeral_5m_input_tokens
+  const hour = u.cache_creation?.ephemeral_1h_input_tokens
+  if (count(five) && count(hour) && five + hour === usage.cacheWriteTokens) {
+    return { ...usage, cacheWrite5mTokens: five, cacheWrite1hTokens: hour }
+  }
+  return usage
+}
+
 function nativeUsage(event) {
   let u = event.type === 'assistant/message' ? event.data.usage : undefined
   if (u === undefined) for (let i = (event.data.stream?.length ?? 0) - 1; i >= 0; i--) {

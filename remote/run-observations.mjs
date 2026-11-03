@@ -1,5 +1,5 @@
 import { firstOutputKind } from '../src/sdk-output-kind.mjs'
-import { responseUsageFromSdk } from '../src/response-usage.mjs'
+import { responseLedgerUsageFromSdk } from '../src/response-usage.mjs'
 import { isNoResponsePlaceholder } from '../src/sdk-message.mjs'
 import { createResponseTimingTracker } from '../src/response-timing.mjs'
 
@@ -16,7 +16,7 @@ export function createRunObservations({ params, record, now = () => performance.
   const emit = (kind, row) => { try { record(kind, row) } catch {} }
   const publish = response => {
     if (!response) return
-    const usage = response.final ? responseUsageFromSdk(response.usage) : undefined
+    const usage = response.final ? responseLedgerUsageFromSdk(response.usage) : undefined
     const row = { ...base(response.model ?? 'unknown'), responseId: response.id,
       ...(usage ? { usage: { scope: 'response-main-agent', ...usage } } : {}) }
     const signature = JSON.stringify({ model: row.model, usage: row.usage })

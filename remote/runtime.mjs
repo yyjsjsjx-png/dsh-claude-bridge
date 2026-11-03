@@ -76,6 +76,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   }
   if (!Number.isSafeInteger(inputConfirmationTimeoutMs) || inputConfirmationTimeoutMs < 1 || inputConfirmationTimeoutMs > 120_000) throw new TypeError('用户输入确认等待时间无效')
 
+  // These pinned executables are the combination whose per-query TTL overrides were inspected.
+  const promptCacheTtlSupported = cliVersion === '2.1.314' && sdkVersion === '0.3.314'
   const activeSessions = new Set()
   const activeRuns = new Map()
   const completedRuns = new Map()
@@ -170,6 +172,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         contextSummary: true,
         manualCompact: true,
         autoCompactWindow: true,
+        ...(promptCacheTtlSupported ? { promptCacheTtl: true } : {}),
         planUsage: true,
         ...(observability ? { observability: true } : {}),
         historySync: typeof sdk.getSessionMessages === 'function',
@@ -264,7 +267,10 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   // cancellation, then validate identity, limits and the prompt payload.
   function registerQuery(q) {
     const { params, context } = q
-    const { compact, contextPreferences, runId } = validateQueryEnvelope(params)
+    const { compact, contextPreferences, promptCacheTtl, runId } = validateQueryEnvelope(params)
+    if (promptCacheTtl !== undefined && !promptCacheTtlSupported) {
+      throw new WorkerError('PROMPT_CACHE_TTL_UNSUPPORTED', '当前服务器不支持自定义缓存有效期')
+    }
     q.runId = runId
     if (activeRuns.has(runId) || completedRuns.has(runId)) throw new WorkerError('DUPLICATE_RUN', '运行标识已被使用')
     const controller = new AbortController()
@@ -297,7 +303,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     if (observability) run.observations = createRunObservations({ params: { ...params, deviceId, sessionId },
       record: (kind, row) => observability.record(kind, row) })
     validateRunLimits(params, maxBudgetUsd)
-    return { compact, contextPreferences, dshSessionId, ...prepareQueryPayload(params, compact, zod) }
+    return { compact, contextPreferences, promptCacheTtl, dshSessionId, ...prepareQueryPayload(params, compact, zod) }
   }
 
   // Stage 2: authentication, model selection, diagnostics and the
@@ -336,7 +342,10 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         convertedDefinitions: request.convertedDefinitions, cwd, io })
       const server = sdk.createSdkMcpServer({ name: 'dsh', version: '0.1.0', tools: tools.mcpTools })
       q.diagnose('mcp', 'ready')
-      const sdkOptions = buildSdkOptions({ params, compact, cwd, cliPath, childEnv, contextPreferences: request.contextPreferences,
+      const queryEnv = request.promptCacheTtl === undefined ? childEnv : { ...childEnv,
+        CLAUDE_CODE_PROMPT_CACHE_TTL: request.promptCacheTtl,
+        CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: request.promptCacheTtl }
+      const sdkOptions = buildSdkOptions({ params, compact, cwd, cliPath, childEnv: queryEnv, contextPreferences: request.contextPreferences,
         systemPrompt: request.systemPrompt, definitions: request.definitions, server, controller, tools, sessionId,
         selectedModel, serviceBudgetUsd: maxBudgetUsd })
       const stream = createQueryStream({ query: q, compact, prompt: request.prompt, toolCalls, tools, io, inputConfirmationTimeoutMs })

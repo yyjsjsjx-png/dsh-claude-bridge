@@ -135,7 +135,8 @@ exports.apply = async function apply(ctx) {
     } }]),
     descriptor('saveContextPreferences', [{ name: 'value', wire: 'value', source: 'json', codec: {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ContextPreferences',
-      create: () => z.object({ autoCompactWindowTokens: z.number().int().min(100000).max(1000000).nullable() }),
+      create: () => z.object({ autoCompactWindowTokens: z.number().int().min(100000).max(1000000).nullable(),
+        promptCacheTtl: z.enum(['5m', '1h']).optional() }),
     } }]),
   ] });
   // This namespace is created by the mount above, so declaring it in the
@@ -216,7 +217,7 @@ exports.apply = async function apply(ctx) {
       refresh: settings.models.refreshCatalog, refreshStatus: settings.readStatus,
       loadModels: settings.models.loadModelPreferences, toggleVisibleModel: settings.models.toggleModel,
       saveModels: settings.models.saveModelPreferences, editContextMode: settings.editContextMode,
-      editContextWindow: settings.editContextWindow, saveContext: settings.saveContextPreferences }),
+      editContextWindow: settings.editContextWindow, editPromptCacheTtl: settings.editPromptCacheTtl, saveContext: settings.saveContextPreferences }),
   }, Settings));
   void settings.readStatus();
   ctx.effect(() => () => { settings.dispose(); quota.dispose(); picker.dispose(); }, '远程会话界面状态');
