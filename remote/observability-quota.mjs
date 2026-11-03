@@ -6,6 +6,9 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
   now = Date.now, cooldownMs = 120_000, freshnessMs = 120_000, timeoutMs = 15_000 } = {}) {
   const active = new Set(), skipped = Symbol('inactive')
   let snapshot = null, error = null, nextAllowedAt = 0, inFlight, pollTimer, closed = false, failures = 0
+  // restored: snapshot came from the ledger, never fresh. settledAccount: a live
+  // observation or boundary already decided this process's account state.
+  let restored = false, settledAccount = false, boundaryRecorded = false
   const report = (code, gap = false) => {
     try { Promise.resolve(onDiagnostic({ code, gap })).catch(() => {}) } catch {}
   }
@@ -19,7 +22,7 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
   const peek = () => {
     const at = now()
     return { snapshot: snapshot ? structuredClone(snapshot) : null,
-      fresh: Boolean(snapshot && at < snapshot.expiresAt && at < snapshot.observedAt + freshnessMs
+      restored, fresh: Boolean(snapshot && !restored && at < snapshot.expiresAt && at < snapshot.observedAt + freshnessMs
         && snapshot.windows.every(row => row.resetsAt === null || at < row.resetsAt)),
       lastObservedAt: snapshot?.observedAt ?? null, error: error ? { ...error } : null,
       nextAllowedAt, inFlight: Boolean(inFlight), active: active.size > 0, activeCount: active.size }
@@ -38,11 +41,14 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
     if (read.reported || closed) return
     read.reported = true
     clearTimeout(read.timer)
+    // Started before an account boundary: neither its value nor its failure belongs to the new login.
+    if (read.fenced) { read.resolve(peek()); return }
     const at = now(), candidate = normalizeObservedQuota(reply)
     const observed = candidate && candidate.observedAt >= read.startedAt && candidate.observedAt <= at + 30_000
       && (!snapshot || candidate.observedAt > snapshot.observedAt) ? candidate : undefined
     if (observed) {
       snapshot = observed; error = null; failures = 0
+      restored = false; settledAccount = true; boundaryRecorded = false
       observe({ version: 1, observationId: read.id, observedAt: at, reason: read.reason,
         status: 'available', snapshot: observed })
     } else {
@@ -107,6 +113,27 @@ export function createQuotaCoordinator({ fetchUsage, onObservation = () => {}, o
   }
   return {
     peek,
+    /** Seed the last persisted reading. Never samples, never moves the cooldown. */
+    restore(value) {
+      if (closed || snapshot || settledAccount) return false
+      const candidate = normalizeObservedQuota(value)
+      if (!candidate || candidate.observedAt > now() + 30_000) return false
+      snapshot = candidate; restored = true
+      return true
+    },
+    /** A login recheck or logout. Forget the old account's reading without sampling again. */
+    clearAccount() {
+      if (closed) return false
+      settledAccount = true
+      if (inFlight) inFlight.fenced = true
+      snapshot = null; error = null; restored = false
+      if (!boundaryRecorded) {
+        boundaryRecorded = true
+        observe({ version: 1, observationId: randomUUID(), observedAt: now(), reason: 'account-boundary',
+          status: 'unavailable', code: 'QUOTA_ACCOUNT_BOUNDARY' })
+      }
+      return true
+    },
     request(options = {}) {
       const { reason = 'manual', signal } = options && typeof options === 'object' ? options : {}
       if (!['manual', 'run-start', 'run-end', 'activity'].includes(reason)) {

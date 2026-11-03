@@ -1755,22 +1755,27 @@ test('目录初始化认证失败使有效缓存失效，网络刷新失败明�
 })
 
 test('认证状态失效或读取失败清目录，requireAuth仍独立检查且不以缓存绕过', async t => {
-  let status = { loggedIn: true, authMethod: 'claude.ai' }
+  let status = { loggedIn: true, authMethod: 'claude.ai' }, boundaries = 0
   const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') }, {
     authReader: { async read() { if (status instanceof Error) throw status; return status } },
+    observability: { accountBoundary() { boundaries++ } },
   })
   await f.worker.handlers.catalog({}, f.context)
   assert.equal(f.state.catalogQueries.length, 1)
+  assert.equal(boundaries, 0)
   await f.worker.handlers.authStatus({ refresh: true })
   await f.worker.handlers.catalog({}, f.context)
   assert.equal(f.state.catalogQueries.length, 2, '成功重新验证登录也不能沿用另一账号的目录')
+  assert.equal(boundaries, 1, '登录复核同样清除共享额度读数')
   status = { loggedIn: false }
   assert.deepEqual(await f.worker.handlers.authStatus({ refresh: true }), { loggedIn: false })
+  assert.equal(boundaries, 2)
   status = { loggedIn: true, authMethod: 'claude.ai' }
   await f.worker.handlers.catalog({}, f.context)
   assert.equal(f.state.catalogQueries.length, 3)
   status = { loggedIn: false }
   assert.equal((await f.worker.handlers.catalog({}, f.context)).code, 'AUTH_REQUIRED')
+  assert.equal(boundaries, 3)
   status = { loggedIn: true, authMethod: 'claude.ai' }
   await f.worker.handlers.catalog({}, f.context)
   assert.equal(f.state.catalogQueries.length, 4)
@@ -1779,6 +1784,7 @@ test('认证状态失效或读取失败清目录，requireAuth仍独立检查且
   status = { loggedIn: true, authMethod: 'claude.ai' }
   await f.worker.handlers.catalog({}, f.context)
   assert.equal(f.state.catalogQueries.length, 5)
+  assert.equal(boundaries, 3, '登录状态读取失败不是账号边界')
   assert.equal(f.state.queries.length, 0)
 })
 

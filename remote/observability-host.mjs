@@ -24,7 +24,11 @@ export function createObservabilityHost({ directory, onDiagnostic = () => {} }) 
     },
     onObservation: row => ledger.recordQuota(row),
   })
+  // Restart recovery reads only the private ledger. A failed read means no snapshot, not a blocked start.
+  const restored = ledger.latestQuota().then(reply => reply?.status === 'ok' && reply.snapshot
+    ? quota.restore(reply.snapshot) : false, () => false)
   return {
+    restored,
     attach(child, deviceId) {
       const identity = row => row?.deviceId === deviceId
       const workerScope = randomUUID(), keys = new Set()
@@ -54,6 +58,10 @@ export function createObservabilityHost({ directory, onDiagnostic = () => {} }) 
           }
           if (params.active) keys.add(key); else keys.delete(key)
           return { status: 'ok' }
+        },
+        accountBoundary: () => {
+          if (released) return { status: 'unavailable', code: 'OBSERVABILITY_CHANNEL_CLOSED' }
+          return quota.clearAccount() ? { status: 'ok' } : { status: 'unavailable', code: 'QUOTA_CLOSED' }
         },
       } })
       endpoints.add(endpoint)

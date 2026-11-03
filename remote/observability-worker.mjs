@@ -15,6 +15,8 @@ export function createWorkerObservability(channel, { fetchQuota, onWarning = () 
     status: () => endpoint.request('status', {}),
     quota: (reason = 'manual') => endpoint.request('quota', { reason }),
     activity: (key, active) => endpoint.notify('activity', { key, active }),
+    // Same ordered channel as later quota requests, so no reply is needed.
+    accountBoundary: () => endpoint.notify('accountBoundary', {}),
     close: endpoint.close,
   }
 }

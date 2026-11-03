@@ -386,8 +386,12 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   async function requireAuth(signal, refresh = false) {
     try {
       const status = await authReader.read({ signal, refresh })
-      if (!status.loggedIn) throw new AuthError('AUTH_REQUIRED', '请先在服务器登录 Claude Code')
+      if (!status.loggedIn) {
+        observability?.accountBoundary?.()
+        throw new AuthError('AUTH_REQUIRED', '请先在服务器登录 Claude Code')
+      }
       if (status.authMethod && status.authMethod !== 'claude.ai') {
+        observability?.accountBoundary?.()
         throw new AuthError('AUTH_METHOD_UNSUPPORTED', '当前版本仅支持本人 Claude 订阅登录；API Key 等其他登录方式暂未开放')
       }
       return status
@@ -407,7 +411,11 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
       const status = await authReader.read({ signal: context.signal, refresh: params.refresh === true })
       // Safe auth metadata has no account identity. An explicit recheck is an
       // account boundary even when the new account is also logged in.
-      if (params.refresh === true || !status.loggedIn || status.authMethod && status.authMethod !== 'claude.ai') catalogReader.clear()
+      // The shared quota reading is account-scoped in the same way.
+      if (params.refresh === true || !status.loggedIn || status.authMethod && status.authMethod !== 'claude.ai') {
+        catalogReader.clear()
+        observability?.accountBoundary?.()
+      }
       return status
     } catch (error) {
       const problem = error instanceof WorkerError || error instanceof AuthError
