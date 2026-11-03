@@ -8,6 +8,25 @@ const MAX_BYTES = 16 * 1024 * 1024
 const PAGE_BYTES = 4096
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
+const MAX_QUERY_BYTES = 128
+const MAX_MATCHES = 8
+const CONTEXT_BYTES = 64
+
+function searchBytes(buffer, needle, offset) {
+  const matches = []
+  let hit = buffer.indexOf(needle, offset)
+  while (hit !== -1 && matches.length < MAX_MATCHES) {
+    let start = Math.max(0, hit - CONTEXT_BYTES)
+    let end = Math.min(buffer.length, hit + needle.length + CONTEXT_BYTES)
+    while ((buffer[start] & 0xc0) === 0x80) start++
+    while ((buffer[end] & 0xc0) === 0x80) end--
+    matches.push({ offset: hit, snippet: decoder.decode(buffer.subarray(start, end))
+      .replace(/[\u0000-\u001f\u007f]/g, ' ') })
+    hit = buffer.indexOf(needle, hit + needle.length)
+  }
+  return { matches, nextOffset: hit === -1 ? null : hit, totalBytes: buffer.length }
+}
+
 /** An SDK web result is readable only after its successful hook registers it for this session. */
 export function createWebResultPages({ configDir, cwd, sessionId }) {
   const location = join('projects', cwd.replace(/[^a-zA-Z0-9-]/g, '-'), sessionId, 'tool-results')
@@ -62,8 +81,10 @@ export function createWebResultPages({ configDir, cwd, sessionId }) {
       } catch { return false }
     },
 
-    async read({ callId, offset = 0 }) {
+    async read({ callId, offset = 0, query }) {
       if (typeof callId !== 'string' || !CALL_ID.test(callId) || !Number.isSafeInteger(offset) || offset < 0) return null
+      if (query !== undefined && (typeof query !== 'string' || !query.trim()
+        || Buffer.byteLength(query) > MAX_QUERY_BYTES || !query.isWellFormed())) return null
       const { name, grant } = paths(callId)
       try {
         const mark = await open(grant, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -76,11 +97,13 @@ export function createWebResultPages({ configDir, cwd, sessionId }) {
         const { file, info } = await openResult(await canonicalDirectory(), name)
         try {
           if (identity !== JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs]) || offset > info.size) return null
-          const buffer = Buffer.alloc(Math.min(PAGE_BYTES, info.size - offset))
-          const { bytesRead } = await file.read(buffer, 0, buffer.length, offset)
+          const searching = query !== undefined
+          const buffer = Buffer.alloc(searching ? info.size : Math.min(PAGE_BYTES, info.size - offset))
+          const { bytesRead } = await file.read(buffer, 0, buffer.length, searching ? 0 : offset)
           if (bytesRead !== buffer.length) return null
           const after = await file.stat()
           if (info.mtimeMs !== after.mtimeMs || info.size !== after.size) return null
+          if (searching) return searchBytes(buffer, Buffer.from(query), offset)
           for (let end = bytesRead; end >= Math.max(0, bytesRead - 3); end--) {
             try {
               const content = decoder.decode(buffer.subarray(0, end))
