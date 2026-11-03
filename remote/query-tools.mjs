@@ -213,7 +213,7 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     const additionalContexts = [...(response.additionalContexts ?? [])]
     if (saved.length) additionalContexts.push(
       'Claude saved large web tool output for these call IDs: ' + saved.join(', ')
-      + '. Use read_web_result with the callId and nextOffset to read beyond the preview. Do not use local read_file or refetch for pagination.')
+      + '. Call read_web_result with callId. Pass the returned nextOffset as offset for the next page. Do not use local read_file or refetch for pagination.')
     return {
       ...(response.continue === false ? { continue: false, stopReason: 'DSH 已结束本轮。' } : {}),
       ...(additionalContexts.length ? { hookSpecificOutput: {
