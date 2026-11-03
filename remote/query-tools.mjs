@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { NATIVE_WEB_TOOLS, nativeWebApprovalReason, nativeWebResultText } from '../src/native-web.mjs'
+import { NATIVE_WEB_TOOLS, WEB_RESULT_PAGE_TOOL, nativeWebApprovalReason, nativeWebResultText } from '../src/native-web.mjs'
+import { createWebResultPages } from './web-result-pages.mjs'
 import { hasPublicWebAddresses } from './web-fetch-policy.mjs'
 import { WorkerError, throwIfAborted } from './worker-error.mjs'
 import { asMcpResult, isValidStepPreparation, toSdkUserMessages } from './query-input.mjs'
@@ -14,7 +16,7 @@ import { asMcpResult, isValidStepPreparation, toSdkUserMessages } from './query-
  * `io` is shared with the stream consumer; its `promptInput` and
  * `contextSampler` are assigned after these callbacks are created.
  */
-export function createQueryTools({ sdk, runStore, query, toolCalls, definitions, convertedDefinitions, cwd, io, nativeWebTools }) {
+export function createQueryTools({ sdk, runStore, query, toolCalls, definitions, convertedDefinitions, cwd, configDir, io, nativeWebTools }) {
   const { context, run, runId, sessionId, diagnose, startPhase } = query
   const { controller } = run
   const trackCallback = query.settlement.track
@@ -23,6 +25,9 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
   const qualifiedNames = new Set(definitions.map(({ name }) => `mcp__dsh__${name}`))
   const nativeNames = new Set(nativeWebTools ? NATIVE_WEB_TOOLS : [])
   const nativeResults = new Map(), nativeGrants = new Map()
+  const pages = query.params.nativeWebResultPages ? createWebResultPages({ configDir, cwd, sessionId }) : undefined
+  const pageTool = `mcp__dsh__${WEB_RESULT_PAGE_TOOL}`
+  const successfulWebCalls = new Map()
   const reportNativeResult = (name, id, text, isError, executed = false) => {
     if (nativeResults.has(id)) return nativeResults.get(id)
     const result = trackCallback((async () => {
@@ -119,6 +124,11 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
       const ok = hookEventName === 'PostToolUse'
       const text = nativeWebResultText(ok ? input.tool_response : input.error)
       await reportNativeResult(input.tool_name, id, text, !ok, true)
+      if (pages && ok && nativeGrants.get(id)?.name === input.tool_name) {
+        const body = input.tool_name === 'WebFetch' ? input.tool_response?.result : undefined
+        const hash = typeof body === 'string' ? createHash('sha256').update(body, 'utf8').digest('hex') : undefined
+        successfulWebCalls.set(id, hash)
+      }
       return {}
     }
     let effects
@@ -157,6 +167,12 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
       run.problem = error
       controller.abort()
       throw run.problem
+    }
+    const saved = []
+    for (const call of input.tool_calls) {
+      const id = call?.tool_use_id
+      const hash = successfulWebCalls.get(id)
+      if (successfulWebCalls.delete(id) && await pages.register(id, call.tool_response, hash)) saved.push(id)
     }
     const hookSignal = options?.signal
     const signal = hookSignal ? AbortSignal.any([controller.signal, hookSignal]) : controller.signal
@@ -200,10 +216,14 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     toolCalls.confirmBatch(batchIds)
     diagnose('step', response.continue === false ? 'stopped' : 'prepared')
     io.contextSampler?.request()
+    const additionalContexts = [...(response.additionalContexts ?? [])]
+    if (saved.length) additionalContexts.push(
+      'Claude saved large web tool output for these call IDs: ' + saved.join(', ')
+      + '. Call read_web_result with callId. Pass the returned nextOffset as offset for the next page. Do not use local read_file or refetch for pagination.')
     return {
       ...(response.continue === false ? { continue: false, stopReason: 'DSH 已结束本轮。' } : {}),
-      ...(response.additionalContexts?.length ? { hookSpecificOutput: {
-        hookEventName: 'PostToolBatch', additionalContext: response.additionalContexts.join('\n\n'),
+      ...(additionalContexts.length ? { hookSpecificOutput: {
+        hookEventName: 'PostToolBatch', additionalContext: additionalContexts.join('\n\n'),
       } } : {}),
     }
   })())
@@ -226,6 +246,15 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
         throw run.problem
       }
       throwIfAborted(controller.signal)
+      if (pages && definition.name === WEB_RESULT_PAGE_TOOL) {
+        const page = await pages.read(args)
+        throwIfAborted(controller.signal)
+        const text = page
+          ? `nextOffset: ${page.nextOffset}; totalBytes: ${page.totalBytes}\n\n${page.content}`
+          : '当前会话无此网页结果，或分页位置无效。'
+        await reportNativeResult(definition.name, callId, text, !page, true)
+        return { content: [{ type: 'text', text }], isError: !page }
+      }
       diagnose('tool', 'dispatch')
       run.inFlightTools++
       try {
@@ -273,6 +302,11 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
       return grant?.name === toolName && isDeepStrictEqual(grant.args, input) && !nativeResults.has(options.toolUseID)
         ? { behavior: 'allow', updatedInput: input }
         : { behavior: 'deny', message: '未取得此网页工具调用的本机审批' }
+    }
+    if (pages && toolName === pageTool) {
+      return hasUnexpectedKeys(toolName, input)
+        ? { behavior: 'deny', message: '网页结果分页参数无效。' }
+        : { behavior: 'allow', updatedInput: input }
     }
     if (!qualifiedNames.has(toolName)) {
       return { behavior: 'deny', message: '此会话只能使用已配置的本机 DSH 工具' }

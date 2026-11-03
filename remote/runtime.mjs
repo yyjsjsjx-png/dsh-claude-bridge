@@ -173,6 +173,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         manualCompact: true,
         autoCompactWindow: true,
         nativeWebTools: true,
+        nativeWebResultPages: true,
         ...(promptCacheTtlSupported ? { promptCacheTtl: true } : {}),
         planUsage: true,
         ...(observability ? { observability: true } : {}),
@@ -340,7 +341,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     try {
       const io = { promptInput: undefined, contextSampler: undefined, pendingUserInputs: new Set(), submittedUserInputs: new Set() }
       const tools = createQueryTools({ sdk, runStore, query: q, toolCalls, definitions: request.definitions,
-        convertedDefinitions: request.convertedDefinitions, cwd, io, nativeWebTools: params.nativeWebTools === true })
+        convertedDefinitions: request.convertedDefinitions, cwd, configDir, io, nativeWebTools: params.nativeWebTools === true })
       const server = sdk.createSdkMcpServer({ name: 'dsh', version: '0.1.0', tools: tools.mcpTools })
       q.diagnose('mcp', 'ready')
       const queryEnv = request.promptCacheTtl === undefined ? childEnv : { ...childEnv,

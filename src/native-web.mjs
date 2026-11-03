@@ -1,6 +1,7 @@
 import { isIP } from 'node:net'
 
 export const NATIVE_WEB_TOOLS = Object.freeze(['WebSearch', 'WebFetch'])
+export const WEB_RESULT_PAGE_TOOL = 'read_web_result'
 export const DSH_WEB_TOOLS = Object.freeze(['web_search', 'web_fetch'])
 export const isNativeWebTool = name => NATIVE_WEB_TOOLS.includes(name)
 
