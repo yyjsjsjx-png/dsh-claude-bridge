@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { NATIVE_WEB_TOOLS, WEB_RESULT_PAGE_TOOL, nativeWebApprovalReason, nativeWebResultText } from '../src/native-web.mjs'
 import { createWebResultPages } from './web-result-pages.mjs'
@@ -26,7 +27,7 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
   const nativeResults = new Map(), nativeGrants = new Map()
   const pages = query.params.nativeWebResultPages ? createWebResultPages({ configDir, cwd, sessionId }) : undefined
   const pageTool = `mcp__dsh__${WEB_RESULT_PAGE_TOOL}`
-  const successfulWebCalls = new Set()
+  const successfulWebCalls = new Map()
   const reportNativeResult = (name, id, text, isError, executed = false) => {
     if (nativeResults.has(id)) return nativeResults.get(id)
     const result = trackCallback((async () => {
@@ -123,7 +124,11 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
       const ok = hookEventName === 'PostToolUse'
       const text = nativeWebResultText(ok ? input.tool_response : input.error)
       await reportNativeResult(input.tool_name, id, text, !ok, true)
-      if (pages && ok && nativeGrants.get(id)?.name === input.tool_name) successfulWebCalls.add(id)
+      if (pages && ok && nativeGrants.get(id)?.name === input.tool_name) {
+        const body = input.tool_name === 'WebFetch' ? input.tool_response?.result : undefined
+        const hash = typeof body === 'string' ? createHash('sha256').update(body, 'utf8').digest('hex') : undefined
+        successfulWebCalls.set(id, hash)
+      }
       return {}
     }
     let effects
@@ -166,7 +171,8 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     const saved = []
     for (const call of input.tool_calls) {
       const id = call?.tool_use_id
-      if (successfulWebCalls.delete(id) && await pages.register(id, call.tool_response)) saved.push(id)
+      const hash = successfulWebCalls.get(id)
+      if (successfulWebCalls.delete(id) && await pages.register(id, call.tool_response, hash)) saved.push(id)
     }
     const hookSignal = options?.signal
     const signal = hookSignal ? AbortSignal.any([controller.signal, hookSignal]) : controller.signal

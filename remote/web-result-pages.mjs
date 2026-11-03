@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { open, realpath } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -26,17 +27,23 @@ export function createWebResultPages({ configDir, cwd, sessionId }) {
   }
 
   return {
-    async register(id, response) {
+    async register(id, response, expectedHash) {
       if (!CALL_ID.test(id)) return false
       const { result, grant } = paths(id)
       const text = Array.isArray(response) && response.length === 1 && response[0]?.type === 'text'
         ? response[0].text : response
-      if (typeof text !== 'string' || !text.startsWith('<persisted-output>\n') || !text.endsWith('</persisted-output>')) return false
-      const [, notice] = text.split('\n', 2)
-      if (!/^Output (?:too large \(|exceeded the )/.test(notice) || !notice.endsWith('saved to: ' + result)) return false
+      const marker = typeof text === 'string' && text.startsWith('<persisted-output>\n')
+        && text.trimEnd().endsWith('</persisted-output>')
+      const notice = marker ? text.split('\n', 2)[1] : ''
+      const boundMarker = /^Output (?:too large \(|exceeded the )/.test(notice) && notice.endsWith('saved to: ' + result)
+      if (!boundMarker && !expectedHash) return false
       try {
         const { file, info } = await openResult(result)
-        await file.close()
+        try {
+          if (!boundMarker && createHash('sha256').update(await file.readFile()).digest('hex') !== expectedHash) return false
+          const after = await file.stat()
+          if (info.mtimeMs !== after.mtimeMs || info.size !== after.size) return false
+        } finally { await file.close() }
         const mark = await open(grant, 'wx', 0o600)
         try { await mark.writeFile(JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs])) }
         finally { await mark.close() }

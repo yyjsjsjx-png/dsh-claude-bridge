@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { link, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
@@ -26,6 +27,11 @@ test('only registered web output for the bound session can be read, with UTF-8 p
   const second = await pages.read({ callId, offset: first.nextOffset })
   assert.equal(first.content + second.content, text)
   assert.equal(second.nextOffset, null)
+  const withoutMarker = 'toolu_hash'
+  await writeFile(join(folder, withoutMarker + '.txt'), text)
+  assert.equal(await pages.register(withoutMarker, {}, 'wrong-hash'), false)
+  assert.equal(await pages.register(withoutMarker, {}, createHash('sha256').update(text).digest('hex')), true)
+  assert.equal((await pages.read({ callId: withoutMarker, offset: first.nextOffset })).content, second.content)
   assert.equal(await pages.read({ callId, offset: 4095 }), null)
   assert.equal(await createWebResultPages({ configDir, cwd, sessionId: 'session-b' }).read({ callId }), null)
   await link(file, join(folder, 'toolu_link.txt'))
