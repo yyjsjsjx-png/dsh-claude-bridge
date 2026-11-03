@@ -6,7 +6,11 @@ const DEFAULT_RANGE_MS = 30 * 24 * 60 * 60 * 1000
 const buckets = ['uncachedInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']
 const quotaCodes = new Set(['PLAN_LIMITS_UNAVAILABLE', 'SDK_QUOTA_UNAVAILABLE', 'QUOTA_READ_FAILED',
   'AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_METHOD_UNSUPPORTED', 'AUTHORIZATION_DENIED', 'ACCOUNT_ON_HOLD',
-  'NETWORK', 'RATE_LIMITED', 'CANCELLED', 'CONNECTION_CHANGED', 'QUOTA_TIMEOUT', 'QUOTA_CLOSED', 'QUOTA_STALE_OBSERVATION'])
+  'NETWORK', 'RATE_LIMITED', 'CANCELLED', 'CONNECTION_CHANGED', 'QUOTA_TIMEOUT', 'QUOTA_CLOSED', 'QUOTA_STALE_OBSERVATION',
+  'QUOTA_ACCOUNT_BOUNDARY'])
+/** Failure rows after which an earlier snapshot can no longer be attributed to the current login. */
+export const QUOTA_ACCOUNT_BOUNDARY_CODES = Object.freeze(['QUOTA_ACCOUNT_BOUNDARY', 'AUTH_REQUIRED', 'AUTH_EXPIRED',
+  'AUTH_METHOD_UNSUPPORTED', 'AUTHORIZATION_DENIED', 'ACCOUNT_ON_HOLD'])
 const common = ['version', 'deviceId', 'dshSessionId', 'sdkSessionId', 'runId', 'model', 'observedAt']
 const invalid = () => { throw new TypeError('OBSERVABILITY_INVALID_RECORD') }
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -56,7 +60,7 @@ export function normalizeObservabilityRecord(kind, input) {
     shape(input, ['version', 'observationId', 'observedAt', 'reason', 'status', 'snapshot', 'code', 'retryAfterMs'])
     if (input.version !== 1 || !identity(input.observationId) || !timestamp(input.observedAt)) invalid()
     const result = { version: 1, observationId: input.observationId, observedAt: input.observedAt,
-      reason: choose(input.reason, ['manual', 'run-start', 'run-end', 'activity']),
+      reason: choose(input.reason, ['manual', 'run-start', 'run-end', 'activity', 'account-boundary']),
       status: choose(input.status, ['available', 'unavailable']) }
     if (result.status === 'available') {
       const snapshot = normalizeObservedQuota(input.snapshot)

@@ -2,7 +2,7 @@ import { parentPort, workerData } from 'node:worker_threads'
 import { mkdirSync, lstatSync, chmodSync, openSync, closeSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { normalizeObservabilityRecord } from '../src/observability-schema.mjs'
+import { normalizeObservabilityRecord, normalizeObservedQuota, QUOTA_ACCOUNT_BOUNDARY_CODES } from '../src/observability-schema.mjs'
 
 let database
 const unknown = code => ({ status: 'unavailable', code })
@@ -178,6 +178,20 @@ function summarize(filters) {
     timing: timing.slice(0, 500).map(row => ({ ...row })), timingTruncated: timing.length > 500 }
 }
 
+// A boundary row at the same instant wins: attribution must fail closed.
+function latestQuota() {
+  const none = { status: 'ok', schemaVersion: 1, snapshot: null }
+  const row = database.prepare(`SELECT observed_at, body FROM quota WHERE status='available'
+    ORDER BY observed_at DESC, id DESC LIMIT 1`).get()
+  if (!row) return none
+  const boundary = database.prepare(`SELECT MAX(observed_at) AS at FROM quota WHERE status='unavailable'
+    AND json_extract(body,'$.code') IN (${QUOTA_ACCOUNT_BOUNDARY_CODES.map(() => '?').join(',')})`)
+    .get(...QUOTA_ACCOUNT_BOUNDARY_CODES)
+  if (boundary.at !== null && boundary.at >= row.observed_at) return none
+  const snapshot = normalizeObservedQuota(JSON.parse(row.body).snapshot)
+  return snapshot ? { ...none, snapshot } : none
+}
+
 try {
   initialize()
   parentPort.postMessage({ type: 'ready', ok: true })
@@ -187,6 +201,7 @@ try {
       if (message.action === 'record') result = write(message.kind, message.value)
       else if (message.action === 'query') result = query(message.value)
       else if (message.action === 'summarize') result = summarize(message.value)
+      else if (message.action === 'latestQuota') result = latestQuota()
       else if (message.action === 'flush') result = { status: 'ok', schemaVersion: 1 }
       else if (message.action === 'close') { database.close(); result = { status: 'ok', schemaVersion: 1 } }
       else result = unknown('OBSERVABILITY_INVALID_OPERATION')

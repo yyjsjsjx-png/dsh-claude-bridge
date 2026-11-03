@@ -115,6 +115,8 @@ export function createObservabilityLedger({ directory, onDiagnostic = () => {}, 
     status: () => ({ status: state, pending: queue.length + Number(Boolean(active)), gaps, dropped, lastError }),
     query: filters => read('query', filters), summarize: filters => read('summarize', filters),
     flush: () => new Promise(resolve => { enqueue('flush', undefined, undefined, resolve) }),
+    /** Parent-only startup read: the newest account snapshot not followed by an account boundary. */
+    latestQuota: () => new Promise(resolve => { enqueue('latestQuota', undefined, undefined, resolve) }),
     close() {
       if (closing) return closing
       closing = new Promise(resolve => {

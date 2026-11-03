@@ -76,6 +76,52 @@ test('两个设备共享账号采样，空闲只读缓存，断开和已排队�
   assert.equal((await workers[1].status()).quota.active, false)
 })
 
+test('父服务重启只从账本恢复上次快照，不采样；登录边界后重启不再恢复旧账号读数', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-observability-restart-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const observedAt = Date.now() - 600_000
+  const reading = { status: 'available', source: 'sdk-plan-usage', observedAt, expiresAt: observedAt + 120_000,
+    windows: [{ id: 'seven_day', name: '周额度', scope: 'weekly', usedPercent: 98, resetsAt: observedAt + 86_400_000 }] }
+  const start = async () => {
+    const host = createObservabilityHost({ directory })
+    const [parent, child] = channels()
+    host.attach(parent, 'device-a')
+    let reads = 0
+    const worker = createWorkerObservability(child, { fetchQuota: async () => { reads++; return reading } })
+    return { host, worker, reads: () => reads, async stop() { worker.close(); await host.close() } }
+  }
+
+  // Only an older generation wrote this row; the new process must not invent fresh data from it.
+  let first = await start()
+  assert.equal(await first.host.restored, false)
+  await first.stop()
+  const { createObservabilityLedger } = await import('../remote/observability-ledger.mjs')
+  const seed = createObservabilityLedger({ directory })
+  seed.recordQuota({ version: 1, observationId: 'seed-a', observedAt, reason: 'activity', status: 'available', snapshot: reading })
+  await seed.close()
+
+  let second = await start()
+  assert.equal(await second.host.restored, true)
+  const view = await second.worker.quota('manual')
+  assert.equal(view.restored, true)
+  assert.equal(view.fresh, false)
+  assert.equal(view.active, false)
+  assert.equal(view.nextAllowedAt, 0)
+  assert.equal(view.snapshot.observedAt, observedAt)
+  assert.equal(view.snapshot.windows[0].usedPercent, 98)
+  assert.equal(second.reads(), 0)
+  second.worker.accountBoundary()
+  await tick()
+  assert.equal((await second.worker.quota('manual')).snapshot, null)
+  await second.stop()
+
+  const third = await start()
+  assert.equal(await third.host.restored, false)
+  assert.equal((await third.worker.quota('manual')).snapshot, null)
+  assert.equal(third.reads(), 0)
+  await third.stop()
+})
+
 test('IPC拒绝拥塞的落库通知时留下明确缺口，通道关闭清理等待', async () => {
   const [parent, child] = channels(), diagnostics = []
   let release, active = true

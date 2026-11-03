@@ -176,6 +176,52 @@ test('a run ending before detached sampling starts makes no read or observation'
   await coordinator.close()
 })
 
+test('restored ledger snapshot is history only: no read, no cooldown change, never fresh', async () => {
+  let now = start + 60_000, calls = 0
+  const observations = []
+  const coordinator = createQuotaCoordinator({ now: () => now,
+    fetchUsage: async () => { calls++; return snapshot(now) }, onObservation: row => observations.push(row) })
+  assert.equal(coordinator.restore({ ...snapshot(), observedAt: now + 60_000 }), false)
+  assert.equal(coordinator.restore(snapshot()), true)
+  assert.equal(coordinator.restore(snapshot(start + 1)), false)
+  const idle = await coordinator.request()
+  assert.equal(idle.restored, true)
+  assert.equal(idle.fresh, false)
+  assert.equal(idle.snapshot.observedAt, start)
+  assert.equal(idle.nextAllowedAt, 0)
+  assert.equal(calls, 0)
+  assert.equal(observations.length, 0)
+  coordinator.setActive('device-a:run-a', true)
+  const live = await coordinator.request()
+  assert.equal(calls, 1)
+  assert.equal(live.restored, false)
+  assert.equal(live.fresh, true)
+  assert.equal(live.snapshot.observedAt, now)
+  await coordinator.close()
+})
+
+test('account boundary clears the reading, fences an in-flight read, and blocks a late restore', async () => {
+  const raw = deferred(), observations = []
+  let calls = 0
+  const coordinator = createQuotaCoordinator({ now: () => start,
+    fetchUsage: () => { calls++; return raw.promise }, onObservation: row => observations.push(row) })
+  coordinator.restore(snapshot(start - 1000))
+  coordinator.setActive('device-a:run-a', true)
+  const pending = coordinator.request()
+  await Promise.resolve()
+  assert.equal(coordinator.clearAccount(), true)
+  assert.equal(coordinator.clearAccount(), true)
+  raw.resolve(snapshot(start))
+  const view = await pending
+  assert.equal(view.snapshot, null)
+  assert.equal(view.error, null)
+  assert.equal(coordinator.restore(snapshot(start - 1000)), false)
+  assert.equal(calls, 1)
+  assert.deepEqual(observations.map(row => [row.reason, row.code]), [['account-boundary', 'QUOTA_ACCOUNT_BOUNDARY']])
+  assert.doesNotThrow(() => normalizeObservabilityRecord('quota', observations[0]))
+  await coordinator.close()
+})
+
 test('close removes the active timer and neither stale ticks nor reads can restart sampling', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: start })
   let calls = 0
