@@ -184,6 +184,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         toolConclusionViaPostHook: true,
         stepPreparationViaBatchHook: true,
         userInputViaStream: true,
+        userInputImagesViaStream: true,
         maxPromptBytes: MAX_PROMPT_BYTES,
         ...(maxBudgetUsd === undefined ? {} : { maxBudgetUsd }),
       },

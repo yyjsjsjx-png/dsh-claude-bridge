@@ -1323,18 +1323,30 @@ export class BridgeBackend {
       }
       const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true)
       const additionalContexts = [], userMessages = []
+      const capabilities = this.initialized?.capabilities
+      let hasUserImages = false
       for (const message of messages) {
         const blocks = await toSdkPrompt([message], { ...run.media, signal })
-        if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_STEP_CONTEXT', '步骤附加上下文含有无法在此处投递的图片等内容；已停止。')
         // The durable event name is also used for instructions, tool context
         // and subagent delivery. Only native user provenance may steer as user.
         if (message.source.kind === 'user') {
           if (!USER_MESSAGE_ID.test(message.id)) throw failure('USER_INPUT_INVALID', '用户插话缺少有效消息标识，已停止且保留未发送消息。')
+          if (blocks.some(block => block.type === 'image')) hasUserImages = true
           userMessages.push({ id: message.id, content: blocks })
-        } else additionalContexts.push(...blocks.map(block => block.text))
+        } else {
+          if (blocks.some(block => block.type !== 'text')) throw failure('UNSUPPORTED_STEP_CONTEXT', '步骤附加上下文含有无法在此处投递的图片等内容；已停止。')
+          additionalContexts.push(...blocks.map(block => block.text))
+        }
       }
-      if (userMessages.length && this.initialized?.capabilities?.userInputViaStream !== true) {
+      if (userMessages.length && capabilities?.userInputViaStream !== true) {
         throw failure('USER_INTERJECTION_UNSUPPORTED', '服务器不支持以用户身份接收运行中插话，请更新服务器；已停止且保留未发送消息。')
+      }
+      if (hasUserImages && capabilities?.userInputImagesViaStream !== true) {
+        throw failure('USER_INTERJECTION_IMAGE_UNSUPPORTED', '服务器不支持带图插话，请更新服务器；本轮已停止，未发送消息已保留。')
+      }
+      if (hasUserImages && (userMessages.length > 64
+        || Buffer.byteLength(JSON.stringify(userMessages), 'utf8') > capabilities.maxPromptBytes)) {
+        throw failure('USER_INPUT_LIMIT', '本批带图插话超过传输限制；本轮已停止，未发送消息已保留。')
       }
       signal.throwIfAborted()
       if (run.inputClosed) throw failure('USER_INPUT_CLOSED', '当前运行已结束接收插话，未发送消息已保留。')

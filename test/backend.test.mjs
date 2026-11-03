@@ -827,6 +827,40 @@ test('旧服务器拒绝插话降为 hook，未提交用户消息恢复而不重
   assert.equal(f.records.some(record => record.type === 'user/message' && record.data.id === input.id), false)
 })
 
+test('带图插话只通过支持图片的用户输入流发送，拒绝时保留原消息', async t => {
+  const data = Buffer.from('test-image')
+  const attachment = { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png', bytes: data.length, width: 1, height: 1 }
+  for (const mode of ['supported', 'old-server', 'tool-context', 'size-limit']) {
+    const input = { id: '5c0d6e2b-0df1-4d24-98a7-873eb74b4db5', role: 'user',
+      source: { kind: mode === 'tool-context' ? 'tool-result' : 'user' },
+      content: [{ type: 'text', text: '看这张图' }, { type: 'image', attachment }] }
+    const code = { 'old-server': 'USER_INTERJECTION_IMAGE_UNSUPPORTED', 'tool-context': 'UNSUPPORTED_STEP_CONTEXT',
+      'size-limit': 'USER_INPUT_LIMIT' }[mode]
+    const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: {
+        userInputViaStream: true, userInputImagesViaStream: mode !== 'old-server',
+        maxPromptBytes: mode === 'size-limit' ? 128 : 3 * 1024 * 1024,
+      } }
+      const prepare = handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+      if (code) {
+        await assert.rejects(prepare, { code })
+        assert.deepEqual(f.agent.inbox.nextStep, [input])
+      } else {
+        assert.deepEqual(await prepare, { userMessages: [{ id: input.id, content: [input.content[0],
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: data.toString('base64') } }] }] })
+      }
+      return { status: 'completed' }
+    } }, async close() {} }))
+    f.ctx.attachments.readImage = async ref => ({ ref, data })
+    f.agent.inbox = { nextStep: [input], splice(_target, at, count, messages) { this.nextStep.splice(at, count, ...messages) } }
+    f.agent.preStep = async () => { f.agent.inbox.nextStep = []; return { ...f.decision, messages: [input] } }
+    const run = f.backend.runStep(f.agent, f.decision)
+    if (code) await assert.rejects(run, { code })
+    else assert.deepEqual(await run, { kind: 'completed' })
+    assert.equal(f.records.filter(record => record.type === 'user/message' && record.data.id === input.id).length, code ? 0 : 1)
+  }
+})
+
 test('准备插话时取消或已完成，不提交晚到消息且保留原生队列边界', async t => {
   for (const mode of ['cancel', 'finished']) {
     const input = { id: '5c0d6e2b-0df1-4d24-98a7-873eb74b4db5', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'LATE_USER' }] }

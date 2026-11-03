@@ -1520,6 +1520,7 @@ test('批次后本机要求结束或准备失败时不会静默继续', async (t
 const STEER_ONE = '5c0d6e2b-0df1-4d24-98a7-873eb74b4db5'
 const STEER_TWO = '3385ab1a-f2d9-459f-a292-2c5d494671a2'
 const steer = (id, text) => ({ id, content: [{ type: 'text', text }] })
+const STEER_IMAGE = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } }
 
 function pumpSdkInput(prompt, received) {
   return (async () => { for await (const input of prompt) { received.push(input); await Promise.resolve() } })()
@@ -1527,24 +1528,42 @@ function pumpSdkInput(prompt, received) {
 
 test('运行中真实用户消息进入 SDK 输入流，hook 来源不升权且同 UUID 不重复', async t => {
   const received = [], hooks = []
+  const inputs = [steer(STEER_ONE, 'USER_ONE'), { id: STEER_TWO, content: [STEER_IMAGE] }]
   const f = await fixture(t, async function* ({ prompt, options }) {
     const pump = pumpSdkInput(prompt, received)
     for (let i = 0; i < 2; i++) hooks.push(await options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] }))
     assert.equal(received.length, 3)
     assert.deepEqual(received.slice(1).map(message => [message.type, message.uuid, message.message.role, message.priority]),
       [['user', STEER_ONE, 'user', 'now'], ['user', STEER_TWO, 'user', 'now']])
-    assert.deepEqual(received.slice(1).map(message => message.message.content), [steer(STEER_ONE, 'USER_ONE').content, steer(STEER_TWO, 'USER_TWO').content])
+    assert.deepEqual(received.slice(1).map(message => message.message.content), inputs.map(message => message.content))
     yield { type: 'result', subtype: 'success', session_id: SESSION, user_message_uuids: [STEER_ONE, STEER_TWO] }
     await pump
   })
   f.peer.request = async method => {
     assert.equal(method, 'step.prepare')
-    return { additionalContexts: ['TOOL_CONTEXT_STAYS_HOOK', 'RULE_STAYS_HOOK'], userMessages: [steer(STEER_ONE, 'USER_ONE'), steer(STEER_TWO, 'USER_TWO')] }
+    return { additionalContexts: ['TOOL_CONTEXT_STAYS_HOOK', 'RULE_STAYS_HOOK'], userMessages: inputs }
   }
-  assert.equal((await f.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.userInputViaStream, true)
+  const { capabilities } = await f.worker.handlers.initialize({ protocolVersion: 1 })
+  assert.equal(capabilities.userInputViaStream, true)
+  assert.equal(capabilities.userInputImagesViaStream, true)
   assert.equal((await f.worker.handlers.query(f.params, f.context)).status, 'completed')
   for (const hook of hooks) assert.deepEqual(hook, { hookSpecificOutput: { hookEventName: 'PostToolBatch', additionalContext: 'TOOL_CONTEXT_STAYS_HOOK\n\nRULE_STAYS_HOOK' } })
   assert.equal(f.state.notifications.filter(event => event.method === 'sdk.message' && event.params.message.type === 'result').length, 1)
+})
+
+test('运行中图片插话的无效 base64 不进入 SDK 输入流', async t => {
+  const received = []
+  const f = await fixture(t, async function* ({ prompt, options }) {
+    const pump = pumpSdkInput(prompt, received)
+    await assert.rejects(options.hooks.PostToolBatch[0].hooks[0]({ hook_event_name: 'PostToolBatch', tool_calls: [] }),
+      { code: 'STEP_PREPARE_INVALID' })
+    yield { type: 'result', subtype: 'success', session_id: SESSION }
+    await pump
+  })
+  const invalidImage = { ...STEER_IMAGE, source: { ...STEER_IMAGE.source, data: 'invalid!' } }
+  f.peer.request = async () => ({ userMessages: [{ id: STEER_ONE, content: [invalidImage] }] })
+  assert.equal((await f.worker.handlers.query(f.params, f.context)).code, 'STEP_PREPARE_INVALID')
+  assert.equal(received.length, 1)
 })
 
 test('插话另起 SDK turn 时等待消费确认，主 usage 合并且累计 modelUsage/cost 不叠加', async t => {
