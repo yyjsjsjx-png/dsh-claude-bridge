@@ -1553,16 +1553,26 @@ export class BridgeBackend {
       let parsed
       try { parsed = JSON.parse(call.arguments) } catch { return deny }
       if (!isDeepStrictEqual(parsed, params.input)) return deny
-      const approval = this.ctx.approval
-      if (typeof approval?.request !== 'function') return { behavior: 'deny', message: '当前 DSH 无法请求网页工具审批。' }
+      const tools = this.ctx.tools
+      if (typeof tools?.prepareScheduledExecution !== 'function' || typeof tools.get !== 'function') {
+        return { behavior: 'deny', message: '当前 DSH 无法核对原生网页工具权限。' }
+      }
       const signal = AbortSignal.any([run.signal, context.signal])
+      const name = params.toolName === 'WebSearch' ? 'web_search' : 'web_fetch'
+      if (!tools.get(name, run.agent) || signal.aborted) return deny
+      const args = name === 'web_search' ? { queries: [parsed.query] } : { url: parsed.url }
       if (!run.nativeApprovals.has(params.toolUseId)) {
-        const request = Promise.resolve(approval.request({ agent: run.agent, toolName: params.toolName,
-          callId: params.toolUseId, reason, signal }))
-          .then(outcome => outcome === 'allowed-once' && !signal.aborted ? { behavior: 'allow' } : deny)
+        // Run the actual DSH policy and guards, without invoking the DSH tool body.
+        const request = this.ctx.agents.withInitiator(run.agent, async () => {
+          const prepared = await tools.prepareScheduledExecution({
+            agent: run.agent, name, callId: params.toolUseId, arguments: args, signal,
+          })
+          return prepared?.kind === 'dispatch' && !signal.aborted ? { behavior: 'allow' } : deny
+        })
         run.nativeApprovals.set(params.toolUseId, request)
       }
-      return await run.nativeApprovals.get(params.toolUseId)
+      const result = await run.nativeApprovals.get(params.toolUseId)
+      return signal.aborted ? deny : result
     }
     // Tool permissions are enforced by the local DSH tool pipeline. Native SDK
     // tools are not silently granted a second execution world.
