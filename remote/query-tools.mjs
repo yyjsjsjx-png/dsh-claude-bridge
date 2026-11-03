@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util'
 import { NATIVE_WEB_TOOLS, nativeWebApprovalReason, nativeWebResultText } from '../src/native-web.mjs'
 import { hasPublicWebAddresses } from './web-fetch-policy.mjs'
 import { WorkerError, throwIfAborted } from './worker-error.mjs'
@@ -21,7 +22,7 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
   // registry can bind it to canonical arguments or advance tool facts.
   const qualifiedNames = new Set(definitions.map(({ name }) => `mcp__dsh__${name}`))
   const nativeNames = new Set(nativeWebTools ? NATIVE_WEB_TOOLS : [])
-  const nativeResults = new Map()
+  const nativeResults = new Map(), nativeGrants = new Map()
   const reportNativeResult = (name, id, text, isError, executed = false) => {
     if (nativeResults.has(id)) return nativeResults.get(id)
     const result = trackCallback((async () => {
@@ -94,8 +95,9 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
         await reportNativeResult(name, id, message, true)
         return denyTool(message)
       }
-      // The exact native names are already pre-approved by the SDK options.
-      // Never issue a hook allow override for Claude Code's own security checks.
+      if (controller.signal.aborted) return denyTool('请求已取消')
+      nativeGrants.set(id, { name, args })
+      // Preserve any native SDK permission and domain checks after this hook.
       return {}
     }
     if (!qualifiedNames.has(input.tool_name)) return denyTool('此会话只能使用已配置的本机 DSH 工具')
@@ -249,7 +251,10 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     })()))
   })
   const hooks = {
-    PreToolUse: [{ hooks: [(...args) => trackCallback(preToolUse(...args))] }],
+    PreToolUse: [{ hooks: [(...args) => trackCallback(preToolUse(...args).catch(error => {
+      if (!nativeNames.has(args[0]?.tool_name)) throw error
+      return denyTool('未能完成原生网页工具审批')
+    }))] }],
     PostToolUse: [{ hooks: [postToolUse] }],
     PostToolUseFailure: [{ hooks: [postToolUse] }],
     PostToolBatch: [{ hooks: [postToolBatch] }],
@@ -263,6 +268,12 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
   }
   const canUseTool = (toolName, input, options) => trackCallback((async () => {
     if (controller.signal.aborted) return { behavior: 'deny', message: '请求已取消' }
+    if (nativeNames.has(toolName)) {
+      const grant = nativeGrants.get(options?.toolUseID)
+      return grant?.name === toolName && isDeepStrictEqual(grant.args, input) && !nativeResults.has(options.toolUseID)
+        ? { behavior: 'allow', updatedInput: input }
+        : { behavior: 'deny', message: '未取得此网页工具调用的本机审批' }
+    }
     if (!qualifiedNames.has(toolName)) {
       return { behavior: 'deny', message: '此会话只能使用已配置的本机 DSH 工具' }
     }

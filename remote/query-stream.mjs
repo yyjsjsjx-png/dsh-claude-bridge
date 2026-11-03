@@ -25,7 +25,7 @@ export function buildSdkOptions({ params, compact, cwd, cliPath, childEnv, conte
     strictMcpConfig: true,
     verbatimPrompts: !compact,
     tools: [...(tools.nativeNames ?? [])],
-    allowedTools: [...definitions.map(({ name }) => `mcp__dsh__${name}`), ...(tools.nativeNames ?? [])],
+    allowedTools: definitions.map(({ name }) => `mcp__dsh__${name}`),
     permissionMode: 'default',
     mcpServers: { dsh: server },
     persistSession: true,

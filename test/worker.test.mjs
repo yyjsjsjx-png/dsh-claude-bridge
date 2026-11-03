@@ -1886,7 +1886,9 @@ test('原生网页工具经过本机审批，按调用 ID 记录远端结果，�
     const f = await fixture(t, async function* ({ options, prompt }) {
       await prompt.next()
       assert.deepEqual(options.tools, ['WebSearch', 'WebFetch'])
-      assert.deepEqual(options.allowedTools, ['mcp__dsh__local_command', 'WebSearch', 'WebFetch'])
+      assert.deepEqual(options.allowedTools, ['mcp__dsh__local_command'])
+      const permission = args => options.canUseTool(name, args, { toolUseID: callId })
+      assert.equal((await permission(input)).behavior, 'deny')
       const invoke = (event, fields = {}) => options.hooks[event][0].hooks[0]({
         hook_event_name: event, tool_use_id: callId, tool_name: name, tool_input: input, ...fields,
       }, callId)
@@ -1896,9 +1898,12 @@ test('原生网页工具经过本机审批，按调用 ID 记录远端结果，�
       yield { type: 'assistant', message: { id: 'response-1', content: [{ type: 'tool_use', id: callId, name, input }] } }
       if (allowed) {
         assert.deepEqual(await pre, {})
+        assert.equal((await permission(input)).behavior, 'allow')
+        assert.equal((await permission({ ...input, query: '未批准参数' })).behavior, 'deny')
         const data = { tool_response: '合成网页正文' }
         await invoke('PostToolUse', data)
         await invoke('PostToolUse', data)
+        assert.equal((await permission(input)).behavior, 'deny')
       } else assert.equal((await pre).hookSpecificOutput.permissionDecision, 'deny')
       await invoke('PostToolBatch', { tool_calls: [{ tool_use_id: callId, tool_name: name }] })
       yield { type: 'result', subtype: 'success', session_id: SESSION }
