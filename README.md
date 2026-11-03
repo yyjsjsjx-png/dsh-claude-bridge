@@ -10,6 +10,11 @@
 
 参与开发见 [Issue 并行开发与交付](docs/development.md) 和 [代码开发规范](docs/coding-standards.md)；统计能力与精度边界见 [用量、额度与耗时账本](docs/observability.md)。开发合并、正式发布和两端升级分别按授权执行。
 
+## v0.2.13
+
+- 远程任务全部结束后，在冷却与退避允许时补采一次额度。
+- Windows 在线更新可补齐 pnpm 缺失的依赖元数据，并显示可识别的安装错误。
+
 ## 使用边界与合规
 
 - 本项目是个人实验工具，与 Anthropic 无隶属、合作或背书关系。Claude、Claude Code 为 Anthropic 的商标，此处仅用于说明服务器上运行的是官方程序。
