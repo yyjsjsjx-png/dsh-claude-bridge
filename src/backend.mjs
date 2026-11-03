@@ -34,7 +34,7 @@ import { readHistoryPages } from './history-reader.mjs'
 import { appendHistoryRecord, HISTORY_TOOL_RESULT } from './history-records.mjs'
 import { isNoResponsePlaceholder } from './sdk-message.mjs'
 import { recoveryNotice } from './recovery-notice.mjs'
-import { DSH_WEB_TOOLS, isNativeWebTool, nativeWebApprovalReason } from './native-web.mjs'
+import { DSH_WEB_TOOLS, WEB_RESULT_PAGE_TOOL, isNativeWebTool, nativeWebApprovalReason } from './native-web.mjs'
 import { validateContextPreferences } from './context-preferences.mjs'
 import { requiredShellName, assertRemoteShell,
   shellInfrastructureFailure } from './remote-capabilities.mjs'
@@ -1050,7 +1050,7 @@ export class BridgeBackend {
     let { binding, transport, contextPreferences } = await this.connectRunStep(agent, signal, timing)
     if (this.initialized?.capabilities?.historySync === true) binding = await this.syncRunHistory(agent, signal)
     timing('history_checked')
-    const request = await this.prepareRunRequest(agent, decision, { selected, binding, signal, timing, nativeWebTools: contextPreferences.nativeWebTools === true })
+    const request = await this.prepareRunRequest(agent, decision, { selected, binding, signal, timing, nativeWebTools: contextPreferences.nativeWebTools === true, nativeWebResultPages: contextPreferences.nativeWebResultPages === true })
     const run = this.createRun(agent, { runId, phase, turn, step, signal, timing, selected, request })
     // Mutable per-run flow state shared by the start, failure and finish stages.
     const flow = { transport, onStop: undefined, startedAt: undefined }
@@ -1086,6 +1086,7 @@ export class BridgeBackend {
     const contextPreferences = this.contextRequestPreferences()
     if (this.initialized?.capabilities?.nativeWebTools === true && this.contextPreferences().webToolProvider !== 'dsh') {
       contextPreferences.nativeWebTools = true
+      if (this.initialized.capabilities.nativeWebResultPages === true) contextPreferences.nativeWebResultPages = true
     }
     timing('connected')
     return { binding, transport, contextPreferences }
@@ -1104,7 +1105,7 @@ export class BridgeBackend {
     return this.state.binding(agent.id, agent.session.header.cwd)
   }
 
-  async prepareRunRequest(agent, decision, { selected, binding, signal, timing, nativeWebTools }) {
+  async prepareRunRequest(agent, decision, { selected, binding, signal, timing, nativeWebTools, nativeWebResultPages }) {
     const converted = await this.convertTools(decision.assembly, selected, undefined, nativeWebTools)
     // The full conversion can exclude the shell (for example, the global tool
     // count cap); the cheap initial probe cannot admit that final collection.
@@ -1123,7 +1124,7 @@ export class BridgeBackend {
     signal.throwIfAborted()
     const systemPrompt = prepared.renderSystemPrompt()
     timing('prompt_prepared')
-    return { converted, prepared, assembly, messages, media, prompt, notice, injectNotice, systemPrompt, nativeWebTools }
+    return { converted, prepared, assembly, messages, media, prompt, notice, injectNotice, systemPrompt, nativeWebTools, nativeWebResultPages }
   }
 
   createRun(agent, { runId, phase, turn, step, signal, timing, selected, request }) {
@@ -1133,7 +1134,7 @@ export class BridgeBackend {
       signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
       compatibility: converted.compatibility, requestedModel: selected.model, requestedEffort: selected.reasoningEffort,
-      nativeWebTools: request.nativeWebTools, callEvents: new Map(), settledToolIds: new Set(), nativeApprovals: new Map(), nativeResultHashes: new Map(),
+      nativeWebTools: request.nativeWebTools, nativeWebResultPages: request.nativeWebResultPages, callEvents: new Map(), settledToolIds: new Set(), nativeApprovals: new Map(), nativeResultHashes: new Map(),
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
   }
 
@@ -1498,7 +1499,7 @@ export class BridgeBackend {
     let unresolved = false
     for (const [id, call] of run.projection.committedToolCalls) {
       if (call.step !== run.step || run.settledToolIds.has(id)) continue
-      const native = isNativeWebTool(call.name)
+      const native = isNativeWebTool(call.name) || call.name === WEB_RESULT_PAGE_TOOL
       const unknown = native || run.callEvents.has(id)
       const text = unknown ? (native ? 'Claude Code 网页工具结果未知，请核实后再重试。' : UNKNOWN_TOOL_TEXT)
         : '桥接未派发此工具调用，已停止本轮。'
@@ -1518,7 +1519,8 @@ export class BridgeBackend {
     await context.peer?.drainNotifications?.()
     const run = this.runs.get(params?.runId)
     const call = run?.projection.committedToolCalls.get(params?.callId)
-    if (!run?.nativeWebTools || !isNativeWebTool(params?.name) || call?.name !== params.name
+    const page = run?.nativeWebResultPages && params?.name === WEB_RESULT_PAGE_TOOL
+    if (!run?.nativeWebTools || (!page && !isNativeWebTool(params?.name)) || call?.name !== params.name
       || (params.text !== null && (typeof params.text !== 'string' || params.text.length > 129_000))
       || typeof params.isError !== 'boolean') throw failure('UNADMITTED_TOOL', '未能关联 Claude Code 网页工具结果。')
     const hash = createHash('sha256').update(JSON.stringify([params.text, params.isError])).digest('hex')
@@ -1526,7 +1528,7 @@ export class BridgeBackend {
       if (run.nativeResultHashes.get(params.callId) !== hash) throw failure('LATE_TOOL_RESULT', '迟到或不一致的网页工具结果未覆盖历史。')
     } else {
       if (run.inputClosed || call.step !== run.step) throw failure('LATE_TOOL_RESULT', '网页工具结果晚于步骤结束，未写入历史。')
-      if (!params.isError && (await run.nativeApprovals.get(params.callId))?.behavior !== 'allow') {
+      if (!page && !params.isError && (await run.nativeApprovals.get(params.callId))?.behavior !== 'allow') {
         throw failure('UNADMITTED_TOOL', '未经批准的网页工具结果未写入历史。')
       }
       if (run.inputClosed || call.step !== run.step || run.settledToolIds.has(params.callId)) {
