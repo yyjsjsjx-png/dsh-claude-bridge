@@ -1,3 +1,5 @@
+import { NATIVE_WEB_TOOLS, nativeWebApprovalReason, nativeWebResultText } from '../src/native-web.mjs'
+import { hasPublicWebAddresses } from './web-fetch-policy.mjs'
 import { WorkerError, throwIfAborted } from './worker-error.mjs'
 import { asMcpResult, isValidStepPreparation, toSdkUserMessages } from './query-input.mjs'
 
@@ -11,18 +13,40 @@ import { asMcpResult, isValidStepPreparation, toSdkUserMessages } from './query-
  * `io` is shared with the stream consumer; its `promptInput` and
  * `contextSampler` are assigned after these callbacks are created.
  */
-export function createQueryTools({ sdk, runStore, query, toolCalls, definitions, convertedDefinitions, cwd, io }) {
+export function createQueryTools({ sdk, runStore, query, toolCalls, definitions, convertedDefinitions, cwd, io, nativeWebTools }) {
   const { context, run, runId, sessionId, diagnose, startPhase } = query
   const { controller } = run
   const trackCallback = query.settlement.track
   // PreToolUse supplies the ID that MCP handlers lack. Only the per-run
   // registry can bind it to canonical arguments or advance tool facts.
   const qualifiedNames = new Set(definitions.map(({ name }) => `mcp__dsh__${name}`))
+  const nativeNames = new Set(nativeWebTools ? NATIVE_WEB_TOOLS : [])
+  const nativeResults = new Map()
+  const reportNativeResult = (name, id, text, isError, executed = false) => {
+    if (nativeResults.has(id)) return nativeResults.get(id)
+    const result = trackCallback((async () => {
+      try {
+        await toolCalls.waitForEvent(id)
+        const ack = await context.peer.request('web.result', { runId, name, callId: id, text, isError }, { signal: controller.signal })
+        if (ack?.recorded !== true || text === null) {
+          throw new WorkerError('NATIVE_WEB_RESULT_UNCONFIRMED', 'Claude Code 网页工具结果未获确认', { toolMayHaveExecuted: true })
+        }
+        if (executed) toolCalls.recordResult(id, { concludesTurn: false, additionalContexts: [] })
+      } catch (error) {
+        run.problem = error instanceof WorkerError ? error
+          : new WorkerError('NATIVE_WEB_RESULT_UNCONFIRMED', 'Claude Code 网页工具结果未能写入历史', { toolMayHaveExecuted: true })
+        controller.abort()
+        throw run.problem
+      }
+    })())
+    nativeResults.set(id, result)
+    return result
+  }
   const definitionsByName = new Map(definitions.map((definition) => [`mcp__dsh__${definition.name}`, definition]))
   const markForwardedToolEvents = (message) => {
     if (message?.type !== 'assistant' || message.error || !Array.isArray(message.message?.content)) return
     for (const block of message.message.content) {
-      if (block?.type !== 'tool_use' || typeof block.id !== 'string' || !qualifiedNames.has(block.name)) continue
+      if (block?.type !== 'tool_use' || typeof block.id !== 'string' || !(qualifiedNames.has(block.name) || nativeNames.has(block.name))) continue
       toolCalls.markForwarded(block.id)
     }
   }
@@ -38,6 +62,42 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
   })
   const preToolUse = async (input, toolUseId) => {
     if (input?.hook_event_name !== 'PreToolUse') return denyTool('无法确认工具执行类型')
+    if (nativeNames.has(input.tool_name)) {
+      const { tool_name: name, tool_input: args } = input
+      const id = input.tool_use_id ?? toolUseId
+      if (typeof id !== 'string' || !id) return denyTool('无法关联网页工具调用标识')
+      const reason = nativeWebApprovalReason(name, args)
+      if (!reason) {
+        const message = '原生网页工具参数不受支持。抓取仅接受公开域名的标准 HTTPS 地址。'
+        await reportNativeResult(name, id, message, true)
+        return denyTool(message)
+      }
+      const finishApproval = startPhase('approval_wait', { callId: id })
+      let response
+      try {
+        await toolCalls.waitForEvent(id)
+        response = await context.peer.request('approval.request', {
+          runId, toolName: name, toolUseId: id, input: args,
+        }, { signal: controller.signal })
+      } catch (error) {
+        run.problem = error instanceof WorkerError ? error : new WorkerError('APPROVAL_UNAVAILABLE', '网页工具审批连接中断')
+        controller.abort()
+        throw run.problem
+      } finally { finishApproval() }
+      if (response?.behavior !== 'allow') {
+        const message = response?.message ?? '网页工具未获批准。'
+        await reportNativeResult(name, id, message, true)
+        return denyTool(message)
+      }
+      if (name === 'WebFetch' && !await hasPublicWebAddresses(args.url)) {
+        const message = '网页域名未能解析为公网地址，已拒绝抓取。'
+        await reportNativeResult(name, id, message, true)
+        return denyTool(message)
+      }
+      // The exact native names are already pre-approved by the SDK options.
+      // Never issue a hook allow override for Claude Code's own security checks.
+      return {}
+    }
     if (!qualifiedNames.has(input.tool_name)) return denyTool('此会话只能使用已配置的本机 DSH 工具')
     if (hasUnexpectedKeys(input.tool_name, input.tool_input)) return denyTool('工具参数包含未声明的字段')
     const id = input.tool_use_id ?? toolUseId
@@ -53,6 +113,12 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     const id = input?.tool_use_id ?? toolUseId
     if (typeof id !== 'string') return {}
     const hookEventName = input?.hook_event_name
+    if (nativeNames.has(input?.tool_name)) {
+      const ok = hookEventName === 'PostToolUse'
+      const text = nativeWebResultText(ok ? input.tool_response : input.error)
+      await reportNativeResult(input.tool_name, id, text, !ok, true)
+      return {}
+    }
     let effects
     try { effects = toolCalls.confirmEffects(id, hookEventName) } catch (error) {
       run.problem = error
@@ -78,7 +144,14 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     // create a new DSH step if the batch callback still fires afterward.
     if (toolCalls.concluded) return { continue: false, stopReason: 'DSH 工具已结束本轮。' }
     const batchIds = new Set(input.tool_calls.map((call) => call?.tool_use_id).filter((id) => typeof id === 'string'))
-    try { toolCalls.assertBatch(batchIds) } catch (error) {
+    try {
+      for (const call of input.tool_calls) if (nativeNames.has(call?.tool_name)) {
+        const result = nativeResults.get(call.tool_use_id)
+        if (!result) throw new WorkerError('NATIVE_WEB_RESULT_UNCONFIRMED', '无法确认 Claude Code 网页工具的实际结果', { toolMayHaveExecuted: true })
+        await result
+      }
+      toolCalls.assertBatch(batchIds)
+    } catch (error) {
       run.problem = error
       controller.abort()
       throw run.problem
@@ -176,13 +249,15 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     })()))
   })
   const hooks = {
-    PreToolUse: [{ hooks: [preToolUse] }],
+    PreToolUse: [{ hooks: [(...args) => trackCallback(preToolUse(...args))] }],
     PostToolUse: [{ hooks: [postToolUse] }],
     PostToolUseFailure: [{ hooks: [postToolUse] }],
     PostToolBatch: [{ hooks: [postToolBatch] }],
     PermissionDenied: [{ hooks: [async (input, toolUseId) => {
       const id = input?.tool_use_id ?? toolUseId
-      if (typeof id === 'string') toolCalls.forget(id)
+      if (typeof id === 'string' && nativeNames.has(input?.tool_name)) {
+        await reportNativeResult(input.tool_name, id, 'Claude Code 拒绝执行此网页工具。', true)
+      } else if (typeof id === 'string') toolCalls.forget(id)
       return {}
     }] }],
   }
@@ -234,5 +309,5 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
       ? { behavior: 'allow', updatedInput: response.updatedInput ?? input }
       : { behavior: 'deny', message: typeof response.message === 'string' ? response.message : '用户未批准' }
   })())
-  return { qualifiedNames, markForwardedToolEvents, mcpTools, hooks, canUseTool }
+  return { qualifiedNames, nativeNames, markForwardedToolEvents, mcpTools, hooks, canUseTool }
 }

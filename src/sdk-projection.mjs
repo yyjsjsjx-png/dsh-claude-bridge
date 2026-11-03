@@ -49,7 +49,7 @@ export class SdkProjection {
 
   getCommittedToolCall(id) {
     const call = this.committedToolCalls.get(id)
-    return call && { ...call }
+    return call && { name: call.name, arguments: call.arguments }
   }
 
   emit(frame) {
@@ -432,13 +432,6 @@ export class SdkProjection {
       else content[previous] = block
     }
     if (this.messageId) this.committedContent.set(this.messageId, content)
-    for (const block of content) {
-      if (block.type === 'tool-call') {
-        this.committedToolIds.add(block.id)
-        this.committedToolCalls.set(block.id, { name: block.name, arguments: block.arguments })
-      }
-      else if (['text', 'reasoning'].includes(block.type)) this.committedText.add(JSON.stringify([this.messageId, block.type, block.text]))
-    }
     const data = {
       turn: this.turn, step: this.step,
       message: { ...this.helpers.createAssistantMessage({ content,
@@ -455,6 +448,14 @@ export class SdkProjection {
       committed = this.agent.session.append('assistant/message', { ...data,
         ...(previousContent ? { message: { ...data.message, content: journalContent }, stream: [] } : {}),
       }, { surfaceOp: 'append' })
+    }
+    for (const block of journalContent) {
+      if (block.type === 'tool-call') {
+        this.committedToolIds.add(block.id)
+        this.committedToolCalls.set(block.id, { name: block.name, arguments: block.arguments, step: this.step })
+      } else if (['text', 'reasoning'].includes(block.type)) {
+        this.committedText.add(JSON.stringify([this.messageId, block.type, block.text]))
+      }
     }
     if (previousContent) appendHistoryRecord(this.agent.session, HISTORY_ASSISTANT, data, this.helpers)
     this.recordResponseUsage(this.currentResponse)

@@ -1,3 +1,4 @@
+import { DSH_WEB_TOOLS } from '../src/native-web.mjs'
 import { validateContextPreferences, validatePromptCacheTtl } from '../src/context-preferences.mjs'
 import { WorkerError, requireObject, requireString } from './worker-error.mjs'
 
@@ -7,7 +8,7 @@ const MAX_TOOLS = 80
 export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
 const MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp'])
-const QUERY_KEYS = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences', 'promptCacheTtl'])
+const QUERY_KEYS = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences', 'promptCacheTtl', 'nativeWebTools'])
 
 /**
  * Validate the request shape that must hold before a run is registered.
@@ -20,6 +21,9 @@ export function validateQueryEnvelope(params) {
   }
   if (params.action !== undefined && params.action !== 'compact') throw new WorkerError('UNSUPPORTED_ACTION', '不支持该会话操作')
   const compact = params.action === 'compact'
+  if (params.nativeWebTools !== undefined && (compact || params.nativeWebTools !== true)) {
+    throw new WorkerError('INVALID_WEB_TOOLS', '原生网页工具仅支持普通远程请求')
+  }
   let contextPreferences, promptCacheTtl
   try {
     contextPreferences = validateContextPreferences(params.contextPreferences)
@@ -156,6 +160,9 @@ export function prepareQueryPayload(params, compact, zod) {
   // neither reconstructs it from DSH history nor injects a replacement.
   const systemPrompt = compact ? undefined : buildSystemPrompt(params)
   const definitions = compact ? [] : validateToolDefinitions(params.tools)
+  if (params.nativeWebTools && definitions.some(({ name }) => DSH_WEB_TOOLS.includes(name))) {
+    throw new WorkerError('INVALID_WEB_TOOLS', '不能同时使用 Claude Code 和本机 DSH 网页工具')
+  }
   // Validate conversion before reserving a durable session directory.
   const convertedDefinitions = convertToolDefinitions(zod, definitions)
   return { prompt, systemPrompt, definitions, convertedDefinitions }

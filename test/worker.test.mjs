@@ -11,6 +11,7 @@ import { createRunStore } from '../remote/history.mjs'
 import { setImmediate as tick } from 'node:timers/promises'
 import { sanitizePlanUsage } from '../src/plan-usage.mjs'
 import { readSessionTitleMetadata } from '../remote/session-title-metadata.mjs'
+import { hasPublicWebAddresses } from '../remote/web-fetch-policy.mjs'
 import { MODEL_CATALOG_CACHE_MS } from '../src/catalog-cache-policy.mjs'
 
 const SESSION = '7d04801d-7b17-4c52-9535-e10a9cc9358a'
@@ -430,7 +431,7 @@ async function fixture(t, queryImplementation, overrides = {}) {
       const inner = queryImplementation(request, state)
       const generator = (async function* () {
         const names = request.options.mcpServers.dsh.instance.tools.map((tool) => `mcp__dsh__${tool.name}`)
-        yield { type: 'system', subtype: 'init', session_id: request.options.sessionId ?? request.options.resume ?? SESSION, tools: state.initTools ?? names }
+        yield { type: 'system', subtype: 'init', session_id: request.options.sessionId ?? request.options.resume ?? SESSION, tools: state.initTools ?? [...names, ...request.options.tools] }
         yield* inner
       })()
       generator.initializationResult = async () => ({ hooks_applied: state.hooksApplied ?? true, commands: state.commands ?? [],
@@ -1862,4 +1863,65 @@ test('正常Query已取得的初始化models自然更新目录，不额外开启
   assert.equal(result.models.at(-1).value, 'model-c')
   assert.equal(f.state.catalogQueries.length, 1)
   assert.equal(f.state.queries.length, 1)
+})
+
+test('网页抓取 DNS 检查拒绝混有非公网地址的结果，不替换 Claude 的连接', async () => {
+  const resolve = records => async () => records
+  const publicIpv4 = { family: 4, address: '1.1.1.1' }
+  const publicIpv6 = { family: 6, address: '2606:4700:4700::1111' }
+  assert.equal(await hasPublicWebAddresses('https://fixture.example/', { resolve: resolve([publicIpv4, publicIpv6]) }), true)
+  for (const record of [{ family: 4, address: '169.254.169.254' }, { family: 6, address: '::ffff:127.0.0.1' }]) {
+    assert.equal(await hasPublicWebAddresses('https://fixture.example/', { resolve: resolve([publicIpv4, record]) }), false)
+  }
+  assert.equal(await hasPublicWebAddresses('https://fixture.example/', { resolve: resolve([]) }), false)
+})
+
+test('原生网页工具经过本机审批，按调用 ID 记录远端结果，再开放下一步', async t => {
+  for (const [name, input, allowed] of [
+    ['WebSearch', { query: '合成测试' }, true],
+    ['WebSearch', { query: '合成测试' }, false],
+    ['WebFetch', { url: 'https://127.0.0.1/test', prompt: '合成测试' }, false],
+  ]) await t.test(name + (allowed ? ' approved' : ' denied'), async t => {
+    const callId = 'web-tool-1'
+    const f = await fixture(t, async function* ({ options, prompt }) {
+      await prompt.next()
+      assert.deepEqual(options.tools, ['WebSearch', 'WebFetch'])
+      assert.deepEqual(options.allowedTools, ['mcp__dsh__local_command', 'WebSearch', 'WebFetch'])
+      const invoke = (event, fields = {}) => options.hooks[event][0].hooks[0]({
+        hook_event_name: event, tool_use_id: callId, tool_name: name, tool_input: input, ...fields,
+      }, callId)
+      // Start the permission callback before the corresponding assistant
+      // event; its result must remain blocked until the event is forwarded.
+      const pre = invoke('PreToolUse')
+      yield { type: 'assistant', message: { id: 'response-1', content: [{ type: 'tool_use', id: callId, name, input }] } }
+      if (allowed) {
+        assert.deepEqual(await pre, {})
+        const data = { tool_response: '合成网页正文' }
+        await invoke('PostToolUse', data)
+        await invoke('PostToolUse', data)
+      } else assert.equal((await pre).hookSpecificOutput.permissionDecision, 'deny')
+      await invoke('PostToolBatch', { tool_calls: [{ tool_use_id: callId, tool_name: name }] })
+      yield { type: 'result', subtype: 'success', session_id: SESSION }
+    })
+    f.peer.request = async (method, params) => {
+      f.state.requests.push({ method, params })
+      assert.ok(f.state.notifications.some(row => row.params?.message?.message?.id === 'response-1'))
+      if (method === 'approval.request') return { behavior: allowed ? 'allow' : 'deny', message: '未批准' }
+      if (method === 'web.result') return { recorded: true }
+      if (method === 'step.prepare') return {}
+      assert.fail('原生网页工具不能通过 DSH 执行')
+    }
+    const initialized = await f.worker.handlers.initialize({ protocolVersion: 1 })
+    assert.equal(initialized.capabilities.nativeWebTools, true)
+    const result = await f.worker.handlers.query({ ...f.params, nativeWebTools: true }, f.context)
+    assert.equal(result.status, 'completed', JSON.stringify(result))
+    assert.deepEqual(f.state.requests.map(({ method }) => method), [
+      ...(name === 'WebFetch' ? [] : ['approval.request']), 'web.result', 'step.prepare',
+    ])
+    const output = f.state.requests.find(row => row.method === 'web.result').params
+    assert.equal(output.callId, callId)
+    assert.equal(output.name, name)
+    assert.equal(output.isError, !allowed)
+    if (allowed) assert.equal(output.text, '合成网页正文')
+  })
 })

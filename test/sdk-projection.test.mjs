@@ -908,3 +908,60 @@ test('实际rc5：权威工具消息补齐残缺或改变的原始参数时，�
     assert.deepEqual(JSON.parse(projection.getCommittedToolCall('input-call').arguments), { command: 'complete' })
   }
 })
+
+test('实际 rc5：网页结果去重，断线和缺失的第三个本机调用闭合后可严格重载',
+  { skip: !available }, async () => {
+    const native = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+    const { RunStepLifecycle } = await import('../src/step-lifecycle.mjs')
+    const runtime = await import('../plugin/compat/runtime.mjs')
+    const id = 'bridge-tool-settlement'
+    const session = native.Session.create(id, undefined, { version: native.SESSION_FORMAT_VERSION,
+      id, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote', cwd: tmpdir() })
+    const signal = new AbortController().signal
+    const agent = { id, session, phase: { kind: 'running', turn: 1, step: 1 }, dispatch: { emit() {} } }
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    const steps = new RunStepLifecycle({ agent, phase: agent.phase, turn: 1, step: 1 })
+    const run = { agent, turn: 1, get step() { return steps.current }, nativeWebTools: true, signal,
+      nativeApprovals: new Map(), nativeResultHashes: new Map(), callEvents: new Map(), settledToolIds: new Set() }
+    const helpers = { ...runtime, appendPluginRecord: native.appendPluginRecord }
+    const backend = Object.assign(Object.create(BridgeBackend.prototype), { helpers, runs: new Map([['test-run', run]]),
+      ctx: { approval: { request: async () => 'allowed-once' }, sessions: { flush: async () => true } } })
+    run.projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'fixture',
+      onModelStart: () => steps.modelStart({ signal, tools: Promise.resolve(), beforeClose: () => backend.requireSettledStepTools(run) }) })
+    await run.projection.accept({ type: 'assistant', message: { id: 'model-1', content: [
+      { type: 'tool_use', id: 'web-good', name: 'WebSearch', input: { query: 'fixture' } },
+      { type: 'tool_use', id: 'web-lost', name: 'WebFetch', input: { url: 'https://example.com/', prompt: 'fixture' } },
+      { type: 'tool_use', id: 'third-read', name: 'mcp__dsh__read_file', input: { path: 'fixture.txt' } },
+    ] } })
+    assert.deepEqual(await backend.dispatchApproval({ runId: 'test-run', toolUseId: 'web-good',
+      toolName: 'WebSearch', input: { query: 'fixture' } }, { signal }), { behavior: 'allow' })
+    const result = { runId: 'test-run', callId: 'web-good', name: 'WebSearch', text: '合成结果', isError: false }
+    await assert.rejects(backend.dispatchNativeWebResult({ ...result, name: 'WebFetch' }, { signal }), { code: 'UNADMITTED_TOOL' })
+    assert.deepEqual(await backend.dispatchNativeWebResult(result, { signal }), { recorded: true })
+    assert.deepEqual(await backend.dispatchNativeWebResult(result, { signal }), { recorded: true })
+    await assert.rejects(backend.dispatchNativeWebResult({ ...result, text: '不同的结果' }, { signal }), { code: 'LATE_TOOL_RESULT' })
+    // The next response arrives without a confirmed batch, as in the missing
+    // third tool failure. Do not close the step until every call is paired.
+    await assert.rejects(run.projection.accept({ type: 'stream_event', event: { type: 'message_start',
+      message: { id: 'model-2' } } }), { code: 'TOOL_RESULT_MISSING' })
+    assert.equal(backend.settleUnconfirmedStepTools(run), false)
+    session.append('step/end', { turn: 1, step: 1 })
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    const { events } = await strictSession(session)
+    const results = events.filter(e => e.type === 'tool/result')
+    assert.deepEqual(results.map(e => e.data.message.toolCallId), ['web-good', 'web-lost', 'third-read'])
+    assert.deepEqual(results.map(e => e.data.message.isError), [false, true, true])
+    assert.equal(results[1].data.meta?.claudeBridgeOutcome, 'unknown')
+    assert.match(results[2].data.message.content[0].text, /未派发/)
+    const { localHistory } = await import('../src/history-sync.mjs')
+    const local = localHistory(session)
+    const lostCall = local.calls.get('web-lost')
+    const cloudResults = new Map([['web-lost', { isError: false, content: [{ type: 'text', text: '远端留存结果' }] }]])
+    assert.equal(backend.recoverNativeWebResults(session, local, cloudResults, new Map()), 1)
+    const cloudCalls = new Map([['web-lost', { name: lostCall.data.name, arguments: lostCall.data.arguments }]])
+    assert.equal(backend.recoverNativeWebResults(session, local, cloudResults, cloudCalls), 0)
+    assert.equal(backend.recoverNativeWebResults(session, local, cloudResults, cloudCalls), 0)
+    assert.equal(local.results.get('web-lost').data.message.content[0].text, '远端留存结果')
+    await strictSession(session)
+  })

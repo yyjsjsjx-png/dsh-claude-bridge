@@ -6,7 +6,7 @@ export function createSettingsController({ rpc, createStore, textError, createMo
     diagnosticsPath: '', observabilityWarning: null, activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
-    promptCacheTtl: 'default', promptCacheTtlSupported: null, contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
+    promptCacheTtl: 'default', promptCacheTtlSupported: null, webToolProvider: 'claude', nativeWebToolsSupported: null, contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
   const updateSettings = patch => store.set({ ...store.getSnapshot(), ...patch });
   let disposed = false;
   let statusRequest;
@@ -40,10 +40,12 @@ export function createSettingsController({ rpc, createStore, textError, createMo
           usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '',
           observabilityWarning: status.observabilityWarning ?? null, statusError: '',
           promptCacheTtlSupported: status.promptCacheTtlSupported ?? null,
+          nativeWebToolsSupported: status.nativeWebToolsSupported ?? null,
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
             contextWindow: String(status.contextPreferences?.autoCompactWindowTokens ?? 200000),
-            promptCacheTtl: status.contextPreferences?.promptCacheTtl ?? 'default', contextDirty: false } : {}) });
+            promptCacheTtl: status.contextPreferences?.promptCacheTtl ?? 'default',
+            webToolProvider: status.contextPreferences?.webToolProvider ?? 'claude', contextDirty: false } : {}) });
       } catch (error) {
         if (!disposed && generation === statusGeneration) updateSettings({ statusError: textError(error) });
       }
@@ -104,6 +106,10 @@ export function createSettingsController({ rpc, createStore, textError, createMo
     editContext({ promptCacheTtl: value });
   }
 
+  function editWebToolProvider(value) {
+    editContext({ webToolProvider: value });
+  }
+
   async function saveContextPreferences() {
     const state = store.getSnapshot();
     if (state.busy) return;
@@ -114,7 +120,8 @@ export function createSettingsController({ rpc, createStore, textError, createMo
     updateSettings({ busy: true, contextError: '', contextMessage: '' });
     try {
       const response = await rpc.saveContextPreferences({ autoCompactWindowTokens: tokens,
-        ...(state.promptCacheTtl === 'default' ? {} : { promptCacheTtl: state.promptCacheTtl }) });
+        ...(state.promptCacheTtl === 'default' ? {} : { promptCacheTtl: state.promptCacheTtl }),
+        ...(state.webToolProvider === 'dsh' ? { webToolProvider: 'dsh' } : {}) });
       if (!response.ok) throw new Error(response.error.message);
       contextEdited = false;
       updateSettings({ contextMode: tokens === null ? 'default' : 'custom', contextWindow: String(tokens ?? 200000), contextDirty: false });
@@ -133,5 +140,5 @@ export function createSettingsController({ rpc, createStore, textError, createMo
   }
 
   return { store, readStatus, saveConnection, clearConnection, editUrl, editContextMode, editContextWindow, editPromptCacheTtl,
-    saveContextPreferences, authenticationRequired, models, dispose };
+    editWebToolProvider, saveContextPreferences, authenticationRequired, models, dispose };
 }

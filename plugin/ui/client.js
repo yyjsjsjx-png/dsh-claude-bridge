@@ -26,7 +26,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
     diagnosticsPath: '', observabilityWarning: null, activeRuns: 0, busy: false, error: '', statusError: '', message: '',
     models: [], selectedModelIds: [], modelsLoaded: false, modelsLoading: false, modelCatalog: null,
     modelError: '', usingModelDefaults: true, contextMode: 'default', contextWindow: '200000',
-    promptCacheTtl: 'default', promptCacheTtlSupported: null, contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
+    promptCacheTtl: 'default', promptCacheTtlSupported: null, webToolProvider: 'claude', nativeWebToolsSupported: null, contextDirty: false, contextError: '', contextMessage: '', autoCompactWindowSupported: null });
   const updateSettings = patch => store.set({ ...store.getSnapshot(), ...patch });
   let disposed = false;
   let statusRequest;
@@ -60,10 +60,12 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
           usageSummary: status.usageSummary ?? null, diagnosticsPath: status.diagnosticsPath ?? '',
           observabilityWarning: status.observabilityWarning ?? null, statusError: '',
           promptCacheTtlSupported: status.promptCacheTtlSupported ?? null,
+          nativeWebToolsSupported: status.nativeWebToolsSupported ?? null,
           autoCompactWindowSupported: status.autoCompactWindowSupported ?? null,
           ...(!contextEdited && contextGeneration === contextRevision ? { contextMode: status.contextPreferences?.autoCompactWindowTokens == null ? 'default' : 'custom',
             contextWindow: String(status.contextPreferences?.autoCompactWindowTokens ?? 200000),
-            promptCacheTtl: status.contextPreferences?.promptCacheTtl ?? 'default', contextDirty: false } : {}) });
+            promptCacheTtl: status.contextPreferences?.promptCacheTtl ?? 'default',
+            webToolProvider: status.contextPreferences?.webToolProvider ?? 'claude', contextDirty: false } : {}) });
       } catch (error) {
         if (!disposed && generation === statusGeneration) updateSettings({ statusError: textError(error) });
       }
@@ -124,6 +126,10 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
     editContext({ promptCacheTtl: value });
   }
 
+  function editWebToolProvider(value) {
+    editContext({ webToolProvider: value });
+  }
+
   async function saveContextPreferences() {
     const state = store.getSnapshot();
     if (state.busy) return;
@@ -134,7 +140,8 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
     updateSettings({ busy: true, contextError: '', contextMessage: '' });
     try {
       const response = await rpc.saveContextPreferences({ autoCompactWindowTokens: tokens,
-        ...(state.promptCacheTtl === 'default' ? {} : { promptCacheTtl: state.promptCacheTtl }) });
+        ...(state.promptCacheTtl === 'default' ? {} : { promptCacheTtl: state.promptCacheTtl }),
+        ...(state.webToolProvider === 'dsh' ? { webToolProvider: 'dsh' } : {}) });
       if (!response.ok) throw new Error(response.error.message);
       contextEdited = false;
       updateSettings({ contextMode: tokens === null ? 'default' : 'custom', contextWindow: String(tokens ?? 200000), contextDirty: false });
@@ -153,7 +160,7 @@ function createSettingsController({ rpc, createStore, textError, createModelCont
   }
 
   return { store, readStatus, saveConnection, clearConnection, editUrl, editContextMode, editContextWindow, editPromptCacheTtl,
-    saveContextPreferences, authenticationRequired, models, dispose };
+    editWebToolProvider, saveContextPreferences, authenticationRequired, models, dispose };
 }
 
 function createModelController({ rpc, store, updateSettings, textError,
@@ -933,7 +940,7 @@ const SETTINGS_CSS = `
   }
 
   function Settings({ useSettings, editUrl, save, clear, refresh, refreshStatus, loadModels, toggleVisibleModel, saveModels,
-    editContextMode, editContextWindow, editPromptCacheTtl, saveContext }) {
+    editContextMode, editContextWindow, editPromptCacheTtl, editWebToolProvider, saveContext }) {
     const state = useSettings(value => value);
     const [token, setToken] = React.useState('');
     React.useEffect(() => { if (state.configured) void loadModels(); }, [state.configured, loadModels]);
@@ -1057,7 +1064,7 @@ const SETTINGS_CSS = `
           && h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', disabled: state.busy,
             onClick: () => { void loadModels(); } }, '读取模型列表'))),
       h('div', { className: 'dcb-card' },
-        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '上下文与缓存'),
+        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '远程会话偏好'),
           h('span', { className: 'dcb-card-meta' }, '本设备全部远程会话')),
         h('p', { className: 'dcb-card-desc' }, '设置各模型共用的自动压缩窗口，由服务器上的 Claude 原生压缩。保存后从下一轮起生效，当前运行继续使用原设置。'),
         h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '自动压缩方式'),
@@ -1078,11 +1085,19 @@ const SETTINGS_CSS = `
           h('span', { className: 'dcb-hint' }, '从本设备下一轮远程会话及子代理运行起生效。实际缓存写入有效期以服务端返回为准。')),
         state.promptCacheTtlSupported !== true && h('p', { className: 'dcb-hint' },
           state.promptCacheTtlSupported === false ? '当前服务器不支持指定缓存有效期。' : '连接服务器后可检查缓存有效期支持。'),
+        h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '网页搜索与抓取'),
+          h('select', { className: 'dcb-input', value: state.webToolProvider, disabled: state.busy,
+            onChange: event => editWebToolProvider(event.target.value) },
+          h('option', { value: 'claude' }, 'Claude Code 原生工具（默认）'),
+          h('option', { value: 'dsh' }, 'DSH 网页工具')),
+          h('span', { className: 'dcb-hint' }, '保存后从下一次远程请求起生效。')),
+        state.webToolProvider === 'claude' && state.nativeWebToolsSupported === false && h('p', { className: 'dcb-notice' },
+          '当前服务器尚未支持原生网页工具，远程会话使用 DSH 网页工具。'),
         state.autoCompactWindowSupported === false && h('p', { className: 'dcb-notice' }, '当前服务器需要更新后才能使用自定义窗口；跟随模型默认仍可用。'),
         h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', 'data-variant': 'primary',
           disabled: state.busy || !state.contextDirty || (state.contextMode === 'custom' && state.autoCompactWindowSupported === false)
             || (state.promptCacheTtl !== 'default' && state.promptCacheTtlSupported !== true),
-          onClick: () => { void saveContext(); } }, '保存上下文设置')),
+          onClick: () => { void saveContext(); } }, '保存远程会话偏好')),
         state.contextMessage && h('p', { role: 'status', className: 'dcb-notice' }, state.contextMessage),
         state.contextError && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.contextError)),
       h('div', { className: 'dcb-card' },
@@ -1635,7 +1650,7 @@ exports.apply = async function apply(ctx) {
     descriptor('saveContextPreferences', [{ name: 'value', wire: 'value', source: 'json', codec: {
       mode: 'strict', typeSymbol: 'dsh-claude-bridge-ui#ContextPreferences',
       create: () => z.object({ autoCompactWindowTokens: z.number().int().min(100000).max(1000000).nullable(),
-        promptCacheTtl: z.enum(['5m', '1h']).optional() }),
+        promptCacheTtl: z.enum(['5m', '1h']).optional(), webToolProvider: z.enum(['claude', 'dsh']).optional() }),
     } }]),
   ] });
   // This namespace is created by the mount above, so declaring it in the
@@ -1716,7 +1731,8 @@ exports.apply = async function apply(ctx) {
       refresh: settings.models.refreshCatalog, refreshStatus: settings.readStatus,
       loadModels: settings.models.loadModelPreferences, toggleVisibleModel: settings.models.toggleModel,
       saveModels: settings.models.saveModelPreferences, editContextMode: settings.editContextMode,
-      editContextWindow: settings.editContextWindow, editPromptCacheTtl: settings.editPromptCacheTtl, saveContext: settings.saveContextPreferences }),
+      editContextWindow: settings.editContextWindow, editPromptCacheTtl: settings.editPromptCacheTtl,
+      editWebToolProvider: settings.editWebToolProvider, saveContext: settings.saveContextPreferences }),
   }, Settings));
   void settings.readStatus();
   ctx.effect(() => () => { settings.dispose(); quota.dispose(); picker.dispose(); }, '远程会话界面状态');

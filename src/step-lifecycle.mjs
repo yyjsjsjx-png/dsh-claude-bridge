@@ -30,12 +30,13 @@ export class RunStepLifecycle {
     this.#agent._bridgeStepOpen = true
   }
 
-  async modelStart({ signal, tools }) {
+  async modelStart({ signal, tools, beforeClose }) {
     if (signal.aborted) return
     if (!this.#modelStarted) { this.#modelStarted = true; return this.#step }
     if (this.#prepared) { this.#prepared = false; return this.#step }
     await tools
     if (signal.aborted) return
+    beforeClose?.()
     this.#closeCurrent()
     this.#openNext(this.#phase)
     return this.#step
