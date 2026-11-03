@@ -4,7 +4,8 @@ param(
     [string]$DshHome,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$')]
     [string]$Profile = 'desktop',
-    [string]$PackageDirectory
+    [string]$PackageDirectory,
+    [switch]$Online
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +39,7 @@ $null = New-Item -ItemType Directory -Path $BridgeLogDirectory -Force
 $BridgeLogPrefix = Join-Path $BridgeLogDirectory ('bridge-updater-' + [Guid]::NewGuid().ToString('N'))
 $BridgeArguments = @('--expose-internals', $BridgeUpdater, '--resources', $BridgeResources,
     '--home', $BridgeHome, '--profile', $Profile, '--package', $BridgePackage)
+if ($Online) { $BridgeArguments += @('--online', 'true') }
 # All values are filesystem paths or validated profile identifiers. Windows filenames cannot contain quotes.
 $BridgeCommandLine = ($BridgeArguments | ForEach-Object { '"' + [regex]::Replace($_, '(\\+)$', '$1$1') + '"' }) -join ' '
 $BridgePreviousElectron = $env:ELECTRON_RUN_AS_NODE

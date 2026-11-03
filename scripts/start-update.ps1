@@ -5,7 +5,8 @@ param(
     [string]$Profile = 'desktop',
     [string]$PackageDirectory,
     [switch]$Elevated,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$Online
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +33,7 @@ try {
         PackageDirectory = (Resolve-Path -LiteralPath $PackageDirectory).Path
     }
     try {
+        if ($Online) { $BridgeResolved.Online = $true }
         & (Join-Path $PSScriptRoot 'update-plugin.ps1') @BridgeResolved
         $BridgeExitCode = 0
     }
@@ -44,6 +46,7 @@ try {
         $BridgeRelaunchArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
             '-DshExecutable', $BridgeResolved.DshExecutable, '-DshHome', $BridgeResolved.DshHome,
             '-Profile', $BridgeResolved.Profile, '-PackageDirectory', $BridgeResolved.PackageDirectory, '-Elevated')
+        if ($Online) { $BridgeRelaunchArguments += '-Online' }
         # Windows filesystem paths cannot contain quotes. Escape trailing
         # backslashes so quoted root directories remain a single argument.
         $BridgeRelaunchCommand = ($BridgeRelaunchArguments | ForEach-Object { '"' + [regex]::Replace($_, '(\\+)$', '$1$1') + '"' }) -join ' '
