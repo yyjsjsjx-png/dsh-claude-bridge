@@ -4,6 +4,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { createRunObservations } from '../remote/run-observations.mjs'
 import { createObservabilityLedger } from '../remote/observability-ledger.mjs'
 
 const at = 1_800_000_000_000
@@ -130,4 +131,40 @@ test('short SQLite lock failure reports a gap and does not poison later writes',
   await ledger.flush()
   assert.deepEqual((await ledger.query(scope)).rows.map(row => row.runId), ['later'])
   lock.close(); lockClosed = true
+})
+
+
+test('response cache TTL details reach SQLite without changing the four buckets', async t => {
+  const { ledger } = await fixture(t)
+  const capture = createRunObservations({
+    params: { ...common, sessionId: common.sdkSessionId, runId: 'ttl-run' }, wall: () => at,
+    record(kind, row) { if (kind === 'response') assert.equal(ledger.recordResponse(row), true) },
+  })
+  const cases = [
+    [3, { ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 0 }, [3, 0]],
+    [3, { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 3 }, [0, 3]],
+    [3, { ephemeral_5m_input_tokens: 1, ephemeral_1h_input_tokens: 2 }, [1, 2]],
+    [0, undefined, []],
+    [3, undefined, []],
+    [3, { ephemeral_5m_input_tokens: 1, ephemeral_1h_input_tokens: 1 }, []],
+    [3, { ephemeral_1h_input_tokens: 3 }, []],
+  ]
+  const stream = event => capture.observe({ type: 'stream_event', event })
+  for (const [index, [total, detail]] of cases.entries()) {
+    stream({ type: 'message_start', message: { id: `ttl-${index}`, model: common.model, usage: {
+      input_tokens: 2, output_tokens: 0, cache_read_input_tokens: 100,
+      cache_creation_input_tokens: total, cache_creation: detail,
+    } } })
+    stream({ type: 'message_delta', usage: { output_tokens: 10 } })
+    stream({ type: 'message_stop' })
+  }
+  capture.finish({ status: 'completed' })
+  assert.equal((await ledger.flush()).status, 'ok')
+  const { rows } = await ledger.query({ ...scope, kind: 'responses' })
+  assert.equal(rows.length, cases.length)
+  for (const [index, [total, , detail]] of cases.entries()) {
+    const expected = { ...tokens('response-main-agent'), cacheWriteTokens: total }
+    if (detail.length) [expected.cacheWrite5mTokens, expected.cacheWrite1hTokens] = detail
+    assert.deepEqual(rows.find(row => row.responseId === `ttl-${index}`).usage, expected)
+  }
 })
