@@ -8,9 +8,9 @@ export function validatePromptCacheTtl(value) {
 }
 
 /** Validate device-wide defaults for native SDK context behavior. */
-export function validateContextPreferences(value = { autoCompactWindowTokens: null }, { allowCacheTtl = false } = {}) {
+export function validateContextPreferences(value = { autoCompactWindowTokens: null }, { allowCacheTtl = false, allowWebToolProvider = false } = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some(key => key !== 'autoCompactWindowTokens' && !(allowCacheTtl && key === 'promptCacheTtl'))
+    || Object.keys(value).some(key => key !== 'autoCompactWindowTokens' && !(allowCacheTtl && key === 'promptCacheTtl') && !(allowWebToolProvider && key === 'webToolProvider'))
     || !Object.hasOwn(value, 'autoCompactWindowTokens')
     || (value.autoCompactWindowTokens !== null && (!Number.isSafeInteger(value.autoCompactWindowTokens)
       || value.autoCompactWindowTokens < 100_000 || value.autoCompactWindowTokens > 1_000_000))) {
@@ -18,6 +18,11 @@ export function validateContextPreferences(value = { autoCompactWindowTokens: nu
       { code: 'INVALID_CONTEXT_PREFERENCES' })
   }
   const promptCacheTtl = validatePromptCacheTtl(value.promptCacheTtl)
+  const { webToolProvider } = value
+  if (webToolProvider !== undefined && webToolProvider !== 'claude' && webToolProvider !== 'dsh') {
+    throw Object.assign(new Error('网页工具须选择 Claude Code 或本机 DSH。'), { code: 'INVALID_WEB_TOOL_PROVIDER' })
+  }
   return { autoCompactWindowTokens: value.autoCompactWindowTokens,
+    ...(webToolProvider === undefined ? {} : { webToolProvider }),
     ...(promptCacheTtl === undefined ? {} : { promptCacheTtl }) }
 }

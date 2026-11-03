@@ -1676,3 +1676,25 @@ test('纯流通知不重复 flush，新持久记录仍等待落盘，缺少序�
   await assert.rejects(f.backend.notification('sdk.message', { runId, message: { type: 'assistant', durable: true } }),
     { code: 'DURABILITY_UNAVAILABLE' })
 })
+
+test('插件从下一轮应用网页工具设置，默认原生且旧服务端保留本机网页工具', async t => {
+  for (const [supported, provider, native] of [[true, undefined, true], [true, 'dsh', false], [false, undefined, false]]) {
+    const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+        capabilities: supported ? { nativeWebTools: true } : {} }
+      assert.equal(method, 'query')
+      assert.equal(Object.hasOwn(params, 'nativeWebTools'), native)
+      assert.equal(params.tools.some(tool => tool.name === 'web_search'), !native)
+      assert.equal(params.tools.some(tool => tool.name === 'web_fetch'), !native)
+      assert.ok(params.tools.some(tool => tool.name === 'local_command'))
+      return { status: 'completed' }
+    } }, async close() {} }))
+    f.backend.settings = async () => ({ read: async () => ({}) })
+    if (provider) await f.backend.saveContextPreferences({ autoCompactWindowTokens: null, webToolProvider: provider })
+    for (const name of ['web_search', 'web_fetch']) f.decision.assembly.tools.push({
+      name, description: '本机网页工具', parameters: { type: 'object', additionalProperties: false, properties: {} },
+    })
+    await f.backend.runStep(f.agent, f.decision)
+    assert.equal((await f.backend.status()).nativeWebToolsSupported, supported)
+  }
+})

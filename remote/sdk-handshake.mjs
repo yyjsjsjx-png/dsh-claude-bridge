@@ -39,12 +39,12 @@ export async function verifyHooksApplied(query, controller) {
   }
 }
 
-/** Require the SDK init message to list exactly the expected qualified DSH tools. */
+/** Require the SDK init message to list exactly the tools admitted for this query. */
 export function verifyToolset(message, sessionId, expectedNames) {
   if (message?.type !== 'system' || message.subtype !== 'init' || message.session_id !== sessionId
     || !Array.isArray(message.tools) || message.tools.some((name) => typeof name !== 'string')
     || new Set(message.tools).size !== message.tools.length
     || message.tools.length !== expectedNames.size || message.tools.some((name) => !expectedNames.has(name))) {
-    throw new WorkerError('SDK_TOOLSET_MISMATCH', '远程 SDK 工具清单与本机 DSH 工具不一致')
+    throw new WorkerError('SDK_TOOLSET_MISMATCH', '远程 SDK 工具清单与本次准入的工具不一致')
   }
 }

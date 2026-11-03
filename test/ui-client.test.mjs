@@ -68,6 +68,7 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   let modelIds = ['haiku'];
   let contextPreferences = { autoCompactWindowTokens: null };
   let contextSaves = 0;
+  let nativeWebToolsSupported = false;
   let bridgeCompatibility = { status: 'compatible', clientVersion: '0.2.3-rc.1',
     serverVersion: '9.0.0', minimumClientVersion: '0.2.0', message: '客户端符合服务端版本要求。' };
   let host = { version: '0.2.1-rc.5', baselineVersion: '0.2.1-rc.5', status: 'compatible' };
@@ -76,7 +77,7 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
     remote: { $mount: async () => async () => {}, session: {}, claudeBridge: {
       status: async () => ({ ok: true, value: { configured, url: 'wss://example.test/',
         connected: false, authentication: 'unknown', diagnosticsPath: 'local-diagnostics',
-        contextPreferences, autoCompactWindowSupported: true, bridgeCompatibility, host,
+        contextPreferences, autoCompactWindowSupported: true, nativeWebToolsSupported, bridgeCompatibility, host,
         disabledFeatures: [{ name: '规划模式', status: 'disabled', reason: '测试原因' }],
         remotePreset: { mode: 'basic', reasons: ['标准预设无法适配'], disabledComponents: [] },
         remoteCapabilities: { status: 'unavailable', shell: 'pwsh', reason: '基础执行失败' },
@@ -172,6 +173,23 @@ test('设置页保存凭据后只显示状态，测试连接才读取模型目�
   assert.match(settings.hooks.settings.getSnapshot().contextError, /100,000/);
   settings.editContextMode('default'); await settings.saveContext();
   assert.equal(contextPreferences.autoCompactWindowTokens, null);
+  const webProviderSelect = () => nodesOf(render()).find(node => node.type === 'select'
+    && nodesOf(node.children).some(option => option.type === 'option' && option.props.value === 'claude'));
+  assert.equal(webProviderSelect().props.value, 'claude');
+  assert.match(textOf(render()), /远程会话使用 DSH 网页工具/);
+  webProviderSelect().props.onChange({ target: { value: 'dsh' } });
+  await settings.refreshStatus();
+  assert.equal(webProviderSelect().props.value, 'dsh');
+  await settings.saveContext();
+  assert.equal(contextPreferences.webToolProvider, 'dsh');
+  nativeWebToolsSupported = true;
+  await settings.refreshStatus();
+  assert.equal(webProviderSelect().props.value, 'dsh');
+  webProviderSelect().props.onChange({ target: { value: 'claude' } });
+  await settings.saveContext();
+  assert.equal(contextPreferences.webToolProvider, undefined);
+  assert.equal(webProviderSelect().props.value, 'claude');
+  assert.doesNotMatch(textOf(render()), /远程会话使用 DSH 网页工具/);
   await settings.refresh();
   assert.equal(catalogCalls, 1);
   assert.equal(settings.hooks.settings.getSnapshot().models.length, 2);

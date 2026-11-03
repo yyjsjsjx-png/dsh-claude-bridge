@@ -24,7 +24,7 @@ export function buildSdkOptions({ params, compact, cwd, cliPath, childEnv, conte
     settingSources: [],
     strictMcpConfig: true,
     verbatimPrompts: !compact,
-    tools: [],
+    tools: [...(tools.nativeNames ?? [])],
     allowedTools: definitions.map(({ name }) => `mcp__dsh__${name}`),
     permissionMode: 'default',
     mcpServers: { dsh: server },
@@ -161,7 +161,7 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
     }
     if (message?.type === 'result') message = combineTurnResults(turnResults, message)
     if (message?.type === 'system' && message.subtype === 'init') {
-      verifyToolset(message, sessionId, tools.qualifiedNames)
+      verifyToolset(message, sessionId, new Set([...tools.qualifiedNames, ...(tools.nativeNames ?? [])]))
       toolsetVerified = true
       diagnose('sdk', 'toolset-verified')
       timing('toolset_verified')

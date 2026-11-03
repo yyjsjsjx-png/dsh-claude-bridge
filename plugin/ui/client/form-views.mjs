@@ -127,7 +127,7 @@ const SETTINGS_CSS = `
   }
 
   function Settings({ useSettings, editUrl, save, clear, refresh, refreshStatus, loadModels, toggleVisibleModel, saveModels,
-    editContextMode, editContextWindow, editPromptCacheTtl, saveContext }) {
+    editContextMode, editContextWindow, editPromptCacheTtl, editWebToolProvider, saveContext }) {
     const state = useSettings(value => value);
     const [token, setToken] = React.useState('');
     React.useEffect(() => { if (state.configured) void loadModels(); }, [state.configured, loadModels]);
@@ -251,7 +251,7 @@ const SETTINGS_CSS = `
           && h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', disabled: state.busy,
             onClick: () => { void loadModels(); } }, '读取模型列表'))),
       h('div', { className: 'dcb-card' },
-        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '上下文与缓存'),
+        h('div', { className: 'dcb-card-head' }, h('h3', { className: 'dcb-card-title' }, '远程会话偏好'),
           h('span', { className: 'dcb-card-meta' }, '本设备全部远程会话')),
         h('p', { className: 'dcb-card-desc' }, '设置各模型共用的自动压缩窗口，由服务器上的 Claude 原生压缩。保存后从下一轮起生效，当前运行继续使用原设置。'),
         h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '自动压缩方式'),
@@ -272,11 +272,19 @@ const SETTINGS_CSS = `
           h('span', { className: 'dcb-hint' }, '从本设备下一轮远程会话及子代理运行起生效。实际缓存写入有效期以服务端返回为准。')),
         state.promptCacheTtlSupported !== true && h('p', { className: 'dcb-hint' },
           state.promptCacheTtlSupported === false ? '当前服务器不支持指定缓存有效期。' : '连接服务器后可检查缓存有效期支持。'),
+        h('label', { className: 'dcb-field' }, h('span', { className: 'dcb-label' }, '网页搜索与抓取'),
+          h('select', { className: 'dcb-input', value: state.webToolProvider, disabled: state.busy,
+            onChange: event => editWebToolProvider(event.target.value) },
+          h('option', { value: 'claude' }, 'Claude Code 原生工具（默认）'),
+          h('option', { value: 'dsh' }, 'DSH 网页工具')),
+          h('span', { className: 'dcb-hint' }, '保存后从下一次远程请求起生效。')),
+        state.webToolProvider === 'claude' && state.nativeWebToolsSupported === false && h('p', { className: 'dcb-notice' },
+          '当前服务器尚未支持原生网页工具，远程会话使用 DSH 网页工具。'),
         state.autoCompactWindowSupported === false && h('p', { className: 'dcb-notice' }, '当前服务器需要更新后才能使用自定义窗口；跟随模型默认仍可用。'),
         h('div', { className: 'dcb-actions' }, h('button', { type: 'button', className: 'dcb-btn', 'data-variant': 'primary',
           disabled: state.busy || !state.contextDirty || (state.contextMode === 'custom' && state.autoCompactWindowSupported === false)
             || (state.promptCacheTtl !== 'default' && state.promptCacheTtlSupported !== true),
-          onClick: () => { void saveContext(); } }, '保存上下文设置')),
+          onClick: () => { void saveContext(); } }, '保存远程会话偏好')),
         state.contextMessage && h('p', { role: 'status', className: 'dcb-notice' }, state.contextMessage),
         state.contextError && h('p', { role: 'alert', className: 'dcb-notice', 'data-tone': 'error' }, state.contextError)),
       h('div', { className: 'dcb-card' },

@@ -1,3 +1,4 @@
+import { isNativeWebTool } from '../src/native-web.mjs'
 import { open, readFile, rename, unlink } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -144,8 +145,8 @@ export function createHistoryReader({ sdk, sessionRoot, authorizedDeviceId, acqu
             if (block.type === 'text' && typeof block.text === 'string') content.push({ type: 'text', text: block.text })
             else if (block.type === 'thinking' && typeof block.thinking === 'string') content.push({ type: 'reasoning', text: block.thinking })
             else if (block.type === 'tool_use' && typeof block.id === 'string' && ID.test(block.id)
-              && typeof block.name === 'string' && block.name.startsWith('mcp__dsh__')) {
-              content.push({ type: 'tool-call', id: block.id, name: block.name.slice(10), arguments: JSON.stringify(block.input ?? {}) })
+              && typeof block.name === 'string' && (block.name.startsWith('mcp__dsh__') || isNativeWebTool(block.name))) {
+              content.push({ type: 'tool-call', id: block.id, name: isNativeWebTool(block.name) ? block.name : block.name.slice(10), arguments: JSON.stringify(block.input ?? {}) })
             } else if (block.type !== 'redacted_thinking') throw problem('HISTORY_CONTENT_UNSUPPORTED', '云端存在暂不能同步的消息内容')
           }
           if (content.length) records.push({ type: 'assistant', uuid: item.uuid,
