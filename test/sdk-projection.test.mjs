@@ -926,7 +926,28 @@ test('实际 rc5：网页结果去重，断线和缺失的第三个本机调用�
       nativeApprovals: new Map(), nativeResultHashes: new Map(), callEvents: new Map(), settledToolIds: new Set() }
     const helpers = { ...runtime, appendPluginRecord: native.appendPluginRecord }
     const backend = Object.assign(Object.create(BridgeBackend.prototype), { helpers, runs: new Map([['test-run', run]]),
-      ctx: { approval: { request: async () => 'allowed-once' }, sessions: { flush: async () => true } } })
+      ctx: {
+        approval: { request() { assert.fail('Bridge 不应直接请求审批') } },
+        agents: { withInitiator(actual, action) { assert.equal(actual, agent); return action() } },
+        tools: {
+          get(name, actual) {
+            assert.equal(actual, agent)
+            return ['web_search', 'web_fetch'].includes(name)
+          },
+          async prepareScheduledExecution(input) {
+            assert.equal(input.agent, agent)
+            assert.equal(input.signal.aborted, false)
+            if (input.name === 'web_search') {
+              assert.deepEqual(input.arguments, { queries: ['fixture'] })
+              return { kind: 'dispatch' }
+            }
+            assert.equal(input.name, 'web_fetch')
+            assert.deepEqual(input.arguments, { url: 'https://example.com/' })
+            return { kind: 'post-result' }
+          },
+        },
+        sessions: { flush: async () => true },
+      } })
     run.projection = new SdkProjection({ agent, helpers, turn: 1, step: 1, model: 'fixture',
       onModelStart: () => steps.modelStart({ signal, tools: Promise.resolve(), beforeClose: () => backend.requireSettledStepTools(run) }) })
     await run.projection.accept({ type: 'assistant', message: { id: 'model-1', content: [
@@ -936,6 +957,8 @@ test('实际 rc5：网页结果去重，断线和缺失的第三个本机调用�
     ] } })
     assert.deepEqual(await backend.dispatchApproval({ runId: 'test-run', toolUseId: 'web-good',
       toolName: 'WebSearch', input: { query: 'fixture' } }, { signal }), { behavior: 'allow' })
+    assert.equal((await backend.dispatchApproval({ runId: 'test-run', toolUseId: 'web-lost',
+      toolName: 'WebFetch', input: { url: 'https://example.com/', prompt: 'fixture' } }, { signal })).behavior, 'deny')
     const result = { runId: 'test-run', callId: 'web-good', name: 'WebSearch', text: '合成结果', isError: false }
     await assert.rejects(backend.dispatchNativeWebResult({ ...result, name: 'WebFetch' }, { signal }), { code: 'UNADMITTED_TOOL' })
     assert.deepEqual(await backend.dispatchNativeWebResult(result, { signal }), { recorded: true })
