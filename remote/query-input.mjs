@@ -52,6 +52,11 @@ export function validateRunLimits(params, serviceBudgetUsd) {
   }
 }
 
+function isBase64ImageSource(source) {
+  return source.type === 'base64' && MIME_TYPES.has(source.media_type) && typeof source.data === 'string'
+    && source.data.length > 0 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(source.data)
+}
+
 /** Validate a text prompt or a list of text / base64 image blocks. */
 export function validateInputBlocks(prompt) {
   if (typeof prompt === 'string') {
@@ -71,8 +76,7 @@ export function validateInputBlocks(prompt) {
     }
     if (block.type === 'image') {
       const source = requireObject(block.source, '图片来源')
-      if (source.type !== 'base64' || !MIME_TYPES.has(source.media_type) || typeof source.data !== 'string'
-        || source.data.length === 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(source.data)) {
+      if (!isBase64ImageSource(source)) {
         throw new WorkerError('INVALID_PROMPT', '仅支持有效的 base64 图片')
       }
       return { type: 'image', source: { type: 'base64', media_type: source.media_type, data: source.data } }
@@ -229,6 +233,18 @@ export function asMcpResult(response) {
   }
 }
 
+function isValidStepUserBlock(block) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return false
+  if (block.type === 'text') {
+    return typeof block.text === 'string' && Object.keys(block).every(key => key === 'type' || key === 'text')
+  }
+  const { source } = block
+  return block.type === 'image' && Object.keys(block).every(key => key === 'type' || key === 'source')
+    && source && typeof source === 'object' && !Array.isArray(source)
+    && Object.keys(source).every(key => ['type', 'media_type', 'data'].includes(key))
+    && isBase64ImageSource(source)
+}
+
 /**
  * Whether a `step.prepare` reply is well formed and does not combine a stop
  * with additional context or user input.
@@ -246,10 +262,8 @@ export function isValidStepPreparation(response) {
         && Object.keys(item).every(key => key === 'id' || key === 'content')
         && typeof item.id === 'string' && SESSION_ID.test(item.id)
         && Array.isArray(item.content) && item.content.length > 0 && item.content.length <= 64
-        && item.content.every(block => block && typeof block === 'object' && !Array.isArray(block)
-          && Object.keys(block).every(key => key === 'type' || key === 'text')
-          && block.type === 'text' && typeof block.text === 'string')
-        && item.content.some(block => block.text.trim()))
+        && item.content.every(isValidStepUserBlock)
+        && item.content.some(block => block.type === 'image' || block.text.trim()))
       && Buffer.byteLength(JSON.stringify(response.userMessages), 'utf8') <= MAX_PROMPT_BYTES))
   return Boolean(valid) && !(response.continue === false && (response.additionalContexts?.length || response.userMessages?.length))
 }
