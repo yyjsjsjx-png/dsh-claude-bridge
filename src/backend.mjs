@@ -184,27 +184,32 @@ export class BridgeBackend {
       authentication: this.authentication ?? 'unknown', usageSummary: this.usageSummary(),
       modelCatalog: this.displayCatalogState.status ?? { status: 'idle' },
       contextPreferences: this.contextPreferences(),
+      promptCacheTtlSupported: this.initialized ? this.initialized.capabilities?.promptCacheTtl === true : null,
       autoCompactWindowSupported: this.initialized ? this.initialized.capabilities?.autoCompactWindow === true : null }
   }
 
   contextPreferences() {
-    return validateContextPreferences(this.state.value.contextPreferences)
+    return validateContextPreferences(this.state.value.contextPreferences, { allowCacheTtl: true })
   }
 
   async saveContextPreferences(value) {
-    const preferences = validateContextPreferences(value)
+    const preferences = validateContextPreferences(value, { allowCacheTtl: true })
     await this.state.ready
     await this.state.update(state => { state.contextPreferences = preferences })
     return preferences
   }
 
   contextRequestPreferences() {
-    const preferences = this.contextPreferences()
-    if (preferences.autoCompactWindowTokens === null) return {}
-    if (this.initialized?.capabilities?.autoCompactWindow !== true) {
+    const { autoCompactWindowTokens, promptCacheTtl } = this.contextPreferences()
+    const capabilities = this.initialized?.capabilities
+    if (autoCompactWindowTokens !== null && capabilities?.autoCompactWindow !== true) {
       throw failure('CONTEXT_SETTINGS_UNSUPPORTED', '当前服务器不支持自定义自动压缩窗口，请更新服务器或恢复跟随模型默认。')
     }
-    return { contextPreferences: preferences }
+    if (promptCacheTtl !== undefined && capabilities?.promptCacheTtl !== true) {
+      throw failure('PROMPT_CACHE_TTL_UNSUPPORTED', '当前服务器不支持自定义缓存有效期，请恢复跟随 Claude Code。')
+    }
+    return { ...(autoCompactWindowTokens === null ? {} : { contextPreferences: { autoCompactWindowTokens } }),
+      ...(promptCacheTtl === undefined ? {} : { promptCacheTtl }) }
   }
 
   usageSummary() {

@@ -115,6 +115,26 @@ test('上下文默认值仅本设备持久保存，下轮透传且旧服务器�
   assert.deepEqual(f.backend.contextRequestPreferences(), {})
 })
 
+test('缓存有效期由本设备保存，只有已协商的服务器才收到覆盖字段', async t => {
+  const requests = []
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true, capabilities: { promptCacheTtl: true } }
+    requests.push(params)
+    return { sessionId: params.sessionId, status: 'completed' }
+  } }, async close() {} }))
+  await f.backend.saveContextPreferences({ autoCompactWindowTokens: null, promptCacheTtl: '1h' })
+  const restored = new BridgeState(f.backend.directory)
+  await restored.ready
+  assert.equal(restored.value.contextPreferences.promptCacheTtl, '1h')
+  await f.backend.runStep(f.agent, f.decision)
+  assert.equal(requests[0].promptCacheTtl, '1h')
+  assert.equal(Object.hasOwn(requests[0], 'contextPreferences'), false)
+  f.backend.initialized.capabilities.promptCacheTtl = false
+  assert.throws(() => f.backend.contextRequestPreferences(), { code: 'PROMPT_CACHE_TTL_UNSUPPORTED' })
+  await f.backend.saveContextPreferences({ autoCompactWindowTokens: null })
+  assert.deepEqual(f.backend.contextRequestPreferences(), {})
+})
+
 test('清除连接关闭传输并保留设备和会话；活动任务、准备阶段和历史同步均拒绝清除', async t => {
   let closed = 0, cleared = 0, release
   const f = await fixture(t, async () => ({ peer: { async request() { return { protocolVersion: 1, authenticated: true } } },

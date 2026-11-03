@@ -1,4 +1,4 @@
-import { validateContextPreferences } from '../src/context-preferences.mjs'
+import { validateContextPreferences, validatePromptCacheTtl } from '../src/context-preferences.mjs'
 import { WorkerError, requireObject, requireString } from './worker-error.mjs'
 
 export const MAX_PROMPT_BYTES = 3 * 1024 * 1024
@@ -7,11 +7,11 @@ const MAX_TOOLS = 80
 export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
 const MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp'])
-const QUERY_KEYS = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences'])
+const QUERY_KEYS = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences', 'promptCacheTtl'])
 
 /**
  * Validate the request shape that must hold before a run is registered.
- * @returns {{ compact: boolean, contextPreferences: object, runId: string }}
+ * @returns {{ compact: boolean, contextPreferences: object, promptCacheTtl: string | undefined, runId: string }}
  */
 export function validateQueryEnvelope(params) {
   requireObject(params, '请求')
@@ -20,14 +20,17 @@ export function validateQueryEnvelope(params) {
   }
   if (params.action !== undefined && params.action !== 'compact') throw new WorkerError('UNSUPPORTED_ACTION', '不支持该会话操作')
   const compact = params.action === 'compact'
-  let contextPreferences
-  try { contextPreferences = validateContextPreferences(params.contextPreferences) }
+  let contextPreferences, promptCacheTtl
+  try {
+    contextPreferences = validateContextPreferences(params.contextPreferences)
+    promptCacheTtl = validatePromptCacheTtl(params.promptCacheTtl)
+  }
   catch (error) { throw new WorkerError(error.code, error.message) }
   if (compact && (params.resume !== true || ['prompt', 'systemPrompt', 'instructions', 'tools', 'maxTurns'].some(key => params[key] !== undefined))) {
     throw new WorkerError('INVALID_COMPACT_REQUEST', '主动压缩只能操作已有 SDK 会话，不接受自定义消息、工具或提示词')
   }
   const runId = requireString(params.runId, 'runId', 256)
-  return { compact, contextPreferences, runId }
+  return { compact, contextPreferences, promptCacheTtl, runId }
 }
 
 /** Validate the per-request budget against the optional service cap, then maxTurns. */
