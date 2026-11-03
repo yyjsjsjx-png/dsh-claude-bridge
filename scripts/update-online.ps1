@@ -92,8 +92,10 @@ try {
         if (-not ([IO.Path]::GetFullPath($BridgeMovePath)).StartsWith($BridgeRootPrefix,[StringComparison]::OrdinalIgnoreCase)) { throw '更新目录校验失败。' }
     }
     Move-Item -LiteralPath $BridgePackage -Destination $BridgeFinal
-    $BridgeParameters = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $BridgeFinal 'scripts\start-update.ps1'),
+    $BridgeStartUpdate = Join-Path $BridgeFinal 'scripts\start-update.ps1'
+    $BridgeParameters = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$BridgeStartUpdate,
         '-DshHome',$DshHome,'-Profile',$Profile,'-PackageDirectory',$BridgeFinal,'-NoPause')
+    if ((Get-Command -Name $BridgeStartUpdate).Parameters.ContainsKey('Online')) { $BridgeParameters += '-Online' }
     if ($DshExecutable) { $BridgeParameters += @('-DshExecutable',$DshExecutable) }
     $BridgePowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     & $BridgePowerShell @BridgeParameters

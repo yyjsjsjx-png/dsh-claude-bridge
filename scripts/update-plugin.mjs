@@ -1,4 +1,4 @@
-/** Offline in-place update through DSH's installed package manager. */
+/** In-place update through DSH's installed package manager. */
 import { access, copyFile, mkdir, readFile, realpath } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve, delimiter } from 'node:path'
@@ -10,7 +10,13 @@ const packageName = 'dsh-claude-bridge'
 const json = async path => JSON.parse(await readFile(path, 'utf8'))
 const fail = message => { throw new Error(message) }
 
-export async function updatePlugin({ resources, home, profile = 'desktop', packageDirectory }) {
+function pnpmFailureSummary(output = '') {
+  const code = output.match(/\bERR_PNPM_[A-Z0-9_]+\b/)?.[0]
+  const dependency = output.match(/Failed to resolve ((?:@[a-z0-9._-]+\/)?[a-z0-9._-]+@\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?)(?=\s|["']|$)/i)?.[1]
+  return [code, dependency && `无法解析依赖 ${dependency}`].filter(Boolean).join('，')
+}
+
+export async function updatePlugin({ resources, home, profile = 'desktop', packageDirectory, online = false }) {
   if (!process.versions.electron) fail('请使用 update-plugin.ps1，通过现有 DSH 运行更新。')
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(profile)) fail('配置名称无效。')
   const directory = resolve(home, 'profiles', profile)
@@ -62,14 +68,17 @@ export async function updatePlugin({ resources, home, profile = 'desktop', packa
     }
     const history = await repairBridgeHistories({ home, backup, require })
     const result = await operations.runProfilePnpm({ profile, home: resolve(home), dir: directory,
-      installAnchor: anchor, cwd: source }, ['add', '--offline', '--ignore-scripts', `${packageName}@link:${source}`], {
+      installAnchor: anchor, cwd: source }, ['add', online ? '--offline=false' : '--offline', '--ignore-scripts', `${packageName}@link:${source}`], {
       command: process.execPath, args: ['--expose-internals', pnpm],
       execution: 'service', outputBytes: 16_384, lockWaitMs: 5_000, lookupTimeoutMs: 5_000,
       idleTimeoutMs: 120_000,
       env: { ELECTRON_RUN_AS_NODE: '1', DSH_DESKTOP_NODE_EXECUTABLE: process.execPath,
         PATH: `${join(resolve(resources), 'runtime/bin')}${delimiter}${process.env.PATH ?? ''}` },
     })
-    if (result.exitCode !== 0) fail(`更新未完成。安装元数据备份：${backup}；安装日志：${result.logPath}。`)
+    if (result.exitCode !== 0) {
+      const summary = pnpmFailureSummary(result.output)
+      fail(`${summary ? summary + '。' : ''}安装元数据备份：${backup}；安装日志：${result.logPath}。`)
+    }
     const updated = await json(installedPath)
     if (updated.name !== packageName || updated.version !== candidate.version
       || relative(source, await realpath(dirname(installedPath))) !== '') {
@@ -85,6 +94,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const names = { '--resources': 'resources', '--home': 'home', '--profile': 'profile', '--package': 'packageDirectory' }
   try {
     for (let index = 2; index < process.argv.length; index += 2) {
+      if (process.argv[index] === '--online' && process.argv[index + 1] === 'true' && !options.online) {
+        options.online = true
+        continue
+      }
       const name = names[process.argv[index]], value = process.argv[index + 1]
       if (!name || !value || Object.hasOwn(options, name)) fail('更新参数无效。')
       options[name] = value
