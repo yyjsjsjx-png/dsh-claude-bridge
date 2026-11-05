@@ -14,7 +14,7 @@ test('执行器batch契约保留调用关联、准入和上下文，不让原生
     executions++
     assert.deepEqual(batch, { agent, signal, toolSet,
       calls: [{ type: 'tool-call', id: 'call-a', name: 'pwsh', arguments: '{"command":"echo 1"}' }] })
-    return { results: [{ callId: 'call-a', result: { content: [], isError: true,
+    return { results: [{ callId: 'call-a', result: { content: [], isError: true, additionalContexts: [context],
       error: { info: { code: 'ABORTED_BEFORE_DISPATCH' } } } }], additionalContexts: [context], concluded: true }
   } }
   const result = await executeDshTool(tools, input, toolSet)
@@ -56,6 +56,8 @@ test('实际安装执行器：Bridge单调用保留原生策略、取消和步�
     return module.default ?? module
   }
   const { Context } = await import(resolveDshModule('@deepseek-ai/cordis'))
+  const { createUserMessage } = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
+  const deferred = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'synthetic-context' }] })
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   await ctx.plugin(await official('dsh-system-prompt'), {})
@@ -67,13 +69,14 @@ test('实际安装执行器：Bridge单调用保留原生策略、取消和步�
   ctx.tools.register({ name: 'fixture_echo', description: '无副作用合成工具',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
-    async execute() { bodies++; return 'native-executor' } })
+    async execute(_args, exec) { bodies++; exec.deferContext(deferred); return 'native-executor' } })
   const agent = { id: 'executor-fixture', ctx }, signal = new AbortController().signal
   const toolSet = batches ? await ctx.tools.resolve({ agent, signal, modelSelection: { provider: 'fixture', model: 'fixture' } }) : undefined
   const input = { agent, signal, callId: 'native-a', name: 'fixture_echo', arguments: {} }
   const result = await executeDshTool(ctx.tools, input, toolSet)
   assert.equal(result.isError, false)
   assert.equal(result.value, 'native-executor'); assert.equal(bodies, 1)
+  assert.deepEqual(result.additionalContexts.map(message => message.id), [deferred.id])
   allow = false
   const denied = await executeDshTool(ctx.tools, { ...input, callId: 'native-denied' }, toolSet)
   assert.equal(denied.isError, true); assert.equal(bodies, 1)

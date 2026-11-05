@@ -1,6 +1,6 @@
-# rc.5 回归入口
+# 桌面回归入口
 
-当前基线为 DSH Desktop **0.2.1-rc.5**。回归分为普通 Node 无密钥层和真实 Windows Electron／ASAR 原生层；两者均不调用 Claude SDK／CLI 模型，不读取现有账号凭据或用户聊天。本轮另做了[实际桌面与远程 SDK 替身验收](#本轮桌面夹具验收)，其结果不能替代真实上游 SDK／模型验收。
+默认基线为 DSH Desktop **0.2.2-rc.1**，同时保留 **0.2.1-rc.5** 回归。回归分为普通 Node 无密钥层和真实 Windows Electron／ASAR 原生层；两者均不调用 Claude SDK／CLI 模型，不读取现有账号凭据或用户聊天。下方历史[实际桌面与远程 SDK 替身验收](#本轮桌面夹具验收)只对应当时提交，不能替代新版或真实上游模型验收。
 
 ## 本机使用
 
@@ -9,6 +9,7 @@
 ```powershell
 node scripts/run-regression.mjs --layer node --output .local/regression/node
 node scripts/run-regression.mjs --layer native --resources '现有DSH目录\resources' --executable '现有DSH目录\DeepSeek Harness.exe' --output .local/regression/native
+node scripts/run-regression.mjs --layer native --desktop-version 0.2.1-rc.5 --resources '旧版隔离DSH目录\resources' --output .local/regression/rc5
 ```
 
 `--layer all` 顺序执行两层；`--preflight-only` 只检查入口环境，不运行测试，报告状态为 `preflight-passed`，不能当作测试通过。路径也可由 `DSH_CLAUDE_BRIDGE_RESOURCES` 和 `DSH_CLAUDE_BRIDGE_EXECUTABLE` 提供。程序只操作测试自己的临时数据，不安装 DSH、不启动桌面图形窗口、不改变现有插件或服务。
@@ -28,9 +29,21 @@ UI 源码按状态控制器、视图和 DSH 接线维护在 `plugin/ui/client/`�
 | 状态与命令初始化 | `session-status`：真实原生状态日志回放；`compact-command`、`recovery-command`：在同一 Electron 层复验命令参数、取消信号及注销生命周期。实际 Loader 命令初始化另由 `preset-native` 覆盖 |
 | 原生更新器 | `update-plugin`：缺少旧 GitHub 包离线缓存时，使用具名本地链接更新隔离 profile，并保留其他配置及备份 |
 
-原生层先检查真实 Win32、Electron 运行时、文件形式的 `resources/app.asar`，再由该 Electron 读取 ASAR 内桌面及 AgentLoop 的版本，二者必须都是 `0.2.1-rc.5`。不会把 npm 发布包或展开的源码目录当成桌面实测。版本固定仅用于本基线，不改变插件运行时按实际能力检查的兼容策略。
+原生层先检查真实 Win32、Electron 运行时、文件形式的 `resources/app.asar`，再由该 Electron 读取 ASAR 内桌面及 AgentLoop 的版本，二者必须与 `--desktop-version` 所选基线一致。不会把 npm 发布包或展开的源码目录当成桌面实测。固定版本只用于准确归属测试证据，不改变插件运行时按实际能力检查的兼容策略。
 
 ## 本地基线结果
+
+2026-11-06，新版适配与压缩卡片组合候选：
+
+| 运行 | 通过 | 跳过 | 失败 |
+| --- | ---: | ---: | ---: |
+| 普通 Node，全套 531 项 | 469 | 62 | 0 |
+| 0.2.2-rc.1 实际 Electron/ASAR 原生层 | 112 | 0 | 0 |
+| 0.2.1-rc.5 实际 Electron/ASAR 原生层 | 112 | 0 | 0 |
+
+使用各版本的真实桌面 EXE 和 ASAR，通过脚本接口完成工具、审批、取消、严格日志恢复、子代理选型及压缩卡片回放；没有启动日常图形会话、读取真实聊天或调用真实模型。压缩摘要正文没有出现在当前桥接边界事件中，卡片只展示已报告数值及缺失说明。CI 双版本矩阵已配置，本地通过不代表托管 CI 已运行。
+
+现有执行与恢复断言保持；原生测试夹具按新版实际依赖和等价公开接口装配。唯一产品状态预期扩展是 `verifiedVersions` 从旧版精确列表扩展为新旧两版本精确列表，对应本次新增桌面支持要求，仍保留启动探针不冒充完整验收的断言。
 
 2026-11-01 已实际运行统一入口，结果分层保存：
 
@@ -65,9 +78,9 @@ UI 源码按状态控制器、视图和 DSH 接线维护在 `plugin/ui/client/`�
 
 ## CI
 
-`.github/workflows/rc5-regression.yml` 对 main 推送、PR 和手动触发提供两个独立任务，只申请仓库只读权限。Node 任务使用 Ubuntu；原生任务使用 Windows 2025 runner。两者固定 Node `24.22.2`，不执行 `npm install`、SDK 安装或构建。
+`.github/workflows/rc5-regression.yml` 对 main 推送、PR 和手动触发提供独立任务，只申请仓库只读权限。Node 任务使用 Ubuntu；原生任务使用 Windows 2025 runner，矩阵分别检查 0.2.1-rc.5 和 0.2.2-rc.1，工件按版本区分，一项失败不取消另一项。两者固定 Node `24.22.2`，不执行 `npm install` 或 SDK 安装。
 
-Windows 任务仅在 GitHub runner 的临时目录下载固定[官方 rc.5 Windows 安装资产](https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-0.2.1-rc.5-win-x64.exe)。`prepare-ci-dsh.mjs` 使用 runner 已有的 7zip 读取真实 NSIS 清单，唯一定位 `app*.7z` 后提取，再校验 EXE、ASAR 和版本；不执行安装器。布局不符、7zip 缺失或预检失败会明确失败。下载字节数和 SHA-256 写入报告用于追溯；这是本次下载的摘要，未冒充发布方签名。该下载脚本拒绝在普通本机环境运行，本机须提供现有安装路径。
+Windows 任务仅在 GitHub runner 的临时目录下载所选基线的官方 Windows 安装资产。`prepare-ci-dsh.mjs` 使用 runner 已有的 7zip 读取真实 NSIS 清单，唯一定位 `app*.7z` 后提取，再校验 EXE、ASAR 和版本；不执行安装器。布局不符、7zip 缺失或预检失败会明确失败。下载字节数和 SHA-256 写入报告用于追溯；这是本次下载的摘要，未冒充发布方签名。该下载脚本拒绝在普通本机环境运行，本机须提供现有安装路径。
 
 CI 保存本次报告和测试日志 14 天，不上传下载的桌面程序、临时会话或任何真实账号数据。
 

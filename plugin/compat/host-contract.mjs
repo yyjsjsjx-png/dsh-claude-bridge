@@ -142,6 +142,11 @@ export function assertRpcParameters(method, expected, label, version) {
 /** Probe native persistence and message shapes entirely in memory, without touching user sessions. */
 export function assertHostContract(modules, version) {
   for (const name of Object.keys(HOST_FUNCTIONS)) assertHostModule(name, modules[name], version);
+  if (typeof modules['@deepseek-ai/dsh-agent-loop'].AgentLoop.prototype.prepare !== 'function') {
+    requireValue(modules['@deepseek-ai/dsh-agent'].AgentModel, '缺少 AgentModel', version, 'function');
+    requireValue(modules['@deepseek-ai/dsh-agent'].modelSelectionProjectionDefinition,
+      '缺少原生模型选择投影', version);
+  }
   const controller = modules['@deepseek-ai/dsh-api-session-controller'].SessionController.prototype;
   for (const name of ['create', 'selectModel', 'prompt', 'fork']) {
     assertRpcParameters(controller[name], ['request'], `SessionController.${name}`, version);

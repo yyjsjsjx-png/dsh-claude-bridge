@@ -59,6 +59,22 @@ test('严格恢复依赖精确检查 catalog 与 codec 的实际调用接口', (
   }
 });
 
+test('新版工厂与批次工具能力独立核对，缺失关键接口仍拒绝', () => {
+  class AgentLoop {
+    static Config = {};
+    static inject = [];
+    create() {} createAgent() {} resume() {} initializeAgent() {}
+  }
+  assert.doesNotThrow(() => assertHostModule('@deepseek-ai/dsh-agent-loop', { AgentLoop }, '0.2.2-rc.1'));
+  AgentLoop.prototype.initializeAgent = undefined;
+  assert.throws(() => assertHostModule('@deepseek-ai/dsh-agent-loop', { AgentLoop }, '0.2.2-rc.1'));
+  class ToolsService { resolve() {} setExecutor() {} }
+  const tools = { ToolsService, TOOL_ABORTED_BEFORE_DISPATCH: Symbol(), ToolBatchExecutionError() {} };
+  assert.doesNotThrow(() => assertHostModule('@deepseek-ai/dsh-tools', tools, '0.2.2-rc.1'));
+  delete tools.ToolBatchExecutionError;
+  assert.throws(() => assertHostModule('@deepseek-ai/dsh-tools', tools, '0.2.2-rc.1'));
+});
+
 test('升级后的安装版可解析新 ESM 条件导出和变更的标准预设，不再校验旧摘要', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-compat-'));
   const previous = process.env.DSH_CLAUDE_BRIDGE_RESOURCES;

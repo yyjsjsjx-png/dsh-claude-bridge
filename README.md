@@ -51,13 +51,13 @@
 
 | 组件 | 版本 |
 | --- | --- |
-| 已验证支持的 DSH Desktop | **[0.2.1-rc.5](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.5)** |
-| 兼容代码来源提交 | `b830ec950faba0a46dda564be3e2d854afed94f1` |
+| 当前适配的 DSH Desktop | **[0.2.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.1)**；保留 0.2.1-rc.5 回归 |
+| 兼容代码来源提交 | 新版 `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`；旧版 `b830ec950faba0a46dda564be3e2d854afed94f1` |
 | Claude Agent SDK（仅服务器） | `0.3.314` |
 | Claude Code（仅服务器） | `2.1.314` |
 | Node.js（服务器或开发启动脚本） | `>=24.9` |
 
-插件包含构建好的运行文件。目前围绕 DSH 桌面端实际推送的 **0.2.1-rc.5** 维护；已验证范围和限制见 [功能与兼容性](docs/compatibility-inventory.md)。运行时不按版本号或安装版源码摘要拒绝加载，而是检查必需接口、RPC 参数及原生会话回放协议，标准预设按当前安装版读取并检查结构。接口检查通过不代表行为完全兼容，也不构成对所有旧版或未来版本的支持承诺。
+插件包含构建好的运行文件。目前围绕 DSH 桌面端实际推送的 **0.2.2-rc.1** 维护；已验证范围和限制见 [功能与兼容性](docs/compatibility-inventory.md)。运行时按实际工厂与工具接口选择驱动，不按版本字符串或安装版源码摘要拒绝加载；同时检查 RPC 参数、原生会话回放协议，并读取安装版标准预设。接口检查通过不代表所有行为完全兼容，也不构成对所有旧版或未来版本的支持承诺。
 
 桌面端推送新版后，会先审查差异，再针对性适配并执行核心回归；插件完成适配前，请继续使用已验证版本。alpha 不作为近期适配目标或发布门槛。服务器 SDK 和 CLI 继续固定版本。
 

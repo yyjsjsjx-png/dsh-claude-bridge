@@ -16,7 +16,7 @@ DSH Claude Bridge 是面向**账号所有者本人自用**的实验性桥接：�
 
 | 本机 | 自己的服务器 |
 | --- | --- |
-| DSH Desktop，实测基线 `0.2.1-rc.5` | Linux VPS、独立非 root 服务用户及独立部署目录 |
+| DSH Desktop，当前适配基线 `0.2.2-rc.1`，保留 `0.2.1-rc.5` 回归 | Linux VPS、独立非 root 服务用户及独立部署目录 |
 | 最新正式版插件 | Node.js `>=24.9`、npm、锁定 SDK `0.3.314` |
 | 无需安装 Claude Code 或 SDK | 官方 CLI `2.1.314` 和本人具备使用权限的 `claude.ai` 登录 |
 

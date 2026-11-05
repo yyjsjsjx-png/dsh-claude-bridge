@@ -221,7 +221,7 @@ let ClaudeBridgeService = (() => {
             const remotePreset = remotePresetStatus(this.ctx);
             const host = await assertDshCompatibility();
             return { ...status, remotePreset, host,
-                desktopCompatibility: { version: host.version, verifiedVersions: ['0.2.1-rc.5'] },
+                desktopCompatibility: { version: host.version, verifiedVersions: ['0.2.1-rc.5', '0.2.2-rc.1'] },
                 ...remotePresetFeatures(remotePreset) };
         }
         async saveConnection(value) {

@@ -19,7 +19,7 @@ export async function prepareDesktop022(archive) {
   const entries = await readArchiveEntries(archive, [`${base}/lib/index.js`, `${base}/package.json`, `${base}/LICENSE`]);
   const manifest = JSON.parse(entries.get(`${base}/package.json`));
   const source = entries.get(`${base}/lib/index.js`), license = entries.get(`${base}/LICENSE`);
-  if (manifest.version !== '0.2.2-rc.1' || manifest.license !== 'MIT'
+  if (manifest.name !== '@deepseek-ai/dsh-agent-loop' || manifest.version !== '0.2.2-rc.1' || manifest.license !== 'MIT'
     || digest(license) !== 'ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be') {
     throw new Error('不是已核对的 0.2.2-rc.1 官方包。');
   }

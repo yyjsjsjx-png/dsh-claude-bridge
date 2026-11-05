@@ -15,7 +15,9 @@ export async function executeDshTool(tools, input, toolSet) {
     throw error
   }
   const result = batch.results[0].result
-  return { ...result, additionalContexts: [...(result.additionalContexts ?? []), ...(batch.additionalContexts ?? [])],
+  // The executor retains contexts on individual results and also aggregates
+  // them at batch level. The aggregate is authoritative, not a second source.
+  return { ...result, additionalContexts: batch.additionalContexts ?? [],
     concludesTurn: batch.concluded === true || result.concludesTurn === true }
 }
 
