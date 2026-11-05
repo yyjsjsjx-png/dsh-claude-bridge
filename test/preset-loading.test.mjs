@@ -109,6 +109,18 @@ test('基础或降级预设不向界面宣称未开启的 Workflow、子代理�
     .some(item => item.name === '子任务独立选型'));
 });
 
+test('委托组整体关闭时界面同步关闭子代理与Workflow，必要限制继续保留', () => {
+  const status = remotePresetFeatures({ mode: 'degraded', disabledComponents: [
+    { name: 'delegation', status: 'disabled', reason: '原生委托依赖未就绪' },
+  ] });
+  const unavailable = ['子任务独立选型', 'Workflow 深度限制'];
+  assert.ok(unavailable.every(name => !status.convertedFeatures.some(item => item.name === name)));
+  assert.ok(unavailable.every(name => status.disabledFeatures.some(item => item.name === name && item.status === 'disabled')));
+  assert.ok(['计划模式', 'subagent_fork', 'DSH 原生压缩', '会话分叉', '自动时间与时区上下文']
+    .every(name => status.disabledFeatures.some(item => item.name === name && item.status === 'disabled')));
+  assert.ok(status.convertedFeatures.some(item => item.name === '/compact'));
+});
+
 test('可选组件导入、激活或依赖失败只关闭该组件，先等待清理', async () => {
   const f = fixture([{ 'tool-a': 'import', 'tool-b': 'activate', 'tool-c': 'pending' }]);
   let status;

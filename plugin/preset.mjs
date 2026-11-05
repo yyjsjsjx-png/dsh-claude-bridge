@@ -43,11 +43,11 @@ export function createOwnedRemoteClaudePreset(subagentFields = { modelSelectionS
 export function remotePresetFeatures(report) {
   const disabled = new Set(report.disabledComponents.map(item => item.name));
   const unavailable = new Map();
-  if (report.mode === 'basic' || disabled.has('tool-workflow') || disabled.has('workflow-ptc')) {
+  if (report.mode === 'basic' || disabled.has('delegation') || disabled.has('tool-workflow') || disabled.has('workflow-ptc')) {
     unavailable.set('Workflow 深度限制', '当前远程预设未开启 Workflow。');
   }
   if (disabled.has('claude-sdk-compact')) unavailable.set('/compact', '压缩命令组件未就绪。');
-  if (report.mode === 'basic' || disabled.has('tool-subagent')) {
+  if (report.mode === 'basic' || disabled.has('delegation') || disabled.has('tool-subagent')) {
     unavailable.set('子任务独立选型', '当前远程预设未开启子代理。');
   }
   return {
