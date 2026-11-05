@@ -83,5 +83,5 @@ export function createCompactionSummaryProjection(z) {
   const schema = z.object({ summaries: z.record(z.string(), entry), links: z.record(z.string(), z.string().nullable()) }).strict().nullable()
   return { key: 'claudeBridgeCompactionSummaries', stateVersion: 1, stateSchema: schema,
     init: header => header.agentPreset === CLAUDE_PRESET ? rules.initial() : null,
-    apply: rules.apply, wire: { viewSchema: schema, view: state => state } }
+    apply: rules.apply, wire: { viewSchema: schema, view: state => state, summary: false } }
 }

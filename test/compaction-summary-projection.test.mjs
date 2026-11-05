@@ -6,6 +6,8 @@ import { createCompactionHistory } from '../plugin/ui/client/compaction-history.
 import { nativeChat } from './fixtures/native-chat.mjs'
 import { strictSession } from './fixtures/native-persistence.mjs'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 
 const rules = createCompactionSummaryRules()
 const summaryRecord = (boundaryUuid, summary, extra = {}) => ({ type: COMPACTION_SUMMARY_RECORD, ignorable: true,
@@ -13,6 +15,34 @@ const summaryRecord = (boundaryUuid, summary, extra = {}) => ({ type: COMPACTION
 const available = text => ({ status: 'available', text })
 const card = { boundaryUuid: 'boundary-a', runId: 'run', completedAt: 100, seq: 4, trigger: 'auto' }
 const native = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
+
+test('实际原生：摘要正文留在打开会话完整投影，新版列表摘要不携带正文集合', { skip: !native }, async t => {
+  const { Context } = await import(resolveDshModule('@deepseek-ai/cordis'))
+  const { z } = await import(resolveDshModule('zod'))
+  const { Session, SESSION_FORMAT_VERSION, appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'))
+  const ctx = new Context()
+  t.after(() => ctx.fiber.dispose())
+  for (const name of ['dsh-session', 'dsh-session-projection']) {
+    const module = await import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href)
+    await ctx.plugin(module.default ?? module, {})
+  }
+  const projection = createCompactionSummaryProjection(z)
+  await ctx.sessionProjections.register(projection)
+  const session = Session.create('summary-list-exclusion', undefined, { version: SESSION_FORMAT_VERSION,
+    id: 'summary-list-exclusion', createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+  appendPluginRecord(session, COMPACTION_SUMMARY_RECORD, summaryRecord('boundary-a', available('合成完整正文')).data)
+  const full = ctx.sessionProjections.snapshot(session)
+  assert.equal(full.values[projection.key].summaries['$boundary-a'].summary.text, '合成完整正文')
+  if (typeof ctx.sessionProjections.summaryKeys === 'function') {
+    const keys = ctx.sessionProjections.summaryKeys()
+    assert.equal(keys.has(projection.key), false)
+    const list = ctx.sessionProjections.snapshot(session, keys)
+    assert.equal(Object.hasOwn(list.values, projection.key), false)
+    const opened = ctx.sessionProjections.snapshot(session, [projection.key])
+    assert.equal(opened.values[projection.key].summaries['$boundary-a'].summary.text, '合成完整正文')
+  }
+})
 
 test('摘要只按精确UUID或可信旧卡三元定位关联，不按token/时间近似配对', () => {
   const record = summaryRecord('boundary-a', available('## 合成原生摘要\n保留正文'))
