@@ -2,6 +2,10 @@
 import { Service, entryListSchema, loadYaml } from './compat/runtime.mjs';
 import { readShippedStandardPreset, resolveDshModule } from './compat/resolve-dsh-module.mjs';
 import { createRemoteClaudePreset, createOwnedRemoteClaudePreset, createBasicRemoteClaudePreset, containRemotePreset } from './preset.mjs';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+
+const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'));
 
 export default class ClaudePreset {
   // Commands inside the remote composition depend on this service. Wait for
@@ -17,6 +21,11 @@ export default class ClaudePreset {
     let mode = 'full';
     const reasons = [];
     const noticeReasons = [];
+    let subagentFields;
+    try {
+      const nativeSubagent = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href);
+      subagentFields = nativeSubagent.Config?.dict ?? {};
+    } catch { subagentFields = {}; }
     let preset;
     try {
       const shipped = readShippedStandardPreset();
@@ -26,10 +35,10 @@ export default class ClaudePreset {
       const matches = patches.flatMap(patch => Array.isArray(patch?.insert) ? patch.insert : [])
         .filter(row => row?.id === 'preset-standard' && row?.config?.id === 'standard');
       if (matches.length !== 1) throw new Error('DSH 标准预设定义不唯一。');
-      preset = createRemoteClaudePreset(matches[0].config);
+      preset = createRemoteClaudePreset(matches[0].config, subagentFields);
     } catch {
       try {
-        preset = createOwnedRemoteClaudePreset();
+        preset = createOwnedRemoteClaudePreset(subagentFields);
         // A declaration-source change alone must not change an equivalent SDK
         // system prompt. Publish this notice to the user, not to the model.
         noticeReasons.push('安装版标准预设无法读取或适配，已采用插件维护的完整预设。');
