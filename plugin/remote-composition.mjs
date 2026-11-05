@@ -44,6 +44,9 @@ export async function apply(ctx, config) {
     if (row.id === 'tool-subagent' && row.name === '@deepseek-ai/dsh-tool-subagent') {
       return { ...row, name: new URL('./remote-subagent.mjs', import.meta.url).href };
     }
+    if (row.id === 'tool-web' && row.name === '@deepseek-ai/dsh-tool-web') {
+      return { ...row, name: new URL('./remote-web.mjs', import.meta.url).href };
+    }
     return row.group && Array.isArray(row.config) ? { ...row, config: remoteEntries(row.config) } : row;
   });
   composition = await loadRemoteComposition({ ...config,

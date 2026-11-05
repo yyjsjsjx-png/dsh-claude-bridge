@@ -45,6 +45,7 @@ import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.m
 import { RunStepLifecycle } from './step-lifecycle.mjs'
 import { assertPreparedInstructionAudit } from './instruction-audit.mjs'
 import { currentDshSelection, createStepToolAdmission, executeDshTool } from './dsh-tool-execution.mjs'
+import { unavailableLocalWebTools } from './native-web-activation.mjs'
 import { createCompactionRecovery, appendCompactionSummary } from './compaction-recovery.mjs'
 import { COMPACTION_RECORD } from './compaction-summary.mjs'
 
@@ -990,16 +991,35 @@ export class BridgeBackend {
     return next
   }
 
-  async convertTools(assembly, selected, catalogModels, nativeWebTools) {
+  async nativeWebToolReady({ modelSelection, signal }) {
+    if (modelSelection.provider !== CLAUDE_PROVIDER) return false
+    await this.state.ready
+    signal.throwIfAborted()
+    if (this.contextPreferences().webToolProvider === 'dsh') return false
+    // Native activation runs before the first query connection. Confirm only
+    // the handshake here; no model request or local web operation is started.
+    const identity = this.connectionContext.capture()
+    const transport = await this.connect({ signal })
+    signal.throwIfAborted()
+    if (!this.connectionContext.current(identity, transport)) throw failure('CONNECTION_CHANGED', '连接设置已更改。')
+    return this.contextPreferences().webToolProvider !== 'dsh'
+      && this.initialized?.capabilities?.nativeWebTools === true
+  }
+
+  async convertTools(assembly, selected, catalogModels, nativeWebTools, admission = {}) {
     let image = { supported: undefined, source: 'unknown', reason: '本次工具集合没有读图工具。' }
     if (assembly.tools.some(tool => tool.name === 'read_image')) {
       catalogModels ??= (await this.catalog()).models
       image = imageCapability(catalogModels.find(model => model.value === selected.model))
     }
     const replaced = nativeWebTools ? assembly.tools.filter(tool => DSH_WEB_TOOLS.includes(tool.name)) : []
+    const unavailable = await unavailableLocalWebTools({ tools: this.ctx.tools,
+      ...admission, modelSelection: selected, nativeWebTools })
     const converted = toMcpToolDefinitions(assembly.tools.filter(tool => !replaced.includes(tool)
+      && !unavailable.has(tool.name)
       && (tool.name !== 'read_image' || image.supported === true)))
     for (const { name } of replaced) converted.compatibility.push({ name, status: 'disabled', reason: '当前远程会话使用 Claude Code 网页工具。' })
+    for (const name of unavailable) converted.compatibility.push({ name, status: 'disabled', reason: '网页执行路径已变化，本机 DSH 网页服务尚未就绪。' })
     if (assembly.tools.some(tool => tool.name === 'read_image') && image.supported !== true) {
       converted.compatibility.push({ name: 'read_image', status: 'disabled', reason: image.reason })
     }
@@ -1134,7 +1154,8 @@ export class BridgeBackend {
   }
 
   async prepareRunRequest(agent, decision, { selected, binding, signal, timing, nativeWebTools, nativeWebResultPages }) {
-    const converted = await this.convertTools(decision.assembly, selected, undefined, nativeWebTools)
+    const converted = await this.convertTools(decision.assembly, selected, undefined, nativeWebTools,
+      { agent, toolSet: decision.toolSet, signal })
     // The full conversion can exclude the shell (for example, the global tool
     // count cap); the cheap initial probe cannot admit that final collection.
     const prepared = this.prepareRequest(agent, decision, converted)
@@ -1349,7 +1370,8 @@ export class BridgeBackend {
         || selected.reasoningEffort !== run.requestedEffort)) {
         throw failure('QUERY_CONFIGURATION_CHANGED', '运行期间模型选择已更新，本轮已在安全边界停止；继续时将使用新选择。')
       }
-      const tools = await this.convertTools(decision.assembly, selected, run.catalogModels, run.nativeWebTools)
+      const tools = await this.convertTools(decision.assembly, selected, run.catalogModels, run.nativeWebTools,
+        { agent, toolSet: decision.toolSet, signal })
       const prepared = this.prepareRequest(agent, decision, tools)
       const promptChanged = prepared.renderSystemPrompt() !== run.systemPrompt
       if (promptChanged || prepared.toolSignature !== run.toolSignature) {

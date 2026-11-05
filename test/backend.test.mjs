@@ -112,6 +112,48 @@ test('新版原生网页使用公开Pipeline.prepare核对权限，携带本步�
   assert.equal(prepared, 1)
 })
 
+test('原生网页首步先协商能力，普通和DSH路径不新建连接，旧服务不提升准入', async t => {
+  for (const supported of [true, false]) {
+    const methods = []
+    const f = await fixture(t, async () => ({ peer: { async request(method) {
+      methods.push(method)
+      assert.equal(method, 'initialize')
+      return { protocolVersion: 1, authenticated: true,
+        ...(supported ? { capabilities: { nativeWebTools: true } } : {}) }
+    } }, async close() {} }))
+    const signal = new AbortController().signal, modelSelection = { provider, model: 'fixture' }
+    assert.equal(await f.backend.nativeWebToolReady({ modelSelection: { provider: 'ordinary' }, signal }), false)
+    await f.backend.saveContextPreferences({ autoCompactWindowTokens: null, webToolProvider: 'dsh' })
+    assert.equal(await f.backend.nativeWebToolReady({ modelSelection, signal }), false)
+    assert.deepEqual(methods, [])
+    await f.backend.saveContextPreferences({ autoCompactWindowTokens: null })
+    assert.equal(await f.backend.nativeWebToolReady({ modelSelection, signal }), supported)
+    assert.equal(await f.backend.nativeWebToolReady({ modelSelection, signal }), supported)
+    assert.deepEqual(methods, ['initialize'])
+    const aborted = new AbortController(); aborted.abort()
+    await assert.rejects(f.backend.nativeWebToolReady({ modelSelection, signal: aborted.signal }), { name: 'AbortError' })
+    assert.deepEqual(methods, ['initialize'])
+  }
+})
+
+test('原生网页协商期间停止或换连接，迟到能力不能放开准入', async t => {
+  for (const action of ['abort', 'change']) {
+    let entered, complete
+    const started = new Promise(resolve => { entered = resolve })
+    const response = new Promise(resolve => { complete = resolve })
+    const f = await fixture(t, async () => ({ peer: { async request(method) {
+      assert.equal(method, 'initialize'); entered(); return response
+    } }, async close() {} }))
+    const controller = new AbortController()
+    const pending = f.backend.nativeWebToolReady({ modelSelection: { provider, model: 'fixture' }, signal: controller.signal })
+    await started
+    if (action === 'abort') controller.abort()
+    else f.backend.connectionContext.invalidate()
+    complete({ protocolVersion: 1, authenticated: true, capabilities: { nativeWebTools: true } })
+    await assert.rejects(pending, action === 'abort' ? { name: 'AbortError' } : { code: 'CONNECTION_CHANGED' })
+  }
+})
+
 test('启动诊断保留 Host 证据分级，记录未自动实测项且不连接服务器', async t => {
   const checks = [
     { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
