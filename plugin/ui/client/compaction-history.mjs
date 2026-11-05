@@ -7,7 +7,7 @@ export function createCompactionHistory({ React, MarkdownText, summaryRules }) {
   const markdownLabels = { code: { copyLabel: '复制', copiedLabel: '已复制',
     toolbarLabels: { codeLabel: '代码', wrapLabel: '换行', unwrapLabel: '取消换行' } }, footnotes: '脚注' };
   const unavailable = { SUMMARY_MISSING: '本次压缩没有返回摘要正文。', SUMMARY_EMPTY: '本次压缩返回的摘要正文为空。',
-    SUMMARY_TOO_LARGE: '摘要超过 1 MiB 显示上限，未截断或展示。', SUMMARY_UNPAIRED: '摘要未能与本次压缩边界可靠对应。',
+    SUMMARY_TOO_LARGE: '摘要超过显示或传输上限，未截断或展示。', SUMMARY_UNPAIRED: '摘要未能与本次压缩边界可靠对应。',
     SUMMARY_UNAVAILABLE: '原生摘要读取失败或暂不可用。', SUMMARY_CONFLICT: '同一压缩边界的摘要记录冲突，未展示正文。' };
   const dataOf = event => {
     const progress = event.data;

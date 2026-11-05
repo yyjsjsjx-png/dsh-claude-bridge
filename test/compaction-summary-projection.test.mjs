@@ -137,6 +137,8 @@ test('客户端按共享1MiB UTF8上限完整保留正文，超限/空白/异常
   assert.equal(rules.normalize(available(exact)).text, exact)
   assert.deepEqual(rules.normalize(available('文'.repeat(Math.floor(MAX_COMPACTION_SUMMARY_BYTES / 3) + 1))),
     { status: 'unavailable', code: 'SUMMARY_TOO_LARGE' })
+  assert.deepEqual(rules.normalize(available('a' + '\u0000'.repeat(600_000))),
+    { status: 'unavailable', code: 'SUMMARY_TOO_LARGE' })
   assert.deepEqual(rules.normalize(available(' \n')), { status: 'unavailable', code: 'SUMMARY_EMPTY' })
   const initial = rules.initial()
   assert.equal(rules.apply(initial, { ...summaryRecord('boundary-a', available('不得进入')), ignorable: false }), initial)

@@ -14,7 +14,7 @@ import { createUsageProjectionBridge } from '../plugin/ui/client/usage-projectio
 import { createClientReceiveTiming } from '../plugin/ui/client/client-receive-timing.mjs';
 import { createCompactionHistory } from '../plugin/ui/client/compaction-history.mjs';
 import { createCompactionSummaryRules } from '../src/compaction-summary-projection.mjs';
-import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES, SUMMARY_CODES } from '../src/compaction-summary.mjs';
+import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES, MAX_COMPACTION_SUMMARY_JSON_BYTES, SUMMARY_CODES } from '../src/compaction-summary.mjs';
 
 const factories = [createStore, textError, createSettingsController, createModelController,
   createQuotaController, createPickerController, createMeterViews, createFormViews,
@@ -33,6 +33,7 @@ const { useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText } = requir
 const { z } = require('zod');
 const COMPACTION_SUMMARY_RECORD = ${JSON.stringify(COMPACTION_SUMMARY_RECORD)};
 const MAX_COMPACTION_SUMMARY_BYTES = ${MAX_COMPACTION_SUMMARY_BYTES};
+const MAX_COMPACTION_SUMMARY_JSON_BYTES = ${MAX_COMPACTION_SUMMARY_JSON_BYTES};
 const SUMMARY_CODES = ${JSON.stringify(SUMMARY_CODES)};
 
 ${factories.map(factory => normalize(factory.toString())).join('\n\n')}

@@ -10,6 +10,8 @@ test('原生摘要逐字保留，空白/缺失/超限明确失败而不截断', 
   assert.equal(parseSummary('a'.repeat(MAX_COMPACTION_SUMMARY_BYTES)).status, 'available')
   assert.deepEqual(parseSummary('文'.repeat(Math.floor(MAX_COMPACTION_SUMMARY_BYTES / 3) + 1)),
     { status: 'unavailable', code: 'SUMMARY_TOO_LARGE' })
+  assert.deepEqual(parseSummary('a' + '\u0000'.repeat(600_000)),
+    { status: 'unavailable', code: 'SUMMARY_TOO_LARGE' }, '转义放大不能使可选正文突破RPC帧而中断查询')
 })
 
 test('摘要状态只接受白名单字段，诊断不会收录摘要正文', () => {

@@ -6,6 +6,7 @@ const { useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText } = requir
 const { z } = require('zod');
 const COMPACTION_SUMMARY_RECORD = "plugin:claude-bridge/compaction-summary";
 const MAX_COMPACTION_SUMMARY_BYTES = 1048576;
+const MAX_COMPACTION_SUMMARY_JSON_BYTES = 3145728;
 const SUMMARY_CODES = ["SUMMARY_MISSING","SUMMARY_EMPTY","SUMMARY_TOO_LARGE","SUMMARY_UNPAIRED","SUMMARY_UNAVAILABLE","SUMMARY_CONFLICT"];
 
 function createStore(initial) {
@@ -1524,7 +1525,9 @@ function createCompactionSummaryRules() {
   const normalize = value => {
     if (value?.status !== 'available') return unavailable(SUMMARY_CODES.includes(value?.code) ? value.code : 'SUMMARY_UNAVAILABLE')
     if (typeof value.text !== 'string') return unavailable('SUMMARY_MISSING')
-    if (new TextEncoder().encode(value.text).byteLength > MAX_COMPACTION_SUMMARY_BYTES) return unavailable('SUMMARY_TOO_LARGE')
+    const encoder = new TextEncoder()
+    if (encoder.encode(value.text).byteLength > MAX_COMPACTION_SUMMARY_BYTES
+      || encoder.encode(JSON.stringify(value.text)).byteLength > MAX_COMPACTION_SUMMARY_JSON_BYTES) return unavailable('SUMMARY_TOO_LARGE')
     if (!value.text.trim()) return unavailable('SUMMARY_EMPTY')
     return { status: 'available', text: value.text }
   }
@@ -1594,7 +1597,7 @@ function createCompactionHistory({ React, MarkdownText, summaryRules }) {
   const markdownLabels = { code: { copyLabel: '复制', copiedLabel: '已复制',
     toolbarLabels: { codeLabel: '代码', wrapLabel: '换行', unwrapLabel: '取消换行' } }, footnotes: '脚注' };
   const unavailable = { SUMMARY_MISSING: '本次压缩没有返回摘要正文。', SUMMARY_EMPTY: '本次压缩返回的摘要正文为空。',
-    SUMMARY_TOO_LARGE: '摘要超过 1 MiB 显示上限，未截断或展示。', SUMMARY_UNPAIRED: '摘要未能与本次压缩边界可靠对应。',
+    SUMMARY_TOO_LARGE: '摘要超过显示或传输上限，未截断或展示。', SUMMARY_UNPAIRED: '摘要未能与本次压缩边界可靠对应。',
     SUMMARY_UNAVAILABLE: '原生摘要读取失败或暂不可用。', SUMMARY_CONFLICT: '同一压缩边界的摘要记录冲突，未展示正文。' };
   const dataOf = event => {
     const progress = event.data;

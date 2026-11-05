@@ -1,5 +1,5 @@
 import { CLAUDE_PRESET } from '../plugin/policy.mjs'
-import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES, SUMMARY_CODES } from './compaction-summary.mjs'
+import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES, MAX_COMPACTION_SUMMARY_JSON_BYTES, SUMMARY_CODES } from './compaction-summary.mjs'
 
 /** Browser-safe exact-identity merge rules; the client bundle supplies the shared constants. */
 export function createCompactionSummaryRules() {
@@ -10,7 +10,9 @@ export function createCompactionSummaryRules() {
   const normalize = value => {
     if (value?.status !== 'available') return unavailable(SUMMARY_CODES.includes(value?.code) ? value.code : 'SUMMARY_UNAVAILABLE')
     if (typeof value.text !== 'string') return unavailable('SUMMARY_MISSING')
-    if (new TextEncoder().encode(value.text).byteLength > MAX_COMPACTION_SUMMARY_BYTES) return unavailable('SUMMARY_TOO_LARGE')
+    const encoder = new TextEncoder()
+    if (encoder.encode(value.text).byteLength > MAX_COMPACTION_SUMMARY_BYTES
+      || encoder.encode(JSON.stringify(value.text)).byteLength > MAX_COMPACTION_SUMMARY_JSON_BYTES) return unavailable('SUMMARY_TOO_LARGE')
     if (!value.text.trim()) return unavailable('SUMMARY_EMPTY')
     return { status: 'available', text: value.text }
   }
