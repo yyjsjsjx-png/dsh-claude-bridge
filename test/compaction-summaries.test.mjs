@@ -218,6 +218,21 @@ test('实际hook装配在权威边界之后发送摘要，旧客户端不注册�
   assert.equal(manual.notifications.some(item => item.method === 'sdk.message'), false)
 })
 
+test('新旧普通流都不转发原生摘要user事件，普通用户文字不按内容误判', () => {
+  for (const enabled of [false, true]) {
+    const f = streamFixture({ enabled })
+    for (const flag of ['is_compact_summary', 'isCompactSummary']) {
+      f.stream.accept({ type: 'user', session_id: sessionId, [flag]: true,
+        get message() { assert.fail('原生摘要正文不应被转发或读取') } })
+    }
+    const ordinary = { type: 'user', session_id: sessionId, is_compact_summary: false, isCompactSummary: false,
+      message: { role: 'user', content: 'This session is being continued. Summary: 普通用户文字' } }
+    f.stream.accept(ordinary)
+    assert.deepEqual(f.notifications.filter(item => item.message?.type === 'user').map(item => item.message), [ordinary])
+    f.stream.releaseInput()
+  }
+})
+
 test('流式status接线隔离前周期缺失hook，保留新周期的同文本摘要', async () => {
   const f = streamFixture(), post = f.tools.hooks.PostCompact[0].hooks[0]
   f.stream.accept(status('compacting'))

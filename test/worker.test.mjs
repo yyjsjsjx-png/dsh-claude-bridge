@@ -150,6 +150,73 @@ test('版本协商默认报告服务端版本，无最低要求时允许旧客�
   assert.equal(f.state.catalogQueries.length, 0)
 })
 
+test('压缩摘要能力按SDK PostCompact Hook探测，不依赖版本号或启动查询', async t => {
+  for (const [sdkHookEvents, expected] of [[undefined, undefined], [[], undefined], [['PreCompact'], undefined],
+    [['PreCompact', 'PostCompact'], true]]) {
+    const f = await fixture(t, async function* () { assert.fail('能力协商不能发起推理') }, {
+      sdkHookEvents, sdkVersion: '0.0.1', cliVersion: '0.0.1',
+    })
+    const initialized = await f.worker.handlers.initialize({ protocolVersion: 1 })
+    assert.equal(initialized.capabilities.compactionSummaries, expected)
+    assert.equal(f.state.queries.length, 0)
+    assert.equal(f.state.catalogQueries.length, 0)
+  }
+})
+
+test('旧SDK拒绝强制摘要协商且不发模型输入，false参数先于鉴权和查询被拒绝', async t => {
+  const unsupported = await fixture(t, async function* () { assert.fail('不支持摘要Hook时不能派发模型查询') }, {
+    sdkHookEvents: ['PreCompact'],
+  })
+  const refused = await unsupported.worker.handlers.query({ ...unsupported.params, compactionSummaries: true }, unsupported.context)
+  assert.equal(refused.status, 'failed')
+  assert.equal(refused.code, 'COMPACTION_SUMMARY_UNSUPPORTED')
+  assert.equal(unsupported.state.queries.length, 0)
+  for (const sdkHookEvents of [undefined, ['PostCompact']]) {
+    const f = await fixture(t, async function* () { assert.fail('非法摘要参数不能派发') }, { sdkHookEvents })
+    const result = await f.worker.handlers.query({ ...f.params, compactionSummaries: false }, f.context)
+    assert.equal(result.status, 'failed')
+    assert.equal(result.code, 'INVALID_COMPACTION_SUMMARIES')
+    assert.equal(f.state.authReads, 0)
+    assert.equal(f.state.queries.length, 0)
+    assert.equal(f.state.catalogQueries.length, 0)
+  }
+})
+
+test('普通查询仅向协商客户端发送Hook摘要，原生summary user事件对新旧客户端都封闭', async t => {
+  for (const enabled of [false, true]) {
+    const f = await fixture(t, async function* ({ prompt, options }, state) {
+      await prompt.next(); state.exists = true
+      yield { type: 'system', subtype: 'status', status: 'compacting', session_id: SESSION }
+      const post = options.hooks.PostCompact?.[0].hooks[0]
+      assert.equal(typeof post, enabled ? 'function' : 'undefined')
+      if (post) assert.deepEqual(await post({ hook_event_name: 'PostCompact', session_id: SESSION,
+        trigger: 'auto', compact_summary: 'NEGOTIATED_HOOK_SUMMARY' }), {})
+      yield { type: 'system', subtype: 'compact_boundary', session_id: SESSION, uuid: 'summary-boundary',
+        compact_metadata: { trigger: 'auto', pre_tokens: 1000 } }
+      for (const flag of ['is_compact_summary', 'isCompactSummary']) {
+        yield { type: 'user', session_id: SESSION, [flag]: true,
+          message: { role: 'user', content: 'NATIVE_SYNTHETIC_SUMMARY' } }
+      }
+      yield { type: 'user', session_id: SESSION, message: { role: 'user', content: 'ORDINARY_USER_ECHO' } }
+      yield { type: 'result', subtype: 'success', session_id: SESSION }
+    }, { sdkHookEvents: ['PostCompact'] })
+    const result = await f.worker.handlers.query({ ...f.params, ...(enabled ? { compactionSummaries: true } : {}) }, f.context)
+    assert.equal(result.status, 'completed')
+    assert.equal(f.state.queries.length, 1)
+    const messages = f.state.notifications.filter(row => row.method === 'sdk.message').map(row => row.params.message)
+    const summaries = messages.filter(message => message.type === 'bridge_compaction_summary')
+    assert.deepEqual(summaries, enabled ? [{ type: 'bridge_compaction_summary', boundaryUuid: 'summary-boundary', trigger: 'auto',
+      summary: { status: 'available', text: 'NEGOTIATED_HOOK_SUMMARY' }, source: 'sdk-postcompact' }] : [])
+    assert.equal(messages.filter(message => message.type === 'user').length, 1)
+    assert.equal(messages.find(message => message.type === 'user').message.content, 'ORDINARY_USER_ECHO')
+    assert.equal(JSON.stringify(f.state.notifications).includes('NATIVE_SYNTHETIC_SUMMARY'), false)
+    assert.equal(JSON.stringify(f.state.notifications.filter(row => row.method !== 'sdk.message')).includes('NEGOTIATED_HOOK_SUMMARY'), false)
+    assert.equal(JSON.stringify(result).includes('SUMMARY'), false)
+    const diagnostics = await readFile(join(f.config.sessionRoot, '_diagnostics', DEVICE, 'bridge.jsonl'), 'utf8')
+    assert.doesNotMatch(diagnostics, /NATIVE_SYNTHETIC_SUMMARY|NEGOTIATED_HOOK_SUMMARY/)
+  }
+})
+
 test('版本门禁在初始化缺失或客户端过旧时先于参数解析阻止全部 SDK 操作', async t => {
   const f = await fixture(t, async function* () { throw new Error('不能发起模型推理') }, {
     bridgeRelease: { serverVersion: '0.3.0', minimumClientVersion: '0.2.3' },
@@ -396,6 +463,7 @@ test('主动压缩取消后不接受晚到 boundary，不自动重发', async t 
 })
 
 async function fixture(t, queryImplementation, overrides = {}) {
+  const { sdkHookEvents, ...workerOverrides } = overrides
   const tempParent = resolve(tmpdir())
   const root = await mkdtemp(join(tempParent, 'dsh-claude-worker-'))
   t.after(async () => {
@@ -413,6 +481,7 @@ async function fixture(t, queryImplementation, overrides = {}) {
     ],
   }
   const sdk = {
+    ...(sdkHookEvents === undefined ? {} : { HOOK_EVENTS: sdkHookEvents }),
     tool(name, description, shape, handler) { return { name, description, shape, handler } },
     createSdkMcpServer({ name, tools }) { return { type: 'sdk', name, instance: { tools } } },
     async getSessionInfo(sessionId, options) { state.info.push({ sessionId, options }); return state.exists ? { sessionId } : undefined },
@@ -464,7 +533,7 @@ async function fixture(t, queryImplementation, overrides = {}) {
     cliPath: '/desktop/.local/share/claude/versions/2.1.314', homeDir: '/desktop',
     sdkVersion: '0.3.314', cliVersion: '2.1.314', acquireLock,
     authReader: { async read() { state.authReads++; return { loggedIn: true, authMethod: 'claude.ai' } } },
-    ...overrides,
+    ...workerOverrides,
   }
   const worker = createWorkerHandlers(config)
   const peer = {

@@ -101,6 +101,9 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
 
   // Forward one message to the local host with the bridge's redactions.
   function forward(message) {
+    // Native synthetic summaries stay inside the SDK; display text only
+    // through the negotiated and boundary-paired PostCompact channel.
+    if (message?.type === 'user' && (message.is_compact_summary === true || message.isCompactSummary === true)) return
     if (message?.type === 'assistant' && typeof message.error === 'string') assistantError = message.error
     if (compact) {
       // Maintenance keeps ordinary SDK messages private. Negotiated PostCompact
