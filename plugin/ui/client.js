@@ -1537,15 +1537,24 @@ function createCompactionSummaryRules() {
     const data = event.data
     if (data?.version !== 1 || !uuid(data.boundaryUuid) || !['auto', 'manual', 'unknown'].includes(data.trigger)) return state
     const key = `$${data.boundaryUuid}`, previous = own(state.summaries, key)
+    const source = data.source === 'native-transcript' ? 'native-transcript' : 'sdk-postcompact'
+    const previousSource = previous?.source === 'native-transcript' ? 'native-transcript' : 'sdk-postcompact'
     let summary = normalize(data.summary)
-    if (previous?.summary.status === 'available') {
-      if (summary.status !== 'available' && summary.code !== 'SUMMARY_CONFLICT') summary = previous.summary
-      else if (summary.text !== previous.summary.text) summary = unavailable('SUMMARY_CONFLICT')
-    } else if (previous?.summary.code === 'SUMMARY_CONFLICT') summary = previous.summary
-    if (previous && previous.trigger !== 'unknown' && data.trigger !== 'unknown' && previous.trigger !== data.trigger) {
-      summary = unavailable('SUMMARY_CONFLICT')
+    let entry
+    // The native transcript can wrap or transform Hook text. Only compare
+    // verbatim equality within one source; PostCompact owns the live wording.
+    if (previous && source !== previousSource) {
+      entry = source === 'native-transcript' ? previous : { boundaryUuid: data.boundaryUuid, trigger: data.trigger, source, summary }
+    } else {
+      if (previous?.summary.status === 'available') {
+        if (summary.status !== 'available' && summary.code !== 'SUMMARY_CONFLICT') summary = previous.summary
+        else if (summary.text !== previous.summary.text) summary = unavailable('SUMMARY_CONFLICT')
+      } else if (previous?.summary.code === 'SUMMARY_CONFLICT') summary = previous.summary
+      if (previous && previous.trigger !== 'unknown' && data.trigger !== 'unknown' && previous.trigger !== data.trigger) {
+        summary = unavailable('SUMMARY_CONFLICT')
+      }
+      entry = { boundaryUuid: data.boundaryUuid, trigger: previous?.trigger ?? data.trigger, source, summary }
     }
-    const entry = { boundaryUuid: data.boundaryUuid, trigger: previous?.trigger ?? data.trigger, summary }
     const linkKey = locator(data), links = { ...state.links }
     if (linkKey !== undefined) {
       const previousLink = own(links, linkKey)

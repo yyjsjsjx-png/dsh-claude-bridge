@@ -44,6 +44,35 @@ test('重复摘要幂等，可用正文不被普通读取失败覆盖，冲突�
   assert.deepEqual(rules.lookup(wrong, { ...card, boundaryUuid: undefined }), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
 })
 
+test('PostCompact原文优先于transcript封装文本，两种到达顺序均保留Hook且不报跨来源冲突', () => {
+  const hook = summaryRecord('boundary-a', available('## 合成Hook原文\n真实正文'), { source: 'sdk-postcompact' })
+  const transcript = summaryRecord('boundary-a', available('<synthetic-wrapper>原生存档文本</synthetic-wrapper>'),
+    { source: 'native-transcript', runId: 'run', completedAt: 100, anchorSeq: 4 })
+  for (const events of [[hook, transcript], [transcript, hook]]) {
+    const state = events.reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), hook.data.summary)
+    assert.equal(state.summaries['$boundary-a'].source, 'sdk-postcompact')
+    assert.deepEqual(rules.lookup(state, { ...card, boundaryUuid: undefined }), hook.data.summary,
+      '低优先级存档仍可提供主侧已确认的旧卡定位')
+  }
+  const withHook = rules.apply(rules.initial(), hook)
+  const lowerUnavailable = rules.apply(withHook, summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' },
+    { source: 'native-transcript' }))
+  assert.deepEqual(rules.lookup(lowerUnavailable, card), hook.data.summary)
+})
+
+test('同来源同边界正文变化仍明确冲突，旧记录和未知source按Hook来源兼容', () => {
+  for (const source of ['sdk-postcompact', 'native-transcript', undefined, 'unknown']) {
+    const first = summaryRecord('boundary-a', available('第一份同源正文'), { source })
+    const changed = summaryRecord('boundary-a', available('第二份同源正文'), { source })
+    const state = [first, changed].reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+  }
+  const legacy = summaryRecord('boundary-a', available('旧Hook原文'))
+  const lower = summaryRecord('boundary-a', available('存档封装正文'), { source: 'native-transcript' })
+  assert.deepEqual(rules.lookup([legacy, lower].reduce(rules.apply, rules.initial()), card), legacy.data.summary)
+})
+
 test('客户端按共享1MiB UTF8上限完整保留正文，超限/空白/异常事件不渲染私有内容', () => {
   const exact = 'a'.repeat(MAX_COMPACTION_SUMMARY_BYTES)
   assert.equal(rules.normalize(available(exact)).text, exact)
