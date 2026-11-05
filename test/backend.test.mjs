@@ -19,6 +19,99 @@ const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
 const nextClientVersion = `${BigInt(currentClientVersion.split('.')[0]) + 1n}.0.0`
 
+test('压缩摘要按服务器能力协商，只追加展示记录，旧服务器不发送新字段', async t => {
+  for (const supported of [false, true]) {
+    const f = await fixture(t, async options => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+        capabilities: supported ? { compactionSummaries: true } : {} }
+      assert.equal(method, 'query')
+      assert.equal(params.compactionSummaries, supported ? true : undefined)
+      if (supported) {
+        await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'system', subtype: 'compact_boundary',
+          uuid: 'confirmed-boundary', compact_metadata: { trigger: 'auto', pre_tokens: 900 } } })
+        await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'bridge_compaction_summary',
+          boundaryUuid: 'confirmed-boundary', trigger: 'auto', source: 'sdk-postcompact',
+          summary: { status: 'available', text: '合成原生摘要' } } })
+      }
+      return { status: 'completed' }
+    } }, async close() {} }))
+    f.agent.session.snapshotEvents = () => f.records.map((event, index) => ({ ...event, seq: index + 1, ignorable: event.intent?.ignorable }))
+    await f.backend.runStep(f.agent, f.decision)
+    const summaries = f.records.filter(event => event.type === 'plugin:claude-bridge/compaction-summary')
+    assert.equal(summaries.length, supported ? 1 : 0)
+    if (supported) assert.deepEqual(summaries[0].data.summary, { status: 'available', text: '合成原生摘要' })
+    assert.equal(f.records.filter(event => event.type === 'user/message').some(event => JSON.stringify(event.data).includes('合成原生摘要')), false)
+  }
+})
+
+test('新版步骤准入随工具批次切换，batch结果仍由Bridge写日志，准备快照不被新选型改写', async t => {
+  const closed = [], calls = []
+  const initial = { dispose() { closed.push('initial') } }, next = { dispose() { closed.push('next') } }
+  const selection = { provider, model: 'prepared-model', reasoningEffort: 'low' }
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    assert.equal(params.model, 'prepared-model')
+    const run = f.backend.runs.get(params.runId)
+    await run.projection.modelStart('first')
+    run.projection.committedToolCalls.set('call-a', { name: 'local_command', arguments: '{"command":"test"}' })
+    const reply = await handlers.handlers['tool.execute']({ runId: params.runId, callId: 'call-a',
+      name: 'local_command', arguments: { command: 'test' } }, { signal: new AbortController().signal })
+    assert.deepEqual(reply.content, [{ type: 'text', text: 'ok' }])
+    assert.deepEqual(closed, [])
+    await handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+    assert.deepEqual(closed, ['initial'])
+    await run.projection.modelStart('second')
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.decision.selection = selection; f.decision.toolSet = initial
+  f.agent.model = { current: () => ({ provider, model: 'later-model' }) }
+  f.agent.inbox = { nextStep: [], splice() { assert.fail('无需恢复') } }
+  f.agent.preStep = async () => ({ ...f.decision, toolSet: next, messages: [] })
+  f.ctx.tools.resolve = () => {}; f.ctx.tools.setExecutor = () => {}
+  f.ctx.tools.execute = async input => {
+    calls.push(input); assert.equal(input.toolSet, initial); assert.equal(input.log, undefined)
+    return { results: [{ callId: 'call-a', result: { content: [{ type: 'text', text: 'ok' }] } }], additionalContexts: [], concluded: false }
+  }
+  await f.backend.runStep(f.agent, f.decision)
+  assert.deepEqual(closed, ['initial', 'next']); assert.equal(calls.length, 1)
+  assert.equal(f.records.filter(event => event.type === 'tool/call').length, 1)
+  assert.equal(f.records.filter(event => event.type === 'tool/result').length, 1)
+})
+
+test('新版续步模型变化时释放新旧准入，停止SDK续推理且保留未发送输入', async t => {
+  const closed = []
+  const initial = { dispose() { closed.push('initial') } }, rejected = { dispose() { closed.push('rejected') } }
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    const run = f.backend.runs.get(params.runId)
+    await run.projection.modelStart('first')
+    return handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+  } }, async close() {} }))
+  f.decision.selection = f.selection; f.decision.toolSet = initial
+  f.agent.inbox = { nextStep: [], splice() { assert.fail('本例没有新输入') } }
+  f.agent.preStep = async () => ({ ...f.decision, selection: { provider, model: 'changed' }, toolSet: rejected, messages: [] })
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'QUERY_CONFIGURATION_CHANGED' })
+  assert.deepEqual(closed, ['initial', 'rejected'])
+})
+
+test('新版原生网页使用公开Pipeline.prepare核对权限，携带本步准入且不执行工具正文', async () => {
+  const signal = new AbortController().signal, toolSet = {}, input = { query: 'fixture' }
+  const agent = {}, run = { signal, agent, step: 1, nativeWebTools: true, nativeApprovals: new Map(),
+    settledToolIds: new Set(), toolAdmission: { current: toolSet }, projection: { committedToolCalls: new Map([
+      ['web-a', { name: 'WebSearch', step: 1, arguments: JSON.stringify(input) }],
+    ]) } }
+  let prepared = 0
+  const backend = Object.assign(Object.create(BridgeBackend.prototype), { runs: new Map([['run-a', run]]),
+    ctx: { tools: { get(name, actual, admission) { assert.equal(name, 'web_search'); assert.equal(actual, agent); assert.equal(admission, toolSet); return {} } },
+      agents: { withInitiator(_agent, action) { return action() } } }, helpers: { ToolExecutionPipeline: class {
+      async prepare(value) { prepared++; assert.equal(value.toolSet, toolSet); assert.deepEqual(value.arguments, { queries: ['fixture'] }); return { kind: 'dispatch' } }
+    } } })
+  const params = { runId: 'run-a', toolUseId: 'web-a', toolName: 'WebSearch', input }
+  assert.deepEqual(await backend.dispatchApproval(params, { signal }), { behavior: 'allow' })
+  assert.deepEqual(await backend.dispatchApproval(params, { signal }), { behavior: 'allow' })
+  assert.equal(prepared, 1)
+})
+
 test('启动诊断保留 Host 证据分级，记录未自动实测项且不连接服务器', async t => {
   const checks = [
     { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
@@ -313,6 +406,25 @@ test('/compact 忙碌、缺少原生绑定或服务器能力时不发压缩请�
   await prepareCompact(f)
   assert.match((await f.backend.compact(f.agent, signal)).text, /尚未提供/)
   assert.equal(queries, 0)
+})
+
+test('/compact 协商后将真实正文保存为折叠卡展示记录，维护回复不会注入模型历史', async t => {
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+      capabilities: { manualCompact: true, compactionSummaries: true } }
+    assert.equal(method, 'query'); assert.equal(params.compactionSummaries, true)
+    return { status: 'completed', compaction: { status: 'compacted', boundaryUuid: 'manual-boundary', preTokens: 800,
+      trigger: 'manual', summary: { status: 'available', text: '合成手动压缩摘要' } } }
+  } }, async close() {} }))
+  f.agent.session.snapshotEvents = () => f.records.map((event, seq) => ({ ...event, seq, ignorable: event.intent?.ignorable }))
+  await prepareCompact(f)
+  assert.equal((await f.backend.compact(f.agent, new AbortController().signal)).kind, 'success')
+  const card = f.records.find(event => event.type === 'plugin:claude-bridge/compaction')
+  const summary = f.records.find(event => event.type === 'plugin:claude-bridge/compaction-summary')
+  assert.equal(card.data.boundaryUuid, 'manual-boundary'); assert.equal(card.data.trigger, 'manual')
+  assert.deepEqual(summary.data.summary, { status: 'available', text: '合成手动压缩摘要' })
+  assert.equal(summary.intent.ignorable, true)
+  assert.equal(f.records.some(event => ['user/message', 'assistant/message', 'compaction/summary'].includes(event.type)), false)
 })
 
 test('/compact 取消后迟到成功不覆盖未知状态，不自动重试或声称撤销压缩', async t => {
@@ -1289,6 +1401,35 @@ function recoveryEvents(f) {
   f.agent.phase = { kind: 'idle' }
   f.agent.runMaintenance = operation => operation(new AbortController().signal)
 }
+
+test('空闲历史同步按独立能力回补摘要，重复同步幂等且旧服务端不调用新增RPC', async t => {
+  for (const supported of [false, true]) {
+    let binding, summaryReads = 0
+    const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+        capabilities: { historySync: true, ...(supported ? { compactionHistory: true } : {}) } }
+      if (method === 'history') return { status: 'ok', sessionId: binding.sdkSessionId,
+        records: [], runs: {}, nextOffset: 0, lastUuid: null, done: true }
+      assert.equal(method, 'compaction.history'); summaryReads++
+      assert.equal(params.dshSessionId, f.agent.id); assert.equal(params.sessionId, binding.sdkSessionId)
+      assert.equal(params.deviceId, binding.deviceId); assert.equal(params.projectPath, binding.projectPath)
+      return { status: 'ok', sessionId: binding.sdkSessionId, records: params.cursor ? [] : [{ boundaryUuid: 'old-boundary',
+        trigger: 'auto', preTokens: 800, summary: { status: 'available', text: '合成原生旧摘要' } }],
+      done: true, nextCursor: { fingerprint: 'fixed', offset: 1, done: true } }
+    } }, async close() {} }))
+    recoveryEvents(f); f.agent.session.id = f.agent.id; f.agent.session.snapshotEvents = () => f.records
+    binding = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+    await f.backend.state.markStarted(f.agent.id)
+    assert.equal((await f.backend.syncSession(f.agent)).status, 'ready')
+    assert.equal((await f.backend.syncSession(f.agent)).status, 'ready')
+    assert.equal(summaryReads, supported ? 2 : 0)
+    assert.equal(f.records.filter(event => event.type === 'plugin:claude-bridge/compaction-summary').length, supported ? 1 : 0)
+    if (supported) {
+      assert.equal(f.records.find(event => event.type === 'plugin:claude-bridge/compaction').data.recovered, true)
+      assert.doesNotMatch(JSON.stringify(f.backend.state.value), /合成原生旧摘要/)
+    }
+  }
+})
 
 async function interruptedTool(f, { result = false } = {}) {
   recoveryEvents(f)

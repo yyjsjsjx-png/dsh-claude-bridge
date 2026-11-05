@@ -1,6 +1,6 @@
 {
   "name": "dsh-claude-bridge",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -48,6 +48,7 @@
     "docs/getting-started.md",
     "docs/remote-service.md",
     "docs/compatibility-inventory.md",
+    "docs/rc5-regression.md",
     "docs/performance.md",
     "docs/development.md",
     "docs/coding-standards.md",

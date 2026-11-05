@@ -24,7 +24,7 @@ test('实际rc5：SDK标题与迟到fallback竞争、手动固定、安装前pen
   const ctx = new Context()
   let titles
   t.after(async () => { titles?.dispose(); await ctx.fiber.dispose(); await rm(directory, { recursive: true, force: true }) })
-  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-llm']) await ctx.plugin(await official(name), {})
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-llm', 'dsh-agent']) await ctx.plugin(await official(name), {})
   await ctx.plugin(await official('dsh-session-persistence-jsonl'), { root: join(directory, 'sessions') })
   await ctx.plugin(await official('dsh-session-title'), { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 })
   let ordinaryCalls = 0

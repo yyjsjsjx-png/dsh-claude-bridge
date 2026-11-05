@@ -2,8 +2,12 @@
 window.__ModuleLoader__.load({ id: 'dsh-claude-bridge', factory: (require) => {
 const React = require('react');
 const { createPortal } = require('react-dom');
-const { useAnchoredPosition, useDismissOnOutsidePointer } = require('@deepseek-ai/dsh-client-ui-primitives');
+const { useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText } = require('@deepseek-ai/dsh-client-ui-primitives');
 const { z } = require('zod');
+const COMPACTION_SUMMARY_RECORD = "plugin:claude-bridge/compaction-summary";
+const MAX_COMPACTION_SUMMARY_BYTES = 1048576;
+const MAX_COMPACTION_SUMMARY_JSON_BYTES = 3145728;
+const SUMMARY_CODES = ["SUMMARY_MISSING","SUMMARY_EMPTY","SUMMARY_TOO_LARGE","SUMMARY_UNPAIRED","SUMMARY_UNAVAILABLE","SUMMARY_CONFLICT"];
 
 function createStore(initial) {
   let snapshot = initial;
@@ -1513,9 +1517,161 @@ function createUsageProjectionBridge({ React }) {
   };
 }
 
-function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
+function createCompactionSummaryRules() {
+  const count = value => Number.isSafeInteger(value) && value >= 0
+  const uuid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)
+  const own = (object, key) => Object.hasOwn(object, key) ? object[key] : undefined
+  const unavailable = code => ({ status: 'unavailable', code })
+  const normalize = value => {
+    if (value?.status !== 'available') return unavailable(SUMMARY_CODES.includes(value?.code) ? value.code : 'SUMMARY_UNAVAILABLE')
+    if (typeof value.text !== 'string') return unavailable('SUMMARY_MISSING')
+    const encoder = new TextEncoder()
+    if (encoder.encode(value.text).byteLength > MAX_COMPACTION_SUMMARY_BYTES
+      || encoder.encode(JSON.stringify(value.text)).byteLength > MAX_COMPACTION_SUMMARY_JSON_BYTES) return unavailable('SUMMARY_TOO_LARGE')
+    if (!value.text.trim()) return unavailable('SUMMARY_EMPTY')
+    return { status: 'available', text: value.text }
+  }
+  const locator = data => typeof data.runId === 'string' && data.runId.length > 0
+    && count(data.completedAt) && count(data.anchorSeq ?? data.seq)
+    ? JSON.stringify([data.runId, data.completedAt, data.anchorSeq ?? data.seq]) : undefined
+  const initial = () => ({ summaries: {}, links: {} })
+  function apply(state, event) {
+    if (state === null || event.type !== COMPACTION_SUMMARY_RECORD || event.ignorable !== true) return state
+    const data = event.data
+    if (data?.version !== 1 || !uuid(data.boundaryUuid) || !['auto', 'manual', 'unknown'].includes(data.trigger)) return state
+    const key = `$${data.boundaryUuid}`, previous = own(state.summaries, key)
+    const source = data.source === 'native-transcript' ? 'native-transcript' : 'sdk-postcompact'
+    const previousSource = previous?.source === 'native-transcript' ? 'native-transcript' : 'sdk-postcompact'
+    let summary = normalize(data.summary)
+    let entry
+    // The native transcript can wrap or transform Hook text. Only compare
+    // verbatim equality within one source; PostCompact owns the live wording.
+    if (previous && source !== previousSource) {
+      const candidate = { boundaryUuid: data.boundaryUuid, trigger: data.trigger, source, summary }
+      if (source === 'native-transcript') {
+        // Missing/unpaired Hook text is not evidence against a verified archive
+        // summary. An explicit Hook conflict remains an authoritative stop.
+        entry = previous.summary.status === 'available' || previous.summary.code === 'SUMMARY_CONFLICT'
+          || summary.status !== 'available' ? previous : candidate
+      } else {
+        entry = summary.status === 'available' || summary.code === 'SUMMARY_CONFLICT'
+          || previous.summary.status !== 'available' ? candidate : previous
+      }
+    } else {
+      if (previous?.summary.status === 'available') {
+        if (summary.status !== 'available' && summary.code !== 'SUMMARY_CONFLICT') summary = previous.summary
+        else if (summary.text !== previous.summary.text) summary = unavailable('SUMMARY_CONFLICT')
+      } else if (previous?.summary.code === 'SUMMARY_CONFLICT') summary = previous.summary
+      if (previous && previous.trigger !== 'unknown' && data.trigger !== 'unknown' && previous.trigger !== data.trigger) {
+        summary = unavailable('SUMMARY_CONFLICT')
+      }
+      entry = { boundaryUuid: data.boundaryUuid, trigger: previous?.trigger ?? data.trigger, source, summary }
+    }
+    const linkKey = locator(data), links = { ...state.links }
+    if (linkKey !== undefined) {
+      const previousLink = own(links, linkKey)
+      links[linkKey] = previousLink === undefined || previousLink === data.boundaryUuid ? data.boundaryUuid : null
+    }
+    return { summaries: { ...state.summaries, [key]: entry }, links }
+  }
+  function lookup(state, card) {
+    if (!state) return undefined
+    const linkKey = locator(card)
+    const boundaryUuid = uuid(card.boundaryUuid) ? card.boundaryUuid
+      : linkKey === undefined ? undefined : own(state.links, linkKey)
+    if (boundaryUuid === null || card.boundaryConflict) return unavailable('SUMMARY_CONFLICT')
+    if (!uuid(boundaryUuid)) return undefined
+    const entry = own(state.summaries, `$${boundaryUuid}`)
+    if (!entry) return undefined
+    if (card.trigger !== 'unknown' && entry.trigger !== 'unknown' && card.trigger !== entry.trigger) return unavailable('SUMMARY_CONFLICT')
+    return normalize(entry.summary)
+  }
+  return { initial, apply, lookup, normalize }
+}
+
+function createCompactionHistory({ React, MarkdownText, summaryRules }) {
+  const kind = 'claude-bridge-compaction';
+  const record = 'plugin:claude-bridge/compaction';
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  const uuid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+  const markdownLabels = { code: { copyLabel: '复制', copiedLabel: '已复制',
+    toolbarLabels: { codeLabel: '代码', wrapLabel: '换行', unwrapLabel: '取消换行' } }, footnotes: '脚注' };
+  const unavailable = { SUMMARY_MISSING: '本次压缩没有返回摘要正文。', SUMMARY_EMPTY: '本次压缩返回的摘要正文为空。',
+    SUMMARY_TOO_LARGE: '摘要超过显示或传输上限，未截断或展示。', SUMMARY_UNPAIRED: '摘要未能与本次压缩边界可靠对应。',
+    SUMMARY_UNAVAILABLE: '原生摘要读取失败或暂不可用。', SUMMARY_CONFLICT: '同一压缩边界的摘要记录冲突，未展示正文。' };
+  const dataOf = event => {
+    const progress = event.data;
+    // Older clients persisted the last boundary repeatedly during sampling.
+    // preTokens is boundary evidence; a bare status:null is insufficient.
+    if (event.type === 'plugin:claude-bridge/progress' && event.ignorable === true
+      && progress?.version === 1 && typeof progress.runId === 'string'
+      && progress.compaction?.status === 'completed' && count(progress.compaction.preTokens)
+      && count(progress.compaction.completedAt)) {
+      return { version: 1, runId: progress.runId, ...progress.compaction };
+    }
+    return event.type === record ? event.data : undefined;
+  };
+  const valid = event => {
+    const data = dataOf(event);
+    return event.ignorable === true && data?.version === 1 && typeof data.runId === 'string'
+      && ['auto', 'manual', 'unknown'].includes(data.trigger) && count(data.completedAt)
+      && ['preTokens', 'postTokens', 'durationMs'].every(key => data[key] === undefined || count(data[key]));
+  };
+  function CompactionMarker({ node, useProjection }) {
+    const data = node.data;
+    const state = typeof useProjection === 'function' ? useProjection('claudeBridgeCompactionSummaries') : undefined;
+    const summary = summaryRules?.lookup(state, data);
+    const [expanded, setExpanded] = typeof React.useState === 'function' ? React.useState(false) : [false, () => {}];
+    const title = data.trigger === 'auto' ? '自动压缩已完成'
+      : data.trigger === 'manual' ? '手动压缩已完成' : '上下文压缩已完成';
+    const label = data.recovered ? `${title} · 历史补录` : title;
+    const details = [];
+    if (count(data.preTokens)) details.push(`压缩前 ${data.preTokens.toLocaleString()} tokens`);
+    if (count(data.postTokens)) details.push(`压缩后 ${data.postTokens.toLocaleString()} tokens`);
+    if (count(data.durationMs)) details.push(`耗时 ${(data.durationMs / 1000).toFixed(1)} 秒`);
+    const message = summary?.status === 'unavailable' ? unavailable[summary.code] ?? unavailable.SUMMARY_UNAVAILABLE
+      : state ? data.boundaryUuid ? '原生压缩摘要尚未送达。' : '旧记录尚未找到可可靠对应的原生摘要。'
+        : 'Claude 原生压缩已完成。当前接口未提供压缩摘要正文。';
+    return React.createElement('details', { onToggle: event => setExpanded(event.currentTarget.open), style: { padding: '8px 0',
+      color: 'var(--dsw-alias-text-secondary, #777)', fontSize: '13px' } },
+    React.createElement('summary', { style: { cursor: 'pointer' } }, label),
+    React.createElement('div', { style: { padding: '8px 16px', whiteSpace: 'pre-wrap' } },
+      details.length ? `${details.join(' · ')}\n` : '', summary?.status === 'available'
+        ? expanded ? MarkdownText ? React.createElement(MarkdownText, { text: summary.text, labels: markdownLabels })
+          : React.createElement('pre', null, summary.text) : null : message));
+  }
+  return function installCompactionHistory(ctx) {
+    const disposeEvent = ctx.uiConversation.events.register({
+      kind, target: 'chat',
+      match: event => valid(event) ? { id: `${dataOf(event).runId}:${dataOf(event).completedAt}`, role: 'start' } : null,
+      start: (_context, match) => ({ trigger: dataOf(match.event).trigger,
+        runId: dataOf(match.event).runId, completedAt: dataOf(match.event).completedAt,
+        ...(dataOf(match.event).recovered === true ? { recovered: true } : {}),
+        seq: count(dataOf(match.event).anchorSeq) ? dataOf(match.event).anchorSeq : match.event.seq,
+        ...(uuid(dataOf(match.event).boundaryUuid) ? { boundaryUuid: dataOf(match.event).boundaryUuid } : {}),
+        ...Object.fromEntries(['preTokens', 'postTokens', 'durationMs']
+          .filter(key => count(dataOf(match.event)[key])).map(key => [key, dataOf(match.event)[key]])) }),
+      update: (context, match) => {
+        const boundaryUuid = dataOf(match.event)?.boundaryUuid;
+        if (!uuid(boundaryUuid)) return context.state;
+        if (context.state.boundaryUuid && context.state.boundaryUuid !== boundaryUuid) return { ...context.state, boundaryConflict: true };
+        return { ...context.state, boundaryUuid };
+      },
+      buildViewNode: context => context.state === undefined ? null : {
+        key: context.key, kind, id: context.id, target: 'chat', anchorSeq: context.state.seq,
+        location: context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' },
+        visibility: 'visible', groupTree: 'turn', data: context.state,
+      },
+    });
+    const disposeSlot = ctx.slots.register({ name: 'conversation.chat.node', key: kind }, CompactionMarker);
+    return () => { disposeSlot(); disposeEvent(); };
+  };
+}
+
+function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming,
+  createCompactionHistory, createCompactionSummaryRules }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -1540,8 +1696,9 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
   const originalForEvent = registry.forEvent;
   const wrappedForEvent = function(type) {
     const routes = originalForEvent.call(this, repairs[type] ?? type);
-    const kind = repairs[type] === 'assistant/message' ? 'assistant-step' : 'tool-call';
-    return repairs[type] ? new Set([...routes].filter(route => route.definition.kind === kind).map(({ definition, match }) => ({
+    const kinds = repairs[type] === 'assistant/message' ? ['assistant-step', 'process-evidence']
+      : ['tool-call', 'process-evidence'];
+    return repairs[type] ? new Set([...routes].filter(route => kinds.includes(route.definition.kind)).map(({ definition, match }) => ({
       definition, match: event => match(eventView(event)),
     }))) : routes;
   };
@@ -1549,18 +1706,20 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
   const reconcile = () => {
     let changed = false;
     for (const definition of registry.entries()) {
-      if (!['assistant-step', 'tool-call'].includes(definition.kind) || installed.has(definition)) continue;
-      if (typeof definition.buildViewNode !== 'function' || typeof definition.update !== 'function') {
+      if (!['assistant-step', 'tool-call', 'process-evidence'].includes(definition.kind) || installed.has(definition)) continue;
+      if (typeof definition.update !== 'function' || definition.kind !== 'process-evidence'
+        && typeof definition.buildViewNode !== 'function') {
         throw new Error('远程会话插件无法加载：DSH 消息展示接口不兼容。');
       }
       const methods = new Map();
-      for (const name of ['update', 'buildViewNode', 'buildLocationData', 'publication']) {
+      for (const name of ['start', 'update', 'buildViewNode', 'buildLocationData', 'publication']) {
         const original = definition[name];
         if (typeof original !== 'function') continue;
         const wrapped = function(context, ...args) {
           if (name === 'publication') return original.call(this, matchView(context), ...args);
           context = contextView(context);
-          const result = original.call(this, context, ...(name === 'update' ? args.map(matchView) : args));
+          const result = original.call(this, context, ...(['start', 'update'].includes(name)
+            ? args.map((arg, index) => index === 0 ? matchView(arg) : arg) : args));
           if (name !== 'buildViewNode' || definition.kind !== 'assistant-step' || !result
             || !context.matches.some(({ event }) => event.type === 'assistant/message'
               && (event.data.message.source?.provider === 'claude-sdk-remote'
@@ -1573,8 +1732,14 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
           }
           const start = context.start?.event.type === 'step/start' ? context.start.event
             : result.location?.kind === 'step' ? result.location.step.start : undefined;
-          const first = context.matches.find(({ event }) => event.type === 'assistant/message');
-          const anchor = start ? start.seq + 0.25 : first?.event.seq;
+          // A real message or stream owns its chronological position. Moving it
+          // back to step/start could cross a preceding SDK compaction boundary.
+          // Only a display repair without original evidence needs that fallback.
+          const first = context.matches.find(({ event }) => event.type === 'assistant/message'
+            && event.ignorable !== true);
+          const streamed = context.matches.some(({ event }) => event.type === 'assistant/live-chunk');
+          const anchor = first ? Math.min(result.anchorSeq, first.event.seq)
+            : streamed ? result.anchorSeq : start ? start.seq + 0.25 : result.anchorSeq;
           return Number.isFinite(anchor) && result.anchorSeq !== anchor ? { ...result, anchorSeq: anchor } : result;
         };
         definition[name] = wrapped;
@@ -1604,6 +1769,8 @@ exports.installUsageProjection = createUsageProjectionBridge({ React, getClientT
 exports.apply = async function apply(ctx) {
   ctx.inject(['uiConversation'], ctx => {
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
+    if (ctx.uiConversation) ctx.effect(() => createCompactionHistory({ React, MarkdownText,
+      summaryRules: createCompactionSummaryRules() })(ctx), '远程会话压缩记录');
   });
   const json = { mode: 'src-json' };
   const descriptor = (method, parameters = []) => ({
@@ -1742,6 +1909,6 @@ exports.apply = async function apply(ctx) {
 return exports;
 }
 
-return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
-  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createClientReceiveTiming, createUsageProjectionBridge });
+return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText,
+  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createClientReceiveTiming, createUsageProjectionBridge, createCompactionSummaryRules, createCompactionHistory });
 } });

@@ -1,10 +1,11 @@
 import './compat/check-host.mjs'
 import { resolveDshModule } from './compat/resolve-dsh-module.mjs'
 import { DshCompatibilityError } from './compat/host-contract.mjs'
-import { AgentLoop as CompatAgentLoop } from './compat/agent-loop.mjs'
 import { makeSessionRoutedAgentLoop } from './session-loop-routing.mjs'
 
 const { AgentLoop: NativeAgentLoop } = await import(resolveDshModule('@deepseek-ai/dsh-agent-loop'))
+const { AgentLoop: CompatAgentLoop } = await import(typeof NativeAgentLoop.prototype.prepare === 'function'
+  ? './compat/agent-loop.mjs' : './compat/desktop-022/agent-loop.mjs')
 const { Entry, interpolate } = await import(resolveDshModule('@deepseek-ai/cordis-plugin-loader'))
 export const RoutedAgentLoop = makeSessionRoutedAgentLoop(NativeAgentLoop, CompatAgentLoop)
 

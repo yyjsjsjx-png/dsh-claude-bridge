@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { adaptAgentLoop } from '../scripts/prepare-dsh-compat.mjs';
+import { DESKTOP_022_PROFILE } from '../scripts/prepare-dsh-compat-022.mjs';
 
 test('兼容层仅为远程 Agent 闭合当前 step，其他会话仍闭合原始 step', async () => {
   const original = await readFile(new URL('../plugin/compat/agent-loop.original.mjs', import.meta.url));
@@ -35,4 +36,16 @@ test('兼容层仅为远程 Agent 闭合当前 step，其他会话仍闭合原�
   assert.equal(remote._bridgeStepOpen, false);
   close.call(remote, 2, 1);
   assert.deepEqual(calls, []);
+});
+
+test('新版官方副本可从准确来源重建，只替换构造与远程step闭合点', async () => {
+  const root = new URL('../plugin/compat/desktop-022/', import.meta.url);
+  const original = await readFile(new URL('agent-loop.original.mjs', root));
+  const emitted = await readFile(new URL('agent-loop.mjs', root));
+  const provenance = JSON.parse(await readFile(new URL('provenance.json', root), 'utf8'));
+  assert.deepEqual(adaptAgentLoop(original, provenance.officialImports, DESKTOP_022_PROFILE), emitted);
+  assert.equal(emitted.toString().split('/* bridge-step-end-start */').length, 2);
+  assert.ok(emitted.toString().includes('session, projections, lastTurn)'));
+  const altered = Buffer.from(original); altered[0] ^= 1;
+  assert.throws(() => adaptAgentLoop(altered, provenance.officialImports, DESKTOP_022_PROFILE), /SHA-256/);
 });

@@ -10,7 +10,7 @@ import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 import { localHistory, restoreAssistant, assistantIdentity, knownToolResult, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
 import { nativeChat } from './fixtures/native-chat.mjs'
 import { strictSession } from './fixtures/native-persistence.mjs'
-import { HISTORY_TOOL_RESULT, appendHistoryRecord } from '../src/history-records.mjs'
+import { HISTORY_TOOL_RESULT, HISTORY_ASSISTANT, appendHistoryRecord } from '../src/history-records.mjs'
 import { repairBridgeHistories } from '../scripts/repair-history.mjs'
 import { createClient } from '../plugin/ui/client/entry.mjs'
 import { createUsageProjectionBridge } from '../plugin/ui/client/usage-projection.mjs'
@@ -149,6 +149,61 @@ test('实际 rc5 展示：冷回放与实时追加的最终正文在折叠模式
       }
     }
   }
+})
+
+test('实际原生展示：新版保留全部回复和仅最终回复两种折叠偏好，旧接口保持原规则', { skip: !available }, async () => {
+  const { Session, SESSION_FORMAT_VERSION } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const helpers = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
+  const session = Session.create('folded-replies', undefined, { version: SESSION_FORMAT_VERSION,
+    id: 'folded-replies', createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+  const append = (step, content) => session.append('assistant/message', { turn: 1, step, stream: [],
+    message: helpers.createAssistantMessage({ content, source: { provider: 'claude-sdk-remote', model: 'fixture' } }) },
+  { surfaceOp: 'append' })
+  session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
+  append(1, [{ type: 'reasoning', text: '合成早期思考' }, { type: 'text', text: '合成早期回复' },
+    { type: 'tool-call', id: 'folded-tool', name: 'fixture', arguments: '{}' }])
+  session.append('tool/call', { turn: 1, step: 1, callId: 'folded-tool', name: 'fixture', arguments: '{}' })
+  session.append('step/end', { turn: 1, step: 1 }); session.append('step/start', { turn: 1, step: 2 })
+  append(2, [{ type: 'text', text: '合成最终回复' }])
+  session.append('step/end', { turn: 1, step: 2 }); session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const view = await nativeChat()
+  createClient({ createUsageProjectionBridge }).installTranscriptOrder(view.ctx)
+  view.replace(session.snapshotEvents())
+  const early = view.order().find(node => node.kind === 'assistant-step' && node.data.step === 1)
+  const final = view.order().find(node => node.kind === 'assistant-step' && node.data.step === 2)
+  const tool = view.order().find(node => node.kind === 'tool-call')
+  for (const foldedReplies of ['all', 'final']) {
+    assert.equal(view.seat(early, { foldedReplies, groupPart: 'response' })['data-turn-process-hidden'],
+      view.supportsFoldedReplies && foldedReplies === 'all' ? undefined : true)
+    assert.equal(view.seat(early, { foldedReplies, groupPart: 'reasoning' })['data-turn-process-hidden'], true)
+    assert.equal(view.seat(final, { foldedReplies, groupPart: 'response' })['data-turn-process-hidden'], undefined)
+    assert.equal(view.seat(tool, { foldedReplies })['data-turn-process-hidden'], true)
+  }
+})
+
+test('实际原生恢复：显示修复可供新版process-evidence读取，旧接口无需该节点', { skip: !available }, async () => {
+  const { Session, SESSION_FORMAT_VERSION, appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const helpers = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
+  const session = Session.create('repaired-process', undefined, { version: SESSION_FORMAT_VERSION,
+    id: 'repaired-process', createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+  session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
+  appendPluginRecord(session, HISTORY_ASSISTANT, { turn: 1, step: 1, stream: [],
+    message: helpers.createAssistantMessage({ content: [{ type: 'reasoning', text: '合成恢复工作' }],
+      source: { provider: 'claude-sdk-remote', model: 'fixture' } }) })
+  session.append('step/end', { turn: 1, step: 1 }); session.append('step/start', { turn: 1, step: 2 })
+  session.append('user/message', helpers.createUserMessage({ content: [{ type: 'text', text: '合成下一步输入' }],
+    source: { kind: 'user' } }), { surfaceOp: 'append' })
+  const view = await nativeChat()
+  createClient({ createUsageProjectionBridge }).installTranscriptOrder(view.ctx)
+  let precedingEvidence
+  view.ctx.uiConversation.events.register({ kind: 'synthetic-evidence-reader',
+    match: event => event.type === 'user/message' ? { id: String(event.seq), role: 'start' } : null,
+    start(_context, _match, reader) { precedingEvidence = reader.previous('process-evidence'); return {} },
+    update: context => context.state,
+  })
+  view.replace(session.snapshotEvents())
+  assert.equal(precedingEvidence?.state.turn, view.supportsProcessEvidence ? 1 : undefined)
+  assert.deepEqual(session.surface.nodes.map(seq => session.eventAt(seq).type), ['user/message'])
 })
 
 test('原生离线迁移：旧损坏历史先备份、完整校验并原子写回，再次更新不改写', { skip: !available }, async t => {

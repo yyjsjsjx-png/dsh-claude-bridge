@@ -5,6 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { HOST_FUNCTIONS, DshCompatibilityError, assertHostContract } from './host-contract.mjs';
 
 const ALLOWED = new Set(Object.keys(HOST_FUNCTIONS));
+const TOOL_PIPELINE = '@deepseek-ai/dsh-tools/pipeline';
+ALLOWED.add(TOOL_PIPELINE);
 
 let cached;
 
@@ -52,12 +54,14 @@ export function resolveDshModule(name) {
   const installed = installation();
   const existing = installed.urls.get(name);
   if (existing !== undefined) return existing;
-  const dir = join(installed.base, ...name.split('/'));
-  const manifest = readManifest(join(dir, 'package.json'), name, installed.version);
+  const packageName = name === TOOL_PIPELINE ? '@deepseek-ai/dsh-tools' : name;
+  const dir = join(installed.base, ...packageName.split('/'));
+  const manifest = readManifest(join(dir, 'package.json'), packageName, installed.version);
   const exports = manifest.exports;
-  const root = typeof exports === 'object' && exports !== null && Object.hasOwn(exports, '.') ? exports['.'] : exports;
+  const root = name === TOOL_PIPELINE ? exports?.['./pipeline']
+    : typeof exports === 'object' && exports !== null && Object.hasOwn(exports, '.') ? exports['.'] : exports;
   const entry = esmEntry(root) ?? (exports === undefined && manifest.type === 'module' ? manifest.module ?? manifest.main : undefined);
-  if (manifest.name !== name || typeof entry !== 'string'
+  if (manifest.name !== packageName || typeof entry !== 'string'
     || !/^\.\/[a-zA-Z0-9_./-]+$/u.test(entry) || entry.split('/').includes('..')) {
     throw new DshCompatibilityError(installed.version, `${name} 的 ESM 导出不受支持`);
   }
@@ -75,15 +79,21 @@ export function assertDshCompatibility() {
   const installed = installation();
   return installed.compatibility ??= (async () => {
     const modules = {};
-    for (const name of ALLOWED) {
+    for (const name of Object.keys(HOST_FUNCTIONS)) {
       try { modules[name] = await import(resolveDshModule(name)); }
       catch (error) {
         if (error instanceof DshCompatibilityError) throw error;
         throw new DshCompatibilityError(installed.version, `无法加载 ${name}`, { cause: error });
       }
     }
+    if (typeof modules['@deepseek-ai/dsh-tools'].ToolsService?.prototype?.resolve === 'function') {
+      const pipeline = await import(resolveDshModule(TOOL_PIPELINE));
+      if (typeof pipeline.ToolExecutionPipeline?.prototype?.prepare !== 'function') {
+        throw new DshCompatibilityError(installed.version, '缺少工具准入管道');
+      }
+    }
     const checks = assertHostContract(modules, installed.version);
-    return Object.freeze({ version: installed.version, baselineVersion: '0.2.1-rc.5', status: 'compatible',
+    return Object.freeze({ version: installed.version, baselineVersion: '0.2.2-rc.1', status: 'compatible',
       // Startup probes cannot attest to a desktop interaction or an upstream SDK run.
       checks: Object.freeze([...checks,
         { id: 'desktop-acceptance', evidence: 'desktop', status: 'not-run' },

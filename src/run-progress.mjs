@@ -58,6 +58,7 @@ export function createRunProgressReporter({ runId, model, isActive, readStatus,
         for (const key of ['preTokens', 'postTokens', 'durationMs']) if (count(event[key])) compaction[key] = event[key]
         write({ compaction })
         resume()
+        return compaction
       }
     },
     close(context) {

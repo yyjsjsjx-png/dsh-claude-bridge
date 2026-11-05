@@ -62,7 +62,7 @@ async function readExactly(handle, position, size) {
 }
 
 /** Read the bounded ASAR pickle header and selected regular files only. */
-async function readArchiveEntries(archivePath, wanted) {
+export async function readArchiveEntries(archivePath, wanted) {
   const handle = await open(archivePath, 'r');
   try {
     const stat = await handle.stat();
@@ -105,25 +105,28 @@ async function readArchiveEntries(archivePath, wanted) {
 }
 
 /** Verify the exact installed bundle and apply the two reviewed loop seams. */
-export function adaptAgentLoop(source, officialImports) {
+export function adaptAgentLoop(source, officialImports, profile = {}) {
   const bytes = Buffer.isBuffer(source) ? source : Buffer.from(source);
-  if (digest(bytes) !== UPSTREAM_SHA256) {
+  if (digest(bytes) !== (profile.sourceSha256 ?? UPSTREAM_SHA256)) {
     throw new Error('DSH AgentLoop SHA-256 不匹配，拒绝生成兼容包。');
   }
   const original = bytes.toString('utf8');
-  const first = original.indexOf(CONSTRUCTION);
-  if (first < 0 || original.indexOf(CONSTRUCTION, first + CONSTRUCTION.length) >= 0
+  const construction = profile.construction ?? CONSTRUCTION;
+  const replacement = profile.replacement ?? REPLACEMENT;
+  const first = original.indexOf(construction);
+  if (first < 0 || original.indexOf(construction, first + construction.length) >= 0
     || original.includes(IMPORT)) {
     throw new Error('DSH AgentLoop 的构造点不唯一或已被修改。');
   }
-  const stepEnd = original.indexOf(STEP_END);
-  if (stepEnd < 0 || original.indexOf(STEP_END, stepEnd + STEP_END.length) >= 0
+  const closing = profile.stepEnd ?? STEP_END;
+  const stepEnd = original.indexOf(closing);
+  if (stepEnd < 0 || original.indexOf(closing, stepEnd + closing.length) >= 0
     || original.includes('/* bridge-step-end-start */')) {
     throw new Error('DSH AgentLoop 的 step/end 闭合点不唯一或已被修改。');
   }
-  let adapted = COMPATIBILITY_IMPORT + RESOLVER_IMPORT + IMPORT + original.slice(0, first) + REPLACEMENT
-    + original.slice(first + CONSTRUCTION.length);
-  adapted = adapted.replace(STEP_END, STEP_END_REPLACEMENT);
+  let adapted = (profile.imports ?? (COMPATIBILITY_IMPORT + RESOLVER_IMPORT + IMPORT))
+    + original.slice(0, first) + replacement + original.slice(first + construction.length);
+  adapted = adapted.replace(closing, STEP_END_REPLACEMENT);
   if (officialImports === null || typeof officialImports !== 'object') {
     throw new Error('缺少安装版 DSH 模块映射。');
   }

@@ -1,4 +1,4 @@
-name: rc.5 regression
+name: desktop regression
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rc5-${{ github.workflow }}-${{ github.ref }}
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -34,15 +34,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rc5-node-results
+          name: desktop-node-results
           path: regression-results
           if-no-files-found: warn
           retention-days: 14
 
-  rc5-native:
-    name: Windows / real rc.5 Electron ASAR
+  native:
+    name: Windows / ${{ matrix.desktop-version }} Electron ASAR
     runs-on: windows-2025
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        desktop-version: ['0.2.1-rc.5', '0.2.2-rc.1']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,14 +56,14 @@ jobs:
           node-version: '24.22.2'
           package-manager-cache: false
       - name: Extract the fixed official desktop using existing 7zip
-        run: node scripts/prepare-ci-dsh.mjs --report regression-results/ci-target.json
+        run: node scripts/prepare-ci-dsh.mjs --desktop-version ${{ matrix.desktop-version }} --report regression-results/ci-target.json
       - name: Run native tests with zero skips
-        run: node scripts/run-regression.mjs --layer native --output regression-results/native
+        run: node scripts/run-regression.mjs --layer native --desktop-version ${{ matrix.desktop-version }} --output regression-results/native
       - name: Upload native preflight and test report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rc5-native-results
+          name: desktop-native-${{ matrix.desktop-version }}-results
           path: regression-results
           if-no-files-found: warn
           retention-days: 14

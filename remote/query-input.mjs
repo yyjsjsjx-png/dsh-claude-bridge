@@ -8,7 +8,7 @@ const MAX_TOOLS = 80
 export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
 const MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp'])
-const QUERY_KEYS = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences', 'promptCacheTtl', 'nativeWebTools', 'nativeWebResultPages'])
+const QUERY_KEYS = new Set(['runId', 'deviceId', 'dshSessionId', 'sessionId', 'resume', 'prompt', 'projectPath', 'systemPrompt', 'instructions', 'tools', 'model', 'effort', 'maxTurns', 'maxBudgetUsd', 'action', 'contextPreferences', 'promptCacheTtl', 'nativeWebTools', 'nativeWebResultPages', 'compactionSummaries'])
 
 /**
  * Validate the request shape that must hold before a run is registered.
@@ -21,6 +21,9 @@ export function validateQueryEnvelope(params) {
   }
   if (params.action !== undefined && params.action !== 'compact') throw new WorkerError('UNSUPPORTED_ACTION', '不支持该会话操作')
   const compact = params.action === 'compact'
+  if (params.compactionSummaries !== undefined && params.compactionSummaries !== true) {
+    throw new WorkerError('INVALID_COMPACTION_SUMMARIES', '压缩摘要能力参数无效')
+  }
   if (params.nativeWebTools !== undefined && (compact || params.nativeWebTools !== true)) {
     throw new WorkerError('INVALID_WEB_TOOLS', '原生网页工具仅支持普通远程请求')
   }

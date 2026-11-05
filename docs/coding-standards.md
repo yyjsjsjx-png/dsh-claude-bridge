@@ -10,7 +10,7 @@
 | `remote/` | VPS 上的父服务与每设备 worker | WebSocket 服务、worker 生命周期、SDK 调用、观测账本与额度采样 |
 | `plugin/` | DSH 插件入口、预设、兼容层、UI | 与 DSH 原生接口对接；UI 源码在 `plugin/ui/client/*.mjs` |
 | `scripts/` | 本机或 CI | 构建、更新、隔离启动、回归和只读查询工具 |
-| `test/` | 本机 Node 与 CI | `node:test` 用例；原生 rc.5 用例在 CI 的 Windows Electron 中执行 |
+| `test/` | 本机 Node 与 CI | `node:test` 用例；0.2.2-rc.1 与 0.2.1-rc.5 原生用例在 CI 的 Windows Electron 中执行 |
 
 - `src/` 不得依赖 `remote/`。两端共享的纯规则（如 schema、计量换算）放在 `src/`，由 `remote/` 引用。
 - `remote/` 模块不得读取客户端用户数据；`src/` 不得假设 VPS 文件系统路径。
@@ -22,6 +22,7 @@
 | `plugin/ui/client.js` | `plugin/ui/client/*.mjs` | 改源码后运行 `node scripts/build-client.mjs`，提交前用 `--check` 确认一致 |
 | `plugin/index.mjs` | `plugin/index.mts` | 改 `.mts` 后运行 `node scripts/build-plugin.mjs` |
 | `plugin/compat/agent-loop.original.mjs`、`plugin/compat/provenance.json` | 官方 rc.5 包 | 只由 `scripts/prepare-dsh-compat.mjs` 生成，不手改 |
+| `plugin/compat/desktop-022/agent-loop.original.mjs`、同目录 `provenance.json` | 官方 0.2.2-rc.1 包 | 只由 `scripts/prepare-dsh-compat-022.mjs` 生成，不手改 |
 | `plugin/compat/agent-loop.mjs` 等兼容副本 | 官方源码的受控改写 | 只做有原生回归覆盖的最小改动；不顺手重构，不混用 master 接口 |
 | `plugin/session-client/client.js` | DSH 上游产物 | 视为第三方代码，不重构 |
 
@@ -72,7 +73,7 @@
   - 相关用例：`node --test test/<相关>.test.mjs`；
   - 改动跨模块或属于重构：`node --test test/*.test.mjs`，失败数为 0，通过数不得少于基线；
   - 改动 UI 源码：`node scripts/build-client.mjs --check`。
-- 原生 rc.5 行为以 CI 的 Windows Electron 作业为准；本机未运行的层要在交付说明中写明。不得为测试安装浏览器、容器或新工具链，不得调用真实模型做常规回归。
+- 原生行为以对应桌面基线的 Windows Electron 检查为准，CI 分别运行 0.2.2-rc.1 与 0.2.1-rc.5；本机未运行的层要在交付说明中写明。不得为测试安装浏览器、容器或新工具链，不得调用真实模型做常规回归。
 
 ## 9. 提交与 PR
 

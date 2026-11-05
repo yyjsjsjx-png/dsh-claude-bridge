@@ -82,12 +82,14 @@ export async function nativeChat() {
   const assembler = new native.ConversationNodeAssembler(ctx.uiConversation.events, ctx.uiConversation.views, ctx.uiConversation.groups)
   assembler.activateTarget('chat')
   return { ctx, assembler,
+    supportsFoldedReplies: native.presentationPolicyFor('standard').foldedReplies !== undefined,
+    supportsProcessEvidence: ctx.uiConversation.events.entries().some(item => item.kind === 'process-evidence'),
     order() {
       assembler.flush()
       const snapshot = assembler.snapshot('chat')
       return snapshot.order.map(key => snapshot.nodes.get(key))
     },
-    seat(node, { mode = 'standard', groupPart, open = false } = {}) {
+    seat(node, { mode = 'standard', groupPart, open = false, foldedReplies } = {}) {
       assembler.flush()
       const snapshot = assembler.snapshot('chat')
       const turnOf = item => ['step', 'turn'].includes(item?.location.kind) ? item.location.turn.turn : undefined
@@ -97,7 +99,7 @@ export async function nativeChat() {
       }, snapshot.nodes)
       return native.ChatNodeSeat({ nodeKey: node.key, groupPart,
         useChatNode: () => node, useChatNodeProcess: () => process,
-        usePresentation: select => select(native.presentationPolicyFor(mode)),
+        usePresentation: select => select(native.presentationPolicyFor(mode, 'completion', foldedReplies)),
         useStore: select => select({ turnProcesses: process === undefined ? [] : [
           { turn, answerStep: process.spec.answerStep ?? 0, collapsed: !open },
         ] }),

@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 import { strictSession } from './fixtures/native-persistence.mjs'
+import { executeNativeTool } from './fixtures/native-tools.mjs'
 
 const native = Boolean(process.platform === 'win32' && process.versions.electron
   && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
@@ -42,6 +43,7 @@ test('实际 rc5 Windows：PowerShell 执行、审批、超时、取消及原生
       ['dsh-user-approval', { policy: 'ask' }],
       ['dsh-tool-pwsh', { enableRunInBackground: false, promoteOnTimeout: false }],
     ]) await ctx.plugin(await official(name), config)
+    if (typeof ctx.tools.setExecutor === 'function') await ctx.plugin(await official('dsh-tool-executor-native'), {})
 
     const header = { version: SESSION_FORMAT_VERSION, id: 'native-shell', createdAt: 0,
       isSeeded: false, delegationDepth: 0, agentPreset: 'claude-sdk-remote', cwd: workdir }
@@ -72,7 +74,7 @@ test('实际 rc5 Windows：PowerShell 执行、审批、超时、取消及原生
         content: [{ type: 'tool-call', id: callId, name: 'pwsh', arguments: JSON.stringify(args) }],
       }) }, { surfaceOp: 'append' })
       const call = session.append('tool/call', { turn: 1, step, callId, name: 'pwsh', arguments: JSON.stringify(args) })
-      const result = await ctx.tools.execute({ name: 'pwsh', callId, arguments: args, signal, agent })
+      const result = await executeNativeTool(ctx, { name: 'pwsh', callId, arguments: args, signal, agent })
       session.append('tool/result', { turn: 1, step,
         message: createToolResultMessage({ callId, content: result.content, isError: result.isError }),
         ...(result.meta === undefined ? {} : { meta: result.meta }),

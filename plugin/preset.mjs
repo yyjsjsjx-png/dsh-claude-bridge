@@ -1,5 +1,6 @@
 import { CLAUDE_PRESET } from './policy.mjs';
 import { createLegacyV024RemoteClaudePreset } from './presets/legacy-v024.mjs';
+import { remoteSubagentConfig } from './presets/subagent-capabilities.mjs';
 
 /** Explicit limits that are independent of a particular request's tool list. */
 export const REMOTE_PRESET_LIMITATIONS = Object.freeze([
@@ -25,8 +26,17 @@ function remoteCommands() {
 }
 
 /** Owned complete fallback when the installed standard cannot be adapted. */
-export function createOwnedRemoteClaudePreset() {
-  return createLegacyV024RemoteClaudePreset({ personaPrefix: REMOTE_PERSONA_PREFIX, commands: remoteCommands() });
+export function createOwnedRemoteClaudePreset(subagentFields = { modelSelectionSettings: true }) {
+  const preset = createLegacyV024RemoteClaudePreset({ personaPrefix: REMOTE_PERSONA_PREFIX, commands: remoteCommands() });
+  const modern = Object.hasOwn(subagentFields, 'modelSelection');
+  preset.plugins = preset.plugins.map(row => {
+    if (modern && row.id === 'tool-fs') return { ...row, config: { applyPatch: false } };
+    if (modern && row.id === 'tool-plugin-manager') return { ...row, disabled: { __jsExpr: "!ctx.get('profileContext')" } };
+    if (row.id !== 'delegation') return row;
+    return { ...row, config: row.config.filter(child => !modern || child.id !== 'tool-subagent-list-agents')
+      .map(child => child.id === 'tool-subagent' ? { ...child, config: remoteSubagentConfig(child.config, subagentFields) } : child) };
+  });
+  return preset;
 }
 
 /** UI descriptions must follow the effective preset, including basic fallback. */
@@ -80,7 +90,7 @@ export function containRemotePreset(preset, { baseUrl, mode = 'full', reasons = 
  * Plan mode cannot safely transition inside an SDK query; DSH transcript forks
  * are not SDK forks. Fresh children inherit the parent unless explicitly selected.
  */
-export function createRemoteClaudePreset(standard) {
+export function createRemoteClaudePreset(standard, subagentFields) {
   if (standard === null || typeof standard !== 'object' || Array.isArray(standard)
     || !Array.isArray(standard.plugins)) {
     throw new TypeError('需要 DSH 标准预设的完整插件列表。');
@@ -104,6 +114,8 @@ export function createRemoteClaudePreset(standard) {
   }
   const spawn = one(delegation.config, 'tool-subagent');
   const fork = one(delegation.config, 'tool-subagent-fork');
+  subagentFields ??= Object.hasOwn(spawn.config ?? {}, 'modelSelection')
+    ? { modelSelection: true, modelDiscovery: true } : { modelSelectionSettings: true };
   if (spawn.name !== '@deepseek-ai/dsh-tool-subagent' || spawn.config?.provider !== 'spawn'
     || fork.name !== '@deepseek-ai/dsh-tool-subagent' || fork.config?.provider !== 'fork'
     || fork.config?.toolName !== 'subagent_fork') {
@@ -127,7 +139,7 @@ export function createRemoteClaudePreset(standard) {
         config: entry.config.map((child) => {
           if (child.id === 'tool-subagent-fork') return { ...child, disabled: true };
           if (child.id === 'tool-subagent') {
-            return { ...child, config: { ...child.config, modelSelectionSettings: true } };
+            return { ...child, config: remoteSubagentConfig(child.config, subagentFields) };
           }
           return { ...child };
         }),

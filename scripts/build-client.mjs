@@ -12,10 +12,13 @@ import { createFormViews } from '../plugin/ui/client/form-views.mjs';
 import { createClient } from '../plugin/ui/client/entry.mjs';
 import { createUsageProjectionBridge } from '../plugin/ui/client/usage-projection.mjs';
 import { createClientReceiveTiming } from '../plugin/ui/client/client-receive-timing.mjs';
+import { createCompactionHistory } from '../plugin/ui/client/compaction-history.mjs';
+import { createCompactionSummaryRules } from '../src/compaction-summary-projection.mjs';
+import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES, MAX_COMPACTION_SUMMARY_JSON_BYTES, SUMMARY_CODES } from '../src/compaction-summary.mjs';
 
 const factories = [createStore, textError, createSettingsController, createModelController,
   createQuotaController, createPickerController, createMeterViews, createFormViews,
-  createClientReceiveTiming, createUsageProjectionBridge, createClient];
+  createClientReceiveTiming, createUsageProjectionBridge, createCompactionSummaryRules, createCompactionHistory, createClient];
 const target = new URL('../plugin/ui/client.js', import.meta.url);
 const normalize = source => source.replace(/\r\n/g, '\n');
 
@@ -26,12 +29,16 @@ export function renderClientBundle() {
 window.__ModuleLoader__.load({ id: 'dsh-claude-bridge', factory: (require) => {
 const React = require('react');
 const { createPortal } = require('react-dom');
-const { useAnchoredPosition, useDismissOnOutsidePointer } = require('@deepseek-ai/dsh-client-ui-primitives');
+const { useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText } = require('@deepseek-ai/dsh-client-ui-primitives');
 const { z } = require('zod');
+const COMPACTION_SUMMARY_RECORD = ${JSON.stringify(COMPACTION_SUMMARY_RECORD)};
+const MAX_COMPACTION_SUMMARY_BYTES = ${MAX_COMPACTION_SUMMARY_BYTES};
+const MAX_COMPACTION_SUMMARY_JSON_BYTES = ${MAX_COMPACTION_SUMMARY_JSON_BYTES};
+const SUMMARY_CODES = ${JSON.stringify(SUMMARY_CODES)};
 
 ${factories.map(factory => normalize(factory.toString())).join('\n\n')}
 
-return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
+return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText,
   ${factories.filter(factory => factory !== createClient).map(factory => factory.name).join(', ')} });
 } });
 `;

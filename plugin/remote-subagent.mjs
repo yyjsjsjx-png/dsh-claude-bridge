@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { resolveDshModule } from './compat/resolve-dsh-module.mjs';
 import { CLAUDE_PRESET, CLAUDE_PROVIDER } from './policy.mjs';
 import { MODEL_DEFAULT_EFFORT, subagentModels, assertRemoteSubagentRoute, withModelDefault } from './subagent-selection.mjs';
+import { remoteSubagentConfig, captureRemoteSubagentPolicy } from './presets/subagent-capabilities.mjs';
 
 const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'));
 const native = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href);
@@ -123,10 +124,17 @@ export async function apply(ctx, config) {
         } catch {}
         signal?.throwIfAborted();
         if (disposed) throw new Error('远程子任务预设已卸载。');
+        const nativeConfig = remoteSubagentConfig(config, Config.dict, allowedModels !== undefined);
+        // New native tools consume policy recorded by the Host initializer;
+        // this remote-only installation is deliberately later and scoped to one Agent.
+        if (Object.hasOwn(Config.dict, 'modelSelection')) {
+          const parentId = agent.session.header.origin === 'subagent' ? agent.session.header.parentSession : undefined;
+          captureRemoteSubagentPolicy(agent.session, parentId === undefined ? undefined : agent.ctx.get('sessions')?.get(parentId), allowedModels);
+        }
         entry.fiber = agent.ctx.inject(native.inject, inner => native.apply(
           selectionContext(inner, () => ctx.claudeBridge.backend.catalog(), () => ctx.claudeBridge.backend.visibleCatalog(),
             allowedModels, config.toolName ?? 'subagent'),
-          { ...config, modelSelectionSettings: allowedModels !== undefined }, agent.session));
+          nativeConfig, agent.session));
         fibers.add(entry.fiber);
         await entry.fiber;
       })().catch(async error => {

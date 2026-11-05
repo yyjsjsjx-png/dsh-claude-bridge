@@ -5,6 +5,7 @@ import { createWebResultPages } from './web-result-pages.mjs'
 import { hasPublicWebAddresses } from './web-fetch-policy.mjs'
 import { WorkerError, throwIfAborted } from './worker-error.mjs'
 import { asMcpResult, isValidStepPreparation, toSdkUserMessages } from './query-input.mjs'
+import { createCompactionSummaries } from './compaction-summaries.mjs'
 
 /**
  * Build one query's SDK tool surface: the DSH MCP tools, the PreToolUse /
@@ -20,6 +21,12 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
   const { context, run, runId, sessionId, diagnose, startPhase } = query
   const { controller } = run
   const trackCallback = query.settlement.track
+  if (query.params.compactionSummaries === true) io.compactionSummaries = createCompactionSummaries({
+    sessionId, enabled: true, signal: controller.signal, diagnose,
+    publish: message => {
+      if (query.params.action !== 'compact') context.peer.notify('sdk.message', { runId, message })
+    },
+  })
   // PreToolUse supplies the ID that MCP handlers lack. Only the per-run
   // registry can bind it to canonical arguments or advance tool facts.
   const qualifiedNames = new Set(definitions.map(({ name }) => `mcp__dsh__${name}`))
@@ -280,6 +287,8 @@ export function createQueryTools({ sdk, runStore, query, toolCalls, definitions,
     })()))
   })
   const hooks = {
+    ...(io.compactionSummaries ? { PostCompact: [{ hooks: [(input, _toolUseId, options = {}) =>
+      trackCallback(Promise.resolve(io.compactionSummaries.postCompact(input, options.signal)))] }] } : {}),
     PreToolUse: [{ hooks: [(...args) => trackCallback(preToolUse(...args).catch(error => {
       if (!nativeNames.has(args[0]?.tool_name)) throw error
       return denyTool('未能完成原生网页工具审批')

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile, access, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import { HOST_FUNCTIONS, assertHostContract } from '../plugin/compat/host-contract.mjs'
@@ -162,6 +163,23 @@ test('未来兼容模拟：沿用实际接口的新版包、入口和预设可�
       await writePackage(name, `export * from ${JSON.stringify(url)};\n`
         + (Object.hasOwn(module, 'default') ? `export { default } from ${JSON.stringify(url)};\n` : '')
         + 'export const newOptionalFeature = true;\n')
+    }
+    const nativeRequire = createRequire(targets['@deepseek-ai/dsh-session'])
+    await writePackage('@deepseek-ai/dsh-tool-subagent',
+      `export * from ${JSON.stringify(pathToFileURL(nativeRequire.resolve('@deepseek-ai/dsh-tool-subagent')).href)};\n`)
+    // Native subagent capability discovery uses createRequire.resolve, so the
+    // synthetic package must expose the same entry to that resolver as well.
+    const subagentManifestPath = join(base, '@deepseek-ai/dsh-tool-subagent/package.json')
+    const subagentManifest = JSON.parse(await readFile(subagentManifestPath, 'utf8'))
+    subagentManifest.exports['.'].node.default = './lib/next.mjs'
+    await writeFile(subagentManifestPath, JSON.stringify(subagentManifest))
+    if (typeof (await import(targets['@deepseek-ai/dsh-tools'])).ToolsService?.prototype.resolve === 'function') {
+      const path = join(base, '@deepseek-ai/dsh-tools/package.json')
+      const manifest = JSON.parse(await readFile(path, 'utf8'))
+      manifest.exports['./pipeline'] = './lib/pipeline.mjs'
+      await writeFile(path, JSON.stringify(manifest))
+      await writeFile(join(base, '@deepseek-ai/dsh-tools/lib/pipeline.mjs'),
+        `export * from ${JSON.stringify(resolver.resolveDshModule('@deepseek-ai/dsh-tools/pipeline'))};\n`)
     }
     // The routed factory now requires the installation's real AgentLoop API;
     // the compatible future-package shim above preserves it without a hash lock.

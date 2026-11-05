@@ -45,6 +45,7 @@ import { createWorkflowDepthGuard } from './workflow-depth-guard.mjs';
 import { createClaudeCatalogAdapter } from './catalog-adapter.mjs';
 import { createSessionStatusProjection } from '../src/session-status.mjs';
 import { createRunProgressProjection } from '../src/run-progress.mjs';
+import { createCompactionSummaryProjection } from '../src/compaction-summary-projection.mjs';
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
@@ -54,6 +55,9 @@ import { createModelCycleProjection, modelCycleRows } from '../src/model-cycle-p
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
+const toolModule = await import(resolveDshModule('@deepseek-ai/dsh-tools'));
+const ToolExecutionPipeline = typeof toolModule.ToolsService?.prototype?.resolve === 'function'
+    ? (await import(resolveDshModule('@deepseek-ai/dsh-tools/pipeline'))).ToolExecutionPipeline : undefined;
 const nativeTitle = await Promise.resolve().then(() => {
     const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'));
     return import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session-title')).href);
@@ -121,7 +125,7 @@ let ClaudeBridgeService = (() => {
                 resolveDshHome, credentialKey,
                 renderPrompt, renderContextSections, joinContextSections, assembleContextFor,
                 createAssistantMessage, createToolResultMessage, createSystemMessage, appendPluginRecord,
-                AssistantStreamAccumulator, BlockAssembler,
+                AssistantStreamAccumulator, BlockAssembler, ToolExecutionPipeline,
             };
             this.backend = new BridgeBackend(ctx, config, { helpers, hostCompatibility });
             ctx.inject(['sessionTitle'], titleCtx => {
@@ -139,6 +143,7 @@ let ClaudeBridgeService = (() => {
             });
             ctx.sessionProjections.register(createSessionStatusProjection(z));
             ctx.sessionProjections.register(createRunProgressProjection(z));
+            ctx.sessionProjections.register(createCompactionSummaryProjection(z));
             ctx.sessionProjections.register(createResponseUsageProjection(z));
             ctx.sessionProjections.register(createResponseTimingProjection(z));
             ctx.sessionProjections.register(createModelCycleProjection(z));
@@ -218,7 +223,7 @@ let ClaudeBridgeService = (() => {
             const remotePreset = remotePresetStatus(this.ctx);
             const host = await assertDshCompatibility();
             return { ...status, remotePreset, host,
-                desktopCompatibility: { version: host.version, verifiedVersions: ['0.2.1-rc.5'] },
+                desktopCompatibility: { version: host.version, verifiedVersions: ['0.2.1-rc.5', '0.2.2-rc.1'] },
                 ...remotePresetFeatures(remotePreset) };
         }
         async saveConnection(value) {

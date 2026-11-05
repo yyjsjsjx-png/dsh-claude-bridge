@@ -21,6 +21,17 @@ test('请求预算不得超过服务上限，maxTurns 必须在范围内', () =>
   assert.doesNotThrow(() => validateRunLimits({ maxBudgetUsd: 1, maxTurns: 3 }, 1))
 })
 
+test('压缩摘要协商只接受显式true，缺省保留旧客户端请求语义', () => {
+  for (const action of [undefined, 'compact']) {
+    const params = { runId: 'r', ...(action ? { action, resume: true } : {}) }
+    assert.doesNotThrow(() => validateQueryEnvelope(params))
+    assert.doesNotThrow(() => validateQueryEnvelope({ ...params, compactionSummaries: true }))
+    for (const compactionSummaries of [false, null, 1, 'true', {}, []]) {
+      assert.throws(() => validateQueryEnvelope({ ...params, compactionSummaries }), { code: 'INVALID_COMPACTION_SUMMARIES' })
+    }
+  }
+})
+
 test('下一步准备回复不能同时结束本轮并附带上下文或插话', () => {
   const userMessages = [{ id, content: [{ type: 'text', text: '继续' }] }]
   assert.equal(isValidStepPreparation({}), true)

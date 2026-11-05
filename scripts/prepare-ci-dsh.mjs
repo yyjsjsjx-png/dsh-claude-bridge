@@ -8,9 +8,13 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { inspectNativeTarget, RC5_VERSION } from './run-regression.mjs';
+import { inspectNativeTarget, DEFAULT_DESKTOP_VERSION, desktopVersion } from './run-regression.mjs';
 
-export const DESKTOP_URL = `https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-${RC5_VERSION}-win-x64.exe`;
+/** Pin downloads to one reviewed official release instead of a moving latest. */
+export function desktopDownloadUrl(version = DEFAULT_DESKTOP_VERSION) {
+  return `https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-${desktopVersion(version)}-win-x64.exe`;
+}
+export const DESKTOP_URL = desktopDownloadUrl();
 const execFileAsync = promisify(execFile);
 
 function safeMember(root, name) {
@@ -48,8 +52,8 @@ async function members(binary, archive) {
   return [...listing.matchAll(/^Path = (.+)\r?$/gm)].map(match => match[1].trim());
 }
 
-async function download(path) {
-  const response = await fetch(DESKTOP_URL, { signal: AbortSignal.timeout(300000) });
+async function download(path, url) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(300000) });
   if (!response.ok || !response.body || new URL(response.url).protocol !== 'https:'
     || new URL(response.url).hostname !== 'download.deepseek.com') throw new Error('固定官方安装包下载失败或跳转来源不受支持。');
   const hash = createHash('sha256');
@@ -61,27 +65,39 @@ async function download(path) {
   } }), createWriteStream(path, { flags: 'wx' }));
   const length = Number(response.headers.get('content-length'));
   if (bytes < 1024 * 1024 || (length && length !== bytes)) throw new Error('安装包长度检查失败。');
-  return { url: DESKTOP_URL, bytes, sha256: hash.digest('hex') };
+  return { url, bytes, sha256: hash.digest('hex') };
+}
+
+export function preparationOptions(argv) {
+  const options = { report: resolve('regression-results/ci-target.json'), desktopVersion: DEFAULT_DESKTOP_VERSION };
+  for (let index = 0; index < argv.length; index++) {
+    const flag = argv[index];
+    if (!['--report', '--desktop-version'].includes(flag) || !argv[index + 1] || argv[index + 1].startsWith('--')) {
+      throw new Error(`未知或缺值参数：${flag}`);
+    }
+    options[flag === '--desktop-version' ? 'desktopVersion' : 'report'] = argv[++index];
+  }
+  options.report = resolve(options.report);
+  options.desktopVersion = desktopVersion(options.desktopVersion);
+  return options;
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  let reportPath = resolve('regression-results/ci-target.json');
-  if (argv.length) {
-    if (argv.length !== 2 || argv[0] !== '--report') throw new Error('仅支持 --report <报告路径>。');
-    reportPath = resolve(argv[1]);
-  }
+  const options = preparationOptions(argv);
+  const reportPath = options.report, version = options.desktopVersion;
+  const url = desktopDownloadUrl(version);
   await mkdir(dirname(reportPath), { recursive: true });
-  const report = { schemaVersion: 1, status: 'failed', expectedVersion: RC5_VERSION,
-    sourceUrl: DESKTOP_URL, installationExecuted: false };
+  const report = { schemaVersion: 1, status: 'failed', expectedVersion: version,
+    sourceUrl: url, installationExecuted: false };
   try {
     if (process.platform !== 'win32' || process.env.GITHUB_ACTIONS !== 'true' || process.env.RUNNER_OS !== 'Windows'
       || !process.env.RUNNER_TEMP || !process.env.GITHUB_ENV) {
       throw new Error('此下载入口仅用于 Windows GitHub runner；本机请向 run-regression 提供现有 DSH 路径。');
     }
     const zip = await existing7zip();
-    const root = await mkdtemp(join(resolve(process.env.RUNNER_TEMP), 'dsh-rc5-'));
+    const root = await mkdtemp(join(resolve(process.env.RUNNER_TEMP), `dsh-${version}-`));
     const installer = join(root, 'installer.exe');
-    report.download = await download(installer);
+    report.download = await download(installer, url);
     const stage = join(root, 'installer-payload');
     await mkdir(stage);
     const candidates = (await members(zip, installer)).filter(name => /^app[^\\/]*\.7z$/i.test(basename(name.replaceAll('\\', '/'))));
@@ -98,7 +114,7 @@ export async function main(argv = process.argv.slice(2)) {
     await sevenZip(zip, ['x', '-y', '-bb0', `-o${destination}`, archive]);
     const resources = dirname(safeMember(destination, asars[0]));
     const executable = join(dirname(resources), 'DeepSeek Harness.exe');
-    report.target = await inspectNativeTarget(resources, executable);
+    report.target = await inspectNativeTarget(resources, executable, version);
     report.archiveMember = candidates[0];
     for (const [key, value] of Object.entries({ DSH_CLAUDE_BRIDGE_RESOURCES: resources,
       DSH_CLAUDE_BRIDGE_EXECUTABLE: executable })) {
@@ -106,7 +122,7 @@ export async function main(argv = process.argv.slice(2)) {
       await appendFile(process.env.GITHUB_ENV, `${key}=${value}\n`);
     }
     report.status = 'prepared';
-    console.log(`已提取并预检真实 DSH Desktop ${RC5_VERSION}，未执行安装器。`);
+    console.log(`已提取并预检真实 DSH Desktop ${version}，未执行安装器。`);
   } catch (error) {
     report.error = error.message;
     console.error(error.message);

@@ -48,6 +48,7 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
         : name === 'dsh-working-directory' ? { defaultDirectory: directory }
         : name === 'dsh-fs-local' ? { cwd: directory } : {});
     }
+    if (typeof ctx.tools.setExecutor === 'function') await ctx.plugin(await official('dsh-tool-executor-native'), {});
     await ctx.plugin(await official('dsh-session-persistence-jsonl'), { root: join(directory, 'sessions') });
     await ctx.agentPresets.register({ id: 'standard', plugins: [{ id: 'tool-subagent',
       name: pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href,
@@ -241,7 +242,7 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       const recovered = await create('remote-recovered', 'low');
       assert.ok(definition(recovered).parameters.properties.reasoning_effort);
     });
-    await t.test('原生ordinary resolver拒绝live子代理，bridge历史同步复用真实owner且不改变续聊入口', async () => {
+    await t.test('原生ordinary resolver拒绝live子代理，bridge历史同步复用真实owner且不改变续聊入口', async subtest => {
       const { SessionController } = await import(resolveDshModule('@deepseek-ai/dsh-api-session-controller'));
       const { ClaudeBridgeService } = await import('../plugin/index.mjs');
       // Only inert gateway/file-upload registration is supplied. The actual
@@ -271,10 +272,36 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       await ctx.plugin(Queries);
       let controller;
       const controllerOwner = ctx.plugin({ inject: ['typert', 'sessions', 'agents', 'sessionProjections', 'fileUploads', 'sessionQuery'],
-        apply: inner => { controller = new SessionController(inner, {}); } });
+        apply: async inner => {
+          controller = new SessionController(inner, {});
+          // Newer Hosts install this resolver in Service.init; retain the same
+          // native resolver without starting unrelated file/list/gateway services.
+          if (!controller.agents) {
+            const { ApiSessionAgentController } = await import(new URL('./types/agent.js',
+              resolveDshModule('@deepseek-ai/dsh-api-session-controller')).href);
+            controller.agents = new ApiSessionAgentController(inner);
+            controller.agents.initialize();
+          }
+        } });
       await controllerOwner;
-      const child = ctx.agents.list().find(agent => agent.session.header.origin === 'subagent');
+      // Completed managed activations may already have released their Agent.
+      // This test needs a resident idle owner, so retain the native factory's
+      // handle explicitly and give its real loop one fake-transport turn.
+      const childOwner = await ctx.agentLoop.createAgent(ctx, {
+        sessionId: 'resolver-live-child',
+        meta: { agentPreset: 'claude-sdk-remote', origin: 'subagent', parentSession: a.id,
+          delegationDepth: 1, cwd: directory },
+        agentOptions: { provider: 'claude-sdk-remote', model: 'haiku', reasoningEffort: 'high' },
+        setup: async inner => { await ctx.agentPresets.mount(inner, 'claude-sdk-remote'); },
+      });
+      subtest.after(() => childOwner.dispose());
+      const child = childOwner.agent;
       assert.ok(child);
+      child.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'synthetic resolver child' }] }));
+      await child.activityDone;
+      assert.equal(child.phase.kind, 'idle');
+      assert.equal(ctx.agents.get(child.id), child);
+      assert.equal(queries.filter(row => row.dshSessionId === child.id).length, 1);
       const nativeRejection = await controller.resolveAgent(child.id);
       assert.equal(nativeRejection.error.code, 'session/agent-busy');
       assert.equal(nativeRejection.error.details.reason, 'use subagent delivery for this child session');

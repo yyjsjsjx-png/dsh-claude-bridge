@@ -1,0 +1,220 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { createCompactionSummaryRules, createCompactionSummaryProjection } from '../src/compaction-summary-projection.mjs'
+import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES } from '../src/compaction-summary.mjs'
+import { createCompactionHistory } from '../plugin/ui/client/compaction-history.mjs'
+import { nativeChat } from './fixtures/native-chat.mjs'
+import { strictSession } from './fixtures/native-persistence.mjs'
+import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+
+const rules = createCompactionSummaryRules()
+const summaryRecord = (boundaryUuid, summary, extra = {}) => ({ type: COMPACTION_SUMMARY_RECORD, ignorable: true,
+  data: { version: 1, boundaryUuid, trigger: 'auto', summary, ...extra } })
+const available = text => ({ status: 'available', text })
+const card = { boundaryUuid: 'boundary-a', runId: 'run', completedAt: 100, seq: 4, trigger: 'auto' }
+const native = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
+
+test('实际原生：摘要正文留在打开会话完整投影，新版列表摘要不携带正文集合', { skip: !native }, async t => {
+  const { Context } = await import(resolveDshModule('@deepseek-ai/cordis'))
+  const { z } = await import(resolveDshModule('zod'))
+  const { Session, SESSION_FORMAT_VERSION, appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'))
+  const ctx = new Context()
+  t.after(() => ctx.fiber.dispose())
+  for (const name of ['dsh-session', 'dsh-session-projection']) {
+    const module = await import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href)
+    await ctx.plugin(module.default ?? module, {})
+  }
+  const projection = createCompactionSummaryProjection(z)
+  await ctx.sessionProjections.register(projection)
+  const session = Session.create('summary-list-exclusion', undefined, { version: SESSION_FORMAT_VERSION,
+    id: 'summary-list-exclusion', createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+  appendPluginRecord(session, COMPACTION_SUMMARY_RECORD, summaryRecord('boundary-a', available('合成完整正文')).data)
+  const full = ctx.sessionProjections.snapshot(session)
+  assert.equal(full.values[projection.key].summaries['$boundary-a'].summary.text, '合成完整正文')
+  if (typeof ctx.sessionProjections.summaryKeys === 'function') {
+    const keys = ctx.sessionProjections.summaryKeys()
+    assert.equal(keys.has(projection.key), false)
+    const list = ctx.sessionProjections.snapshot(session, keys)
+    assert.equal(Object.hasOwn(list.values, projection.key), false)
+    const opened = ctx.sessionProjections.snapshot(session, [projection.key])
+    assert.equal(opened.values[projection.key].summaries['$boundary-a'].summary.text, '合成完整正文')
+  }
+})
+
+test('摘要只按精确UUID或可信旧卡三元定位关联，不按token/时间近似配对', () => {
+  const record = summaryRecord('boundary-a', available('## 合成原生摘要\n保留正文'))
+  const state = rules.apply(rules.initial(), record)
+  assert.deepEqual(rules.lookup(state, card), record.data.summary)
+  assert.equal(rules.lookup(state, { ...card, boundaryUuid: 'boundary-b' }), undefined)
+  assert.equal(rules.lookup(state, { ...card, boundaryUuid: undefined }), undefined)
+  const linked = rules.apply(state, summaryRecord('boundary-a', record.data.summary,
+    { runId: 'run', completedAt: 100, anchorSeq: 4 }))
+  assert.deepEqual(rules.lookup(linked, { ...card, boundaryUuid: undefined }), record.data.summary)
+  assert.equal(rules.lookup(linked, { ...card, boundaryUuid: undefined, seq: 5 }), undefined)
+  assert.equal(rules.lookup(linked, { ...card, boundaryUuid: undefined, completedAt: 101 }), undefined)
+  assert.equal(rules.lookup(linked, { ...card, boundaryUuid: undefined, runId: 'other' }), undefined)
+})
+
+test('重复摘要幂等，可用正文不被普通读取失败覆盖，冲突记录或定位明确拒绝', () => {
+  const record = summaryRecord('boundary-a', available('同一份摘要'))
+  const first = rules.apply(rules.initial(), record)
+  assert.deepEqual(rules.apply(first, record), first)
+  const failed = rules.apply(first, summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_UNAVAILABLE' }))
+  assert.deepEqual(rules.lookup(failed, card), record.data.summary)
+  const conflict = rules.apply(first, summaryRecord('boundary-a', available('另一份摘要')))
+  assert.deepEqual(rules.lookup(conflict, card), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+  const declaredConflict = rules.apply(first, summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' }))
+  assert.deepEqual(rules.lookup(declaredConflict, card), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+  const locator = { runId: 'run', completedAt: 100, anchorSeq: 4 }
+  const linked = rules.apply(first, summaryRecord('boundary-a', record.data.summary, locator))
+  const wrong = rules.apply(linked, summaryRecord('boundary-b', available('不能混入另一边界'), locator))
+  assert.deepEqual(rules.lookup(wrong, { ...card, boundaryUuid: undefined }), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+})
+
+test('PostCompact原文优先于transcript封装文本，两种到达顺序均保留Hook且不报跨来源冲突', () => {
+  const hook = summaryRecord('boundary-a', available('## 合成Hook原文\n真实正文'), { source: 'sdk-postcompact' })
+  const transcript = summaryRecord('boundary-a', available('<synthetic-wrapper>原生存档文本</synthetic-wrapper>'),
+    { source: 'native-transcript', runId: 'run', completedAt: 100, anchorSeq: 4 })
+  for (const events of [[hook, transcript], [transcript, hook]]) {
+    const state = events.reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), hook.data.summary)
+    assert.equal(state.summaries['$boundary-a'].source, 'sdk-postcompact')
+    assert.deepEqual(rules.lookup(state, { ...card, boundaryUuid: undefined }), hook.data.summary,
+      '低优先级存档仍可提供主侧已确认的旧卡定位')
+  }
+  const withHook = rules.apply(rules.initial(), hook)
+  const lowerUnavailable = rules.apply(withHook, summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' },
+    { source: 'native-transcript' }))
+  assert.deepEqual(rules.lookup(lowerUnavailable, card), hook.data.summary)
+})
+
+test('同来源同边界正文变化仍明确冲突，旧记录和未知source按Hook来源兼容', () => {
+  for (const source of ['sdk-postcompact', 'native-transcript', undefined, 'unknown']) {
+    const first = summaryRecord('boundary-a', available('第一份同源正文'), { source })
+    const changed = summaryRecord('boundary-a', available('第二份同源正文'), { source })
+    const state = [first, changed].reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+  }
+  const legacy = summaryRecord('boundary-a', available('旧Hook原文'))
+  const lower = summaryRecord('boundary-a', available('存档封装正文'), { source: 'native-transcript' })
+  assert.deepEqual(rules.lookup([legacy, lower].reduce(rules.apply, rules.initial()), card), legacy.data.summary)
+})
+
+test('跨来源可用性：存档正文可补Hook缺失或未配对，迟到Hook缺失也不清除可用存档', () => {
+  const archive = summaryRecord('boundary-a', available('可核对的合成存档摘要'), { source: 'native-transcript' })
+  for (const code of ['SUMMARY_MISSING', 'SUMMARY_UNPAIRED']) {
+    const missingHook = summaryRecord('boundary-a', { status: 'unavailable', code }, { source: 'sdk-postcompact' })
+    for (const events of [[missingHook, archive], [archive, missingHook]]) {
+      const state = events.reduce(rules.apply, rules.initial())
+      assert.deepEqual(rules.lookup(state, card), archive.data.summary)
+      assert.equal(state.summaries['$boundary-a'].source, 'native-transcript')
+    }
+  }
+})
+
+test('跨来源冲突优先级：Hook冲突禁止存档补正文，存档冲突可由真实Hook正文解除', () => {
+  const conflictHook = summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' }, { source: 'sdk-postcompact' })
+  const archive = summaryRecord('boundary-a', available('不得覆盖Hook冲突的存档摘要'), { source: 'native-transcript' })
+  for (const events of [[conflictHook, archive], [archive, conflictHook]]) {
+    const state = events.reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+    assert.equal(state.summaries['$boundary-a'].source, 'sdk-postcompact')
+  }
+  const conflictArchive = summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' }, { source: 'native-transcript' })
+  const hook = summaryRecord('boundary-a', available('真实合成Hook原文'), { source: 'sdk-postcompact' })
+  for (const events of [[conflictArchive, hook], [hook, conflictArchive]]) {
+    const state = events.reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), hook.data.summary)
+    assert.equal(state.summaries['$boundary-a'].source, 'sdk-postcompact')
+  }
+})
+
+test('客户端按共享1MiB UTF8上限完整保留正文，超限/空白/异常事件不渲染私有内容', () => {
+  const exact = 'a'.repeat(MAX_COMPACTION_SUMMARY_BYTES)
+  assert.equal(rules.normalize(available(exact)).text, exact)
+  assert.deepEqual(rules.normalize(available('文'.repeat(Math.floor(MAX_COMPACTION_SUMMARY_BYTES / 3) + 1))),
+    { status: 'unavailable', code: 'SUMMARY_TOO_LARGE' })
+  assert.deepEqual(rules.normalize(available('a' + '\u0000'.repeat(600_000))),
+    { status: 'unavailable', code: 'SUMMARY_TOO_LARGE' })
+  assert.deepEqual(rules.normalize(available(' \n')), { status: 'unavailable', code: 'SUMMARY_EMPTY' })
+  const initial = rules.initial()
+  assert.equal(rules.apply(initial, { ...summaryRecord('boundary-a', available('不得进入')), ignorable: false }), initial)
+  assert.equal(rules.apply(initial, summaryRecord('__proto__', available('不得进入'))), initial)
+  assert.deepEqual(rules.normalize({ status: 'unavailable', code: '私有正文' }), { status: 'unavailable', code: 'SUMMARY_UNAVAILABLE' })
+})
+
+function ui({ expanded = false } = {}) {
+  let definition, component, toggled
+  const MarkdownText = () => undefined
+  createCompactionHistory({ React: { createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: () => [expanded, value => { toggled = value }] }, MarkdownText, summaryRules: rules })({
+    uiConversation: { events: { register(value) { definition = value; return () => {} } } },
+    slots: { register(_options, value) { component = value; return () => {} } },
+  })
+  return { definition, component, MarkdownText, get toggled() { return toggled } }
+}
+
+test('摘要默认折叠且展开时交给原生安全MarkdownText，缺失状态给具体原因', () => {
+  const state = rules.apply(rules.initial(), summaryRecord('boundary-a', available('## 原生摘要\n逐字正文')))
+  const closed = ui()
+  const result = closed.component({ node: { data: card }, useProjection: () => state })
+  assert.equal(result.type, 'details'); assert.equal(result.props.open, undefined)
+  assert.equal(result.children[2]?.props?.text, undefined)
+  assert.equal(JSON.stringify(result).includes('逐字正文'), false)
+  result.props.onToggle({ currentTarget: { open: true } }); assert.equal(closed.toggled, true)
+  const open = ui({ expanded: true })
+  const expanded = open.component({ node: { data: card }, useProjection: () => state })
+  const markdown = expanded.children[1].children[1]
+  assert.equal(markdown.type, open.MarkdownText)
+  assert.equal(markdown.props.text, '## 原生摘要\n逐字正文')
+  const unavailable = rules.apply(rules.initial(), summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_UNPAIRED' }))
+  assert.ok(JSON.stringify(open.component({ node: { data: card }, useProjection: () => unavailable })).includes('未能与本次压缩边界可靠对应'))
+  assert.ok(JSON.stringify(open.component({ node: { data: { ...card, recovered: true } }, useProjection: () => state })).includes('历史补录'))
+})
+
+test('实际原生：摘要先后到达、重复边界和旧卡补摘要均可严格回放，缺边界不造卡', { skip: !native }, async () => {
+  const { Session, SESSION_FORMAT_VERSION, appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const { z } = await import(resolveDshModule('zod'))
+  const projection = createCompactionSummaryProjection(z)
+  for (const ordering of ['summary-first', 'boundary-first', 'legacy']) {
+    const id = `summary-ui-${ordering}`
+    const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION,
+      id, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+    const chat = await nativeChat()
+    createCompactionHistory({ React: {}, summaryRules: rules })({ ...chat.ctx, slots: { register: () => () => {} } })
+    const addBoundary = () => {
+      const data = { version: 1, runId: card.runId, completedAt: card.completedAt, trigger: 'auto', preTokens: 900 }
+      return ordering === 'legacy' ? appendPluginRecord(session, 'plugin:claude-bridge/progress',
+        { ...data, compaction: { status: 'completed', completedAt: 100, preTokens: 900, trigger: 'auto' } })
+        : appendPluginRecord(session, 'plugin:claude-bridge/compaction', { ...data, boundaryUuid: 'boundary-a' })
+    }
+    let markerSeq
+    if (ordering !== 'summary-first') markerSeq = addBoundary()
+    const data = summaryRecord('boundary-a', available('## 合成原生摘要'), ordering === 'legacy'
+      ? { runId: card.runId, completedAt: card.completedAt, anchorSeq: markerSeq } : {}).data
+    appendPluginRecord(session, COMPACTION_SUMMARY_RECORD, data)
+    if (ordering === 'summary-first') {
+      chat.replace(session.snapshotEvents()); assert.equal(chat.order().filter(node => node.kind === 'claude-bridge-compaction').length, 0)
+      markerSeq = addBoundary()
+    }
+    // Replayed summary and repeated old progress observations must not duplicate the card.
+    appendPluginRecord(session, COMPACTION_SUMMARY_RECORD, data)
+    addBoundary()
+    chat.replace(session.snapshotEvents())
+    const cards = chat.order().filter(node => node.kind === 'claude-bridge-compaction')
+    assert.equal(cards.length, 1)
+    let state = session.snapshotEvents().reduce(projection.apply, projection.init(session.header))
+    projection.stateSchema.parse(state); projection.wire.viewSchema.parse(state)
+    assert.equal(rules.lookup(state, cards[0].data).text, '## 合成原生摘要')
+    assert.equal(cards[0].anchorSeq, markerSeq)
+    const restored = await strictSession(session)
+    chat.replace(restored.events)
+    assert.equal(chat.order().filter(node => node.kind === 'claude-bridge-compaction').length, 1)
+    state = restored.events.reduce(projection.apply, projection.init(restored.header))
+    assert.equal(rules.lookup(state, cards[0].data).text, '## 合成原生摘要')
+    assert.deepEqual(Session.create(id, restored.events, restored.header).surface.nodes, [])
+  }
+})

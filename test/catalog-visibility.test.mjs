@@ -57,7 +57,9 @@ test('实际 rc5 服务：状态返回同一份 Host 检查，不把启动探针
     { id: 'desktop-acceptance', evidence: 'desktop', status: 'not-run' },
     { id: 'remote-sdk', evidence: 'real-sdk', status: 'not-run' },
   ]);
-  assert.deepEqual(status.desktopCompatibility.verifiedVersions, ['0.2.1-rc.5']);
+  // The requested new desktop baseline expands this public status contract;
+  // keep an exact assertion for both verified baselines, not an interface-only claim.
+  assert.deepEqual(status.desktopCompatibility.verifiedVersions, ['0.2.1-rc.5', '0.2.2-rc.1']);
   assert.equal(status.connected, false);
 });
 

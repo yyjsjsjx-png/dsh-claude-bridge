@@ -1,4 +1,4 @@
-/** No-key regression entry; native checks require the actual rc.5 desktop. */
+/** No-key regression entry; native checks require a fixed real desktop baseline. */
 import { spawn, execFile } from 'node:child_process';
 import { mkdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 export const RC5_VERSION = '0.2.1-rc.5';
+export const DEFAULT_DESKTOP_VERSION = '0.2.2-rc.1';
+export const DESKTOP_VERSIONS = Object.freeze([RC5_VERSION, DEFAULT_DESKTOP_VERSION]);
 export const RC5_NATIVE_TESTS = Object.freeze([
   'test/agent-loop-native.test.mjs',
   'test/instruction-audit-native.test.mjs',
@@ -18,10 +20,19 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/preset-native.test.mjs', 'test/sdk-projection.test.mjs',
   'test/shell-native.test.mjs', 'test/workflow-depth-guard.test.mjs',
   'test/session-status.test.mjs', 'test/run-progress.test.mjs', 'test/compact-command.test.mjs',
+  'test/compaction-history.test.mjs',
+  'test/compaction-summary-projection.test.mjs',
+  'test/dsh-tool-execution.test.mjs',
   'test/recovery-command.test.mjs', 'test/update-plugin.test.mjs',
 ]);
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
 const execFileAsync = promisify(execFile);
+
+/** Select an evidence baseline, independently of runtime capability checks. */
+export function desktopVersion(value = DEFAULT_DESKTOP_VERSION) {
+  if (!DESKTOP_VERSIONS.includes(value)) throw new Error(`桌面回归基线仅支持 ${DESKTOP_VERSIONS.join('、')}。`);
+  return value;
+}
 
 function requireNode() {
   const [major, minor] = process.versions.node.split('.').map(Number);
@@ -31,8 +42,9 @@ function requireNode() {
 }
 
 /** Node cannot read ASAR contents; the real packaged Electron must do so. */
-export async function inspectNativeTarget(resourcesValue, executableValue) {
-  if (process.platform !== 'win32') throw new Error('rc.5 原生层要求真实 Windows，不能用 npm 包代替。');
+export async function inspectNativeTarget(resourcesValue, executableValue, version = DEFAULT_DESKTOP_VERSION) {
+  const expectedVersion = desktopVersion(version);
+  if (process.platform !== 'win32') throw new Error('原生层要求真实 Windows，不能用 npm 包代替。');
   if (!resourcesValue) throw new Error('缺少 DSH resources 路径，请传 --resources 或设置 DSH_CLAUDE_BRIDGE_RESOURCES。');
   const resources = await realpath(resolve(resourcesValue));
   const executable = await realpath(resolve(executableValue ?? join(dirname(resources), 'DeepSeek Harness.exe')));
@@ -50,8 +62,8 @@ export async function inspectNativeTarget(resourcesValue, executableValue) {
       if (process.platform !== 'win32' || !process.versions.electron) throw Error('不是 Windows Electron 运行时');
       const app = JSON.parse(fs.readFileSync(path.join(resources, 'app.asar/package.json'), 'utf8'));
       const loop = JSON.parse(fs.readFileSync(path.join(resources, 'app.asar/dsh/node_modules/@deepseek-ai/dsh-agent-loop/package.json'), 'utf8'));
-      if (app.version !== '${RC5_VERSION}' || loop.version !== '${RC5_VERSION}'
-        || loop.name !== '@deepseek-ai/dsh-agent-loop') throw Error('桌面或 AgentLoop 版本不是 ${RC5_VERSION}');
+      if (app.version !== '${expectedVersion}' || loop.version !== '${expectedVersion}'
+        || loop.name !== '@deepseek-ai/dsh-agent-loop') throw Error('桌面或 AgentLoop 版本不是 ${expectedVersion}');
       process.stdout.write(JSON.stringify({ platform: process.platform, electron: process.versions.electron,
         node: process.versions.node, desktopVersion: app.version, agentLoopVersion: loop.version }));
     } catch (error) { process.stderr.write(error.message); process.exitCode = 1; }
@@ -63,10 +75,10 @@ export async function inspectNativeTarget(resourcesValue, executableValue) {
       env, windowsHide: true, timeout: 20000, maxBuffer: 128 * 1024, encoding: 'utf8',
     }));
   } catch (error) {
-    throw new Error(`rc.5 Electron／ASAR 预检失败：${String(error.stderr || error.code || '无法启动桌面运行时').trim()}`);
+    throw new Error(`${expectedVersion} Electron／ASAR 预检失败：${String(error.stderr || error.code || '无法启动桌面运行时').trim()}`);
   }
   const target = JSON.parse(stdout);
-  return { ...target, resources, executable, archive: 'app.asar', expectedVersion: RC5_VERSION };
+  return { ...target, resources, executable, archive: 'app.asar', expectedVersion };
 }
 
 function tapSummary(output) {
@@ -105,28 +117,30 @@ async function execute(binary, args, env, outputDirectory, label, shell = false)
   return { ...outcome, summary: tapSummary(stdout) };
 }
 
-function options(argv) {
-  const parsed = { layer: 'node', output: resolve(project, '.local/regression') };
+export function regressionOptions(argv) {
+  const parsed = { layer: 'node', output: resolve(project, '.local/regression'), desktopVersion: DEFAULT_DESKTOP_VERSION };
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index];
     if (flag === '--preflight-only') { parsed.preflightOnly = true; continue; }
-    if (!['--layer', '--resources', '--executable', '--output'].includes(flag) || !argv[index + 1]) {
+    if (!['--layer', '--resources', '--executable', '--output', '--desktop-version'].includes(flag) || !argv[index + 1]
+      || argv[index + 1].startsWith('--')) {
       throw new Error(`未知或缺值参数：${flag}`);
     }
-    parsed[flag.slice(2)] = argv[++index];
+    parsed[flag === '--desktop-version' ? 'desktopVersion' : flag.slice(2)] = argv[++index];
   }
   if (!['node', 'native', 'all'].includes(parsed.layer)) throw new Error('--layer 只接受 node、native 或 all。');
   parsed.output = resolve(parsed.output);
   parsed.resources ??= process.env.DSH_CLAUDE_BRIDGE_RESOURCES;
   parsed.executable ??= process.env.DSH_CLAUDE_BRIDGE_EXECUTABLE;
+  parsed.desktopVersion = desktopVersion(parsed.desktopVersion);
   return parsed;
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const config = options(argv);
+  const config = regressionOptions(argv);
   await mkdir(config.output, { recursive: true });
   const report = { schemaVersion: 1, startedAt: new Date().toISOString(), status: 'failed',
-    baseline: RC5_VERSION, host: { platform: process.platform, node: process.versions.node },
+    baseline: config.desktopVersion, host: { platform: process.platform, node: process.versions.node },
     ...( /^[0-9a-f]{40}$/.test(process.env.GITHUB_SHA ?? '') ? { commit: process.env.GITHUB_SHA } : {}), layers: [] };
   try {
     requireNode();
@@ -138,7 +152,7 @@ export async function main(argv = process.argv.slice(2)) {
         delete env.ELECTRON_RUN_AS_NODE;
         delete env.DSH_CLAUDE_BRIDGE_RESOURCES;
         delete env.DSH_CLAUDE_BRIDGE_EXECUTABLE;
-        if (layer === 'native') result.target = await inspectNativeTarget(config.resources, config.executable);
+        if (layer === 'native') result.target = await inspectNativeTarget(config.resources, config.executable, config.desktopVersion);
         if (config.preflightOnly) { result.status = 'preflight-passed'; continue; }
         let execution;
         if (layer === 'node') {
