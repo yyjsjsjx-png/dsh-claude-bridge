@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveDshModule, readShippedStandardPreset } from '../plugin/compat/resolve-dsh-module.mjs';
-import { createBasicRemoteClaudePreset, createOwnedRemoteClaudePreset, createRemoteClaudePreset } from '../plugin/preset.mjs';
+import { createBasicRemoteClaudePreset, createOwnedRemoteClaudePreset as ownedPreset, createRemoteClaudePreset as adaptedPreset } from '../plugin/preset.mjs';
 import { remotePresetStatus } from '../plugin/preset-loading.mjs';
 import { toMcpToolDefinitions, toSdkPrompt } from '../src/dsh-content.mjs';
 import { prepareRequestAssembly } from '../src/request-preparation.mjs';
+import { executeNativeTool } from './fixtures/native-tools.mjs';
 
 const native = Boolean(process.platform === 'win32' && process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES);
 
@@ -25,6 +26,9 @@ test('实际 rc5：远程组件隔离、基础回退及卸载不改变普通会�
     const module = await import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href);
     return module.default ?? module;
   };
+  const nativeSubagent = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href);
+  const createOwnedRemoteClaudePreset = () => ownedPreset(nativeSubagent.Config.dict);
+  const createRemoteClaudePreset = standard => adaptedPreset(standard, nativeSubagent.Config.dict);
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-preset-'));
   const workdir = join(directory, 'workspace');
   await mkdir(workdir);
@@ -35,10 +39,12 @@ test('实际 rc5：远程组件隔离、基础回退及卸载不改变普通会�
     ctx.loader.builtins.group = Group;
     for (const [name, config] of [
       ['dsh-system-prompt', {}], ['dsh-tools', {}], ['dsh-session-projection', {}],
+      ['dsh-agent', {}],
       ['dsh-fs-local', { cwd: workdir }], ['dsh-working-directory', { defaultDirectory: workdir }],
       ['dsh-shell-env', { dshHome: directory }], ['dsh-subprocess-local', {}],
       ['dsh-pwsh-local', { cwd: workdir }], ['dsh-user-approval', { policy: 'ask' }],
     ]) await ctx.plugin(await official(name), config);
+    if (typeof ctx.tools.setExecutor === 'function') await ctx.plugin(await official('dsh-tool-executor-native'), {});
     ctx.systemPrompt.section({ name: 'ordinary-canary', order: -2000, text: 'ordinary-preserved' });
     const ordinaryBefore = await ctx.systemPrompt.assemble();
     const basicPlugins = createBasicRemoteClaudePreset('win32').plugins;
@@ -183,7 +189,7 @@ export function apply(ctx) {
     });
     await t.test('远程关闭原生时间注入，旧系统提示及工具字节不变，普通会话保留原生时间能力', async () => {
       const { AgentRegistry, agentEvents } = await import(resolveDshModule('@deepseek-ai/dsh-agent'));
-      await ctx.plugin(AgentRegistry);
+      if (!ctx.agents) await ctx.plugin(AgentRegistry);
       const previousHomes = [process.env.DSH_HOME, process.env.DSH_AGENTS_HOME];
       const homes = [join(directory, 'clock-dsh-home'), join(directory, 'clock-agents-home')];
       for (const home of homes) await mkdir(home);
@@ -295,7 +301,7 @@ export function apply(ctx) {
         const missing = Object.create(previous);
         Object.defineProperty(missing, 'pwshPath', { value: { get: () => join(directory, 'missing-pwsh.exe') } });
         ctx.shell.config = missing;
-        const result = await ctx.tools.execute({ name: 'pwsh', callId: 'spawn-failure',
+        const result = await executeNativeTool(ctx, { name: 'pwsh', callId: 'spawn-failure',
           arguments: { description: '验证启动失败', command: 'Write-Output unused' },
           agent: mounted.key, signal: new AbortController().signal });
         assert.equal(result.isError, true);
@@ -305,7 +311,7 @@ export function apply(ctx) {
     await t.test('错误工作目录不会被误判为基础 shell 失效', async () => {
       const mounted = await mount(basicPlugins);
       try {
-        const execute = args => ctx.tools.execute({ name: 'pwsh', callId: 'cwd-check',
+        const execute = args => executeNativeTool(ctx, { name: 'pwsh', callId: 'cwd-check',
           arguments: { description: '验证工作目录', command: "Write-Output 'cwd-valid'", ...args },
           agent: mounted.key, signal: new AbortController().signal });
         const result = await execute({ workdir: join(directory, 'missing-workdir') });
@@ -323,7 +329,7 @@ export function apply(ctx) {
         ctx.shell.execute = async () => { throw Object.assign(new Error('controlled preparation failure'), {
           name: 'Win32Error', api: 'SetNamedSecurityInfoW', win32Code: 5,
         }); };
-        const result = await ctx.tools.execute({ name: 'pwsh', callId: 'acl-start-failure',
+        const result = await executeNativeTool(ctx, { name: 'pwsh', callId: 'acl-start-failure',
           arguments: { description: '验证沙箱准备故障', command: 'Write-Output unused' },
           agent: mounted.key, signal: new AbortController().signal });
         assert.equal(result.isError, true);

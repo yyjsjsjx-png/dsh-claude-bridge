@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWorkflowDepthGuard } from '../plugin/workflow-depth-guard.mjs';
+import { executeNativeTool } from './fixtures/native-tools.mjs';
 
 const agent = (preset, durableDepth, runtimeDepth) => ({
   options: { subagentDepth: runtimeDepth },
@@ -42,13 +43,20 @@ test('安装版 DSH 工具管道在运行 workflow 前执行深度守卫', {
   try {
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
+    if (typeof ctx.tools.setExecutor === 'function') {
+      const { createRequire } = await import('node:module');
+      const { pathToFileURL } = await import('node:url');
+      const require = createRequire(resolveDshModule('@deepseek-ai/dsh-tools'));
+      const NativeExecutor = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-executor-native')).href);
+      await ctx.plugin(NativeExecutor.default ?? NativeExecutor, {});
+    }
     let ran = 0;
     ctx.tools.register({ name: 'workflow', description: '测试',
       parameters: { type: 'object', properties: {} },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       execute: async () => { ran++; return 'executed'; } });
     ctx.tools.guard(createWorkflowDepthGuard({ subagents: { resolveMaxDepth: () => 1 }, delegationDepthOf }));
-    const run = current => ctx.tools.execute({ name: 'workflow', callId: 'test', arguments: {},
+    const run = current => executeNativeTool(ctx, { name: 'workflow', callId: 'test', arguments: {},
       signal: new AbortController().signal, agent: current });
     const result = await run(agent('claude-sdk-remote', 1, 0));
     assert.equal(result.isError, true);

@@ -15,7 +15,9 @@ test('实际 rc5：配置继承、双路 driver、原生预设切换及单 facto
   const { LlmAdapter, createUserMessage } = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
   const { Loader, EntryTree } = await import(resolveDshModule('@deepseek-ai/cordis-plugin-loader'))
   const { RemoteError } = await import(resolveDshModule('@deepseek-ai/dsh-typert-protocol'))
-  const { AgentLoop: CompatAgentLoop } = await import('../plugin/compat/agent-loop.mjs')
+  const preparationMethod = typeof NativeAgentLoop.prototype.prepare === 'function' ? 'prepare' : 'initializeAgent'
+  const { AgentLoop: CompatAgentLoop } = await import(preparationMethod === 'prepare'
+    ? '../plugin/compat/agent-loop.mjs' : '../plugin/compat/desktop-022/agent-loop.mjs')
   const { RoutedAgentLoop, apply } = await import('../plugin/agent-loop.mjs')
   const { installControllerGuards } = await import('../plugin/controller-guards.mjs')
   const { BridgeBackend } = await import('../src/backend.mjs')
@@ -41,10 +43,17 @@ test('实际 rc5：配置继承、双路 driver、原生预设切换及单 facto
     await rm(directory, { recursive: true, force: true })
   })
   await ctx.plugin(Loader, { baseUrl: resolveDshModule('@deepseek-ai/dsh-session') })
+  const projections = []
+  let register
   for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-agent', 'dsh-system-prompt', 'dsh-tools',
     'dsh-llm', 'dsh-agent-preset-registry', 'dsh-user-approval']) {
     await ctx.plugin(await official(name), name === 'dsh-agent-preset-registry' ? { default: 'standard' } : {})
+    if (name === 'dsh-session-projection') {
+      register = ctx.sessionProjections.register.bind(ctx.sessionProjections)
+      t.mock.method(ctx.sessionProjections, 'register', definition => { projections.push(definition.key); return register(definition) })
+    }
   }
+  if (typeof ctx.tools.setExecutor === 'function') await ctx.plugin(await official('dsh-tool-executor-native'), {})
   await ctx.plugin(await official('dsh-session-persistence-jsonl'), { root: join(directory, 'sessions') })
   await ctx.agentPresets.register({ id: 'standard', plugins: [] })
   await ctx.agentPresets.register({ id: 'alternate', plugins: [] })
@@ -52,19 +61,16 @@ test('实际 rc5：配置继承、双路 driver、原生预设切换及单 facto
   let prepares = 0, remotePrepares = 0, requests = 0, tools = 0, bridgeCalls = 0, factories = 0, releases = 0, bridgeError
   let holdRemote = false, remoteStarted, remoteAborts = 0
   const activeRemote = new Promise(resolve => { remoteStarted = resolve })
-  const prepare = NativeAgentLoop.prototype.prepare
-  t.mock.method(NativeAgentLoop.prototype, 'prepare', function(...args) { prepares++; return prepare.apply(this, args) })
-  const remotePrepare = CompatAgentLoop.prototype.prepare
-  t.mock.method(CompatAgentLoop.prototype, 'prepare', function(...args) { remotePrepares++; return remotePrepare.apply(this, args) })
+  const prepare = NativeAgentLoop.prototype[preparationMethod]
+  t.mock.method(NativeAgentLoop.prototype, preparationMethod, function(...args) { prepares++; return prepare.apply(this, args) })
+  const remotePrepare = CompatAgentLoop.prototype[preparationMethod]
+  t.mock.method(CompatAgentLoop.prototype, preparationMethod, function(...args) { remotePrepares++; return remotePrepare.apply(this, args) })
   const setFactory = ctx.agents.setFactory.bind(ctx.agents)
   t.mock.method(ctx.agents, 'setFactory', factory => {
     factories++
     const release = setFactory(factory)
     return () => { releases++; return release() }
   })
-  const projections = []
-  const register = ctx.sessionProjections.register.bind(ctx.sessionProjections)
-  t.mock.method(ctx.sessionProjections, 'register', definition => { projections.push(definition.key); return register(definition) })
   ctx.tools.register({ name: 'canary', description: '合成原生工具',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },

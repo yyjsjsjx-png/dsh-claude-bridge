@@ -84,24 +84,16 @@ test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订�
   const controllerUrl = resolveDshModule('@deepseek-ai/dsh-api-session-controller')
   const require = createRequire(controllerUrl)
   const load = name => import(pathToFileURL(require.resolve(name)).href)
-  const [{ Context }, { agentEvents }, { createScope }, sessionModule, { Deque }, { SessionQueryError }]
+  const [{ Context }, { agentEvents }, { createScope }, sessionModule]
     = await Promise.all([load('@deepseek-ai/cordis'), load('@deepseek-ai/dsh-agent'),
-      load('@deepseek-ai/dsh-scope'), load('@deepseek-ai/dsh-session'),
-      load('@deepseek-ai/dsh-deque'), load('@deepseek-ai/dsh-session-query')])
+      load('@deepseek-ai/dsh-scope'), load('@deepseek-ai/dsh-session')])
   const ctx = new Context()
   const source = await readFile(new URL(controllerUrl), 'utf8')
-  const region = name => {
-    const start = source.indexOf(`//#region ${name}`), end = source.indexOf('//#endregion', start)
-    assert.ok(start >= 0 && end > start)
-    return source.slice(start, end)
-  }
   // Execute the installed private follow implementation, with its real Cordis
   // event routing; no Host, persistence, auth or model service is started.
-  const { SessionHistoryController } = vm.runInNewContext([
-    region('lib/types/assistant-stream.js'), region('lib/types/history.js'),
-    '({ SessionHistoryController })',
-  ].join('\n'), { AssistantStreamAccumulator: f.helpers.AssistantStreamAccumulator,
-    ...sessionModule, Deque, SessionQueryError, RemoteError: f.helpers.RemoteError, Symbol })
+  const splitHistory = source.includes('//#region lib/types/history/controller.js')
+  const historyModule = await import(new URL(splitHistory ? './types/history/controller.js' : './types/history.js', controllerUrl).href)
+  assert.equal(typeof historyModule[splitHistory ? 'HistoryController' : 'SessionHistoryController'], 'function')
   const id = 'native-follow-projection'
   const session = sessionModule.Session.create(id, undefined, { id, version: sessionModule.SESSION_FORMAT_VERSION,
     createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote', cwd: process.cwd() })
@@ -113,8 +105,12 @@ test('实际 rc5 follow：原生 Agent 全局事件经 Host 基线和实时订�
   }
   ctx.sessionQuery = { async observeSession() { return { header: session.header,
     events: session.snapshotEvents(), cursor: session.seq - 1, inheritedEventCount: 0,
+    projections: { asOfSeq: session.seq - 1, values: {} },
     source: 'attached', [Symbol.dispose]() {} } } }
-  const history = new SessionHistoryController(ctx, () => { throw new Error('不得激活会话') })
+  const history = splitHistory
+    ? new (await import(new URL('./types/web/controller.js', controllerUrl).href)).WebController(ctx,
+      new historyModule.HistoryController(ctx), () => { throw new Error('不得激活会话') })
+    : new historyModule.SessionHistoryController(ctx, () => { throw new Error('不得激活会话') })
   const abort = new AbortController()
   const followed = history.follow({ address: { kind: 'session', sessionId: id }, assistantStream: true }, abort.signal)
   t.after(async () => { abort.abort(); await followed.return(); await ctx.fiber.dispose() })

@@ -48,6 +48,7 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
         : name === 'dsh-working-directory' ? { defaultDirectory: directory }
         : name === 'dsh-fs-local' ? { cwd: directory } : {});
     }
+    if (typeof ctx.tools.setExecutor === 'function') await ctx.plugin(await official('dsh-tool-executor-native'), {});
     await ctx.plugin(await official('dsh-session-persistence-jsonl'), { root: join(directory, 'sessions') });
     await ctx.agentPresets.register({ id: 'standard', plugins: [{ id: 'tool-subagent',
       name: pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href,
@@ -271,7 +272,17 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       await ctx.plugin(Queries);
       let controller;
       const controllerOwner = ctx.plugin({ inject: ['typert', 'sessions', 'agents', 'sessionProjections', 'fileUploads', 'sessionQuery'],
-        apply: inner => { controller = new SessionController(inner, {}); } });
+        apply: async inner => {
+          controller = new SessionController(inner, {});
+          // Newer Hosts install this resolver in Service.init; retain the same
+          // native resolver without starting unrelated file/list/gateway services.
+          if (!controller.agents) {
+            const { ApiSessionAgentController } = await import(new URL('./types/agent.js',
+              resolveDshModule('@deepseek-ai/dsh-api-session-controller')).href);
+            controller.agents = new ApiSessionAgentController(inner);
+            controller.agents.initialize();
+          }
+        } });
       await controllerOwner;
       const child = ctx.agents.list().find(agent => agent.session.header.origin === 'subagent');
       assert.ok(child);
