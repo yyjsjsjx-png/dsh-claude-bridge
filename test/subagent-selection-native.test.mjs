@@ -478,5 +478,14 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       await settingsTree.await();
       const ordinaryRestored = await create('ordinary-native-restored', undefined, true);
       if (typeof ctx.tools.setExecutor === 'function') assert.deepEqual(policy(ordinaryRestored), [{ provider: 'ordinary', model: 'fixture' }]);
+      await settingsTree.root.update([nativeSettings(true), { id: 'claude-subagent-settings-gate',
+        name: new URL('../plugin/subagent-settings.mjs', import.meta.url).href }]);
+      await settingsTree.await();
+      assert.deepEqual(policy(await create('remote-gate-reinstalled', 'high')).map(row => row.model), ['haiku', 'sonnet']);
+      const ordinaryReinstalled = await create('ordinary-gate-reinstalled', undefined, true);
+      if (typeof ctx.tools.setExecutor === 'function') assert.deepEqual(policy(ordinaryReinstalled), [{ provider: 'ordinary', model: 'fixture' }]);
+      await settingsTree.root.update([]);
+      await settingsTree.await();
+      assert.equal(ctx.get('claudeSubagentPolicyGate'), undefined);
     });
   });
