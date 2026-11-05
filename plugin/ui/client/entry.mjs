@@ -1,7 +1,8 @@
 /** DSH wiring: mount RPC first, then create one controller set per child scope. */
 export function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
-  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming }) {
+  createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming,
+  createCompactionHistory }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -90,6 +91,7 @@ exports.installUsageProjection = createUsageProjectionBridge({ React, getClientT
 exports.apply = async function apply(ctx) {
   ctx.inject(['uiConversation'], ctx => {
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
+    if (ctx.uiConversation) ctx.effect(() => createCompactionHistory({ React })(ctx), '远程会话压缩记录');
   });
   const json = { mode: 'src-json' };
   const descriptor = (method, parameters = []) => ({

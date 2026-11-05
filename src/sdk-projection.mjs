@@ -36,6 +36,7 @@ export class SdkProjection {
     this.streamUsageFinal = false
     this.responses = new Map()
     this.usageReported = false
+    this.compactionIds = new Set()
   }
 
   advanceStep(step) {
@@ -376,25 +377,33 @@ export class SdkProjection {
   }
 
   async progress(message) {
-    if (typeof this.onProgress !== 'function') return
     const count = n => Number.isSafeInteger(n) && n >= 0
     if (message.type === 'system' && message.subtype === 'status'
       && (message.status === 'compacting' || message.status === null)) {
-      await this.onProgress({ type: 'status', status: message.status })
+      await this.onProgress?.({ type: 'status', status: message.status })
     } else if (message.type === 'system' && message.subtype === 'compact_boundary') {
+      if (message.uuid && this.compactionIds.has(message.uuid)) return
       const metadata = message.compact_metadata
       const event = { type: 'compact-boundary', trigger: ['auto', 'manual'].includes(metadata?.trigger) ? metadata.trigger : 'unknown' }
       for (const [key, input] of [['preTokens', 'pre_tokens'], ['postTokens', 'post_tokens'], ['durationMs', 'duration_ms']]) {
         if (count(metadata?.[input])) event[key] = metadata[input]
       }
-      await this.onProgress(event)
+      // This marker belongs only to DSH's display log, never its model surface.
+      // status:null alone is not proof that a compaction boundary was committed.
+      const compaction = await this.onProgress?.(event)
+      this.helpers.appendPluginRecord(this.agent.session, 'plugin:claude-bridge/compaction', {
+        version: 1, runId: this.runId, turn: this.turn, step: this.step,
+        completedAt: count(compaction?.completedAt) ? compaction.completedAt : Date.now(),
+        ...Object.fromEntries(Object.entries(event).filter(([key]) => key !== 'type')),
+      })
+      if (message.uuid) this.compactionIds.add(message.uuid)
     } else if (message.type === 'bridge_context') {
       const observedAt = count(message.observedAt) ? message.observedAt : Date.now()
       const snapshot = contextSnapshot(message.context, observedAt)
       const event = { type: 'context', context: snapshot.status === 'known'
         ? { ...snapshot, source: 'sdk-summary-approximate' } : { status: 'unknown' }, observedAt }
       if (['CONTEXT_SUMMARY_TIMEOUT', 'CONTEXT_SUMMARY_UNAVAILABLE'].includes(message.code)) event.code = message.code
-      await this.onProgress(event)
+      await this.onProgress?.(event)
     }
   }
 
