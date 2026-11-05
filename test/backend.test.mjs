@@ -408,6 +408,25 @@ test('/compact 忙碌、缺少原生绑定或服务器能力时不发压缩请�
   assert.equal(queries, 0)
 })
 
+test('/compact 协商后将真实正文保存为折叠卡展示记录，维护回复不会注入模型历史', async t => {
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+      capabilities: { manualCompact: true, compactionSummaries: true } }
+    assert.equal(method, 'query'); assert.equal(params.compactionSummaries, true)
+    return { status: 'completed', compaction: { status: 'compacted', boundaryUuid: 'manual-boundary', preTokens: 800,
+      trigger: 'manual', summary: { status: 'available', text: '合成手动压缩摘要' } } }
+  } }, async close() {} }))
+  f.agent.session.snapshotEvents = () => f.records.map((event, seq) => ({ ...event, seq, ignorable: event.intent?.ignorable }))
+  await prepareCompact(f)
+  assert.equal((await f.backend.compact(f.agent, new AbortController().signal)).kind, 'success')
+  const card = f.records.find(event => event.type === 'plugin:claude-bridge/compaction')
+  const summary = f.records.find(event => event.type === 'plugin:claude-bridge/compaction-summary')
+  assert.equal(card.data.boundaryUuid, 'manual-boundary'); assert.equal(card.data.trigger, 'manual')
+  assert.deepEqual(summary.data.summary, { status: 'available', text: '合成手动压缩摘要' })
+  assert.equal(summary.intent.ignorable, true)
+  assert.equal(f.records.some(event => ['user/message', 'assistant/message', 'compaction/summary'].includes(event.type)), false)
+})
+
 test('/compact 取消后迟到成功不覆盖未知状态，不自动重试或声称撤销压缩', async t => {
   const controller = new AbortController()
   let queries = 0, settlements = 0
@@ -1382,6 +1401,35 @@ function recoveryEvents(f) {
   f.agent.phase = { kind: 'idle' }
   f.agent.runMaintenance = operation => operation(new AbortController().signal)
 }
+
+test('空闲历史同步按独立能力回补摘要，重复同步幂等且旧服务端不调用新增RPC', async t => {
+  for (const supported of [false, true]) {
+    let binding, summaryReads = 0
+    const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+        capabilities: { historySync: true, ...(supported ? { compactionHistory: true } : {}) } }
+      if (method === 'history') return { status: 'ok', sessionId: binding.sdkSessionId,
+        records: [], runs: {}, nextOffset: 0, lastUuid: null, done: true }
+      assert.equal(method, 'compaction.history'); summaryReads++
+      assert.equal(params.dshSessionId, f.agent.id); assert.equal(params.sessionId, binding.sdkSessionId)
+      assert.equal(params.deviceId, binding.deviceId); assert.equal(params.projectPath, binding.projectPath)
+      return { status: 'ok', sessionId: binding.sdkSessionId, records: params.cursor ? [] : [{ boundaryUuid: 'old-boundary',
+        trigger: 'auto', preTokens: 800, summary: { status: 'available', text: '合成原生旧摘要' } }],
+      done: true, nextCursor: { fingerprint: 'fixed', offset: 1, done: true } }
+    } }, async close() {} }))
+    recoveryEvents(f); f.agent.session.id = f.agent.id; f.agent.session.snapshotEvents = () => f.records
+    binding = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+    await f.backend.state.markStarted(f.agent.id)
+    assert.equal((await f.backend.syncSession(f.agent)).status, 'ready')
+    assert.equal((await f.backend.syncSession(f.agent)).status, 'ready')
+    assert.equal(summaryReads, supported ? 2 : 0)
+    assert.equal(f.records.filter(event => event.type === 'plugin:claude-bridge/compaction-summary').length, supported ? 1 : 0)
+    if (supported) {
+      assert.equal(f.records.find(event => event.type === 'plugin:claude-bridge/compaction').data.recovered, true)
+      assert.doesNotMatch(JSON.stringify(f.backend.state.value), /合成原生旧摘要/)
+    }
+  }
+})
 
 async function interruptedTool(f, { result = false } = {}) {
   recoveryEvents(f)
