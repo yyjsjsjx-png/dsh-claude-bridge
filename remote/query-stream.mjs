@@ -56,6 +56,7 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
   const { context, run, runId, sessionId, diagnose, timing } = query
   const { controller } = run
   const { pendingUserInputs, submittedUserInputs } = io
+  if (compact) io.compactionSummaries?.beginSingleCompaction()
   const turnResults = [], seenResults = new Set()
   let confirmationTimer
   // Streaming input supports images and interactive SDK callbacks.
@@ -206,6 +207,7 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
     }
     try {
       forward(message)
+      io.compactionSummaries?.status(message)
       // Publish a summary only after the authoritative boundary was queued.
       io.compactionSummaries?.boundary(message)
     } catch {

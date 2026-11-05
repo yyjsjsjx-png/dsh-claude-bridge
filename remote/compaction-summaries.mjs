@@ -11,6 +11,7 @@ export function createCompactionSummaries({ sessionId, enabled, signal, publish,
   const boundaries = new Map(), hooks = [], pending = [], lastMatched = new Map()
   const ambiguous = new Set()
   let closed = false, unpairedHooks = 0
+  let cycleStarted = false, cycleEnded = false, cycleHasBoundary = false, unanchoredBlocked = false
   const active = () => enabled === true && !closed && !signal?.aborted
   const report = code => { try { diagnose('compact-summary', 'unavailable', code) } catch {} }
   function emit(boundary, summary) {
@@ -44,6 +45,30 @@ export function createCompactionSummaries({ sessionId, enabled, signal, publish,
       emit(boundary, hook.summary)
     }
   }
+  function beginCycle() {
+    for (const row of pending.splice(0)) emit(row, unavailable('SUMMARY_UNPAIRED'))
+    if (hooks.length) report('SUMMARY_UNPAIRED')
+    hooks.length = 0
+    lastMatched.clear()
+    ambiguous.clear()
+    cycleStarted = true
+    cycleEnded = false
+    cycleHasBoundary = false
+    unanchoredBlocked = false
+  }
+  function status(message) {
+    if (!active() || message?.type !== 'system' || message.subtype !== 'status'
+      || message.session_id !== sessionId) return
+    if (message.status === 'compacting') {
+      // Repeated progress in the same unfinished cycle is not a new generation.
+      if (!cycleStarted || cycleEnded || cycleHasBoundary) beginCycle()
+    } else if (message.status === null) cycleEnded = true
+  }
+  function beginSingleCompaction() {
+    // A maintenance query runs exactly one /compact command. This is a query
+    // scope anchor, not a synthetic SDK completion or model-context message.
+    if (active() && !cycleStarted) beginCycle()
+  }
   function boundary(message) {
     if (!active() || message?.type !== 'system' || message.subtype !== 'compact_boundary') return
     if (message.session_id !== sessionId || !ID.test(message.uuid ?? '')) {
@@ -68,6 +93,15 @@ export function createCompactionSummaries({ sessionId, enabled, signal, publish,
     }
     const row = { uuid: message.uuid, trigger, signature, summary: unavailable('SUMMARY_MISSING') }
     boundaries.set(row.uuid, row)
+    cycleHasBoundary = true
+    if (!cycleStarted && (unanchoredBlocked || !hooks.some(hook => hook.trigger === trigger))) {
+      // With no cycle status, a later hook might belong to the next boundary.
+      // Never retroactively attach it to this earlier, unanchored completion.
+      unanchoredBlocked = true
+      hooks.length = 0
+      emit(row, unavailable('SUMMARY_UNPAIRED'))
+      return
+    }
     if (trigger === 'unknown' || ambiguous.has(trigger) || pending.length >= MAX_PENDING_COMPACTIONS) {
       emit(row, unavailable('SUMMARY_UNPAIRED'))
       return
@@ -82,6 +116,7 @@ export function createCompactionSummaries({ sessionId, enabled, signal, publish,
       report('SUMMARY_UNPAIRED')
       return {}
     }
+    if (!cycleStarted && unanchoredBlocked) { report('SUMMARY_UNPAIRED'); return {} }
     if (ambiguous.has(input.trigger)) { report('SUMMARY_UNPAIRED'); return {} }
     let summary
     try { summary = parseSummary(input.compact_summary) }
@@ -120,6 +155,6 @@ export function createCompactionSummaries({ sessionId, enabled, signal, publish,
     hooks.length = 0
     pending.length = 0
   }
-  return { boundary, postCompact, finish, stop,
+  return { status, beginSingleCompaction, boundary, postCompact, finish, stop,
     summaryFor(uuid) { return boundaries.get(uuid)?.summary ?? unavailable('SUMMARY_UNPAIRED') } }
 }

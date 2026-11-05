@@ -9,10 +9,12 @@ const sessionId = '12345678-1234-4234-8234-123456789012'
 const hook = (text = '合成原生摘要', trigger = 'auto') => ({ hook_event_name: 'PostCompact', session_id: sessionId, trigger, compact_summary: text })
 const boundary = (uuid = 'boundary-a', trigger = 'auto') => ({ type: 'system', subtype: 'compact_boundary', session_id: sessionId,
   uuid, compact_metadata: { trigger, pre_tokens: 1000 } })
-function fixture(enabled = true) {
+const status = value => ({ type: 'system', subtype: 'status', session_id: sessionId, status: value })
+function fixture(enabled = true, withCycle = true) {
   const messages = [], diagnostics = [], controller = new AbortController()
   const summaries = createCompactionSummaries({ sessionId, enabled, signal: controller.signal,
     publish: value => messages.push(structuredClone(value)), diagnose: (...args) => diagnostics.push(args) })
+  if (withCycle) summaries.status(status('compacting'))
   return { summaries, messages, diagnostics, controller }
 }
 
@@ -129,10 +131,53 @@ test('摘要传输失败仅记录稳定code，不抛出正文或干扰原生压�
   const diagnostics = []
   const f = createCompactionSummaries({ sessionId, enabled: true,
     publish() { throw new Error('private summary network failure') }, diagnose: (...args) => diagnostics.push(args) })
+  f.status(status('compacting'))
   f.boundary(boundary())
   assert.deepEqual(f.postCompact(hook()), {})
   assert.deepEqual(f.summaryFor('boundary-a'), { status: 'unavailable', code: 'SUMMARY_UNAVAILABLE' })
   assert.deepEqual(diagnostics, [['compact-summary', 'unavailable', 'SUMMARY_UNAVAILABLE']])
+})
+
+test('新压缩周期隔离缺hook的旧边界，hook先到新边界也不会贴到旧卡片', () => {
+  const f = fixture()
+  f.summaries.boundary(boundary('old-missing'))
+  f.summaries.status(status(null))
+  f.summaries.status(status('compacting'))
+  f.summaries.postCompact(hook('new-only'))
+  f.summaries.boundary(boundary('new-boundary'))
+  assert.deepEqual(f.messages.map(message => [message.boundaryUuid, message.summary]), [
+    ['old-missing', { status: 'unavailable', code: 'SUMMARY_UNPAIRED' }],
+    ['new-boundary', { status: 'available', text: 'new-only' }],
+  ])
+})
+
+test('同一周期重复compacting或status:null不清配对，新周期允许正文恰好相同', () => {
+  const f = fixture()
+  f.summaries.postCompact(hook('same'))
+  f.summaries.status(status('compacting'))
+  f.summaries.status(status(null))
+  f.summaries.boundary(boundary('first'))
+  f.summaries.status(status('compacting'))
+  f.summaries.postCompact(hook('same'))
+  f.summaries.boundary(boundary('second'))
+  assert.deepEqual(f.messages.map(message => [message.boundaryUuid, message.summary.text]), [['first', 'same'], ['second', 'same']])
+})
+
+test('缺少周期status时不把下一次hook贴给旧边界，显式新周期可恢复配对', () => {
+  const f = fixture(true, false)
+  f.summaries.boundary(boundary('old-without-hook'))
+  f.summaries.postCompact(hook('belongs-to-next'))
+  f.summaries.boundary(boundary('next-without-status'))
+  assert.ok(f.messages.every(message => message.summary.code === 'SUMMARY_UNPAIRED'))
+  assert.equal(JSON.stringify(f.messages).includes('belongs-to-next'), false)
+  f.summaries.status(status('compacting'))
+  f.summaries.postCompact(hook('recovered'))
+  f.summaries.boundary(boundary('anchored'))
+  assert.equal(f.messages.at(-1).summary.text, 'recovered')
+  const g = fixture(true, false)
+  g.summaries.postCompact(hook('first-hook'))
+  g.summaries.boundary(boundary())
+  assert.equal(g.messages[0].summary.text, 'first-hook')
 })
 
 function streamFixture({ enabled = true, compact = false } = {}) {
@@ -171,4 +216,26 @@ test('实际hook装配在权威边界之后发送摘要，旧客户端不注册�
   assert.deepEqual(outcome.compaction, { status: 'compacted', preTokens: 1000, trigger: 'manual', boundaryUuid: 'manual-a', postTokens: 100, durationMs: 20,
     summary: { status: 'available', text: 'manual summary' } })
   assert.equal(manual.notifications.some(item => item.method === 'sdk.message'), false)
+})
+
+test('流式status接线隔离前周期缺失hook，保留新周期的同文本摘要', async () => {
+  const f = streamFixture(), post = f.tools.hooks.PostCompact[0].hooks[0]
+  f.stream.accept(status('compacting'))
+  f.stream.accept(boundary('old-cycle'))
+  f.stream.accept(status(null))
+  f.stream.accept(status('compacting'))
+  await post(hook('same-native-text'))
+  f.stream.accept(boundary('new-cycle'))
+  f.stream.accept(status(null))
+  f.stream.accept(status('compacting'))
+  await post(hook('same-native-text'))
+  f.stream.accept(boundary('third-cycle'))
+  f.stream.releaseInput()
+  const summaries = f.notifications.filter(item => item.message?.type === 'bridge_compaction_summary')
+    .map(item => [item.message.boundaryUuid, item.message.summary])
+  assert.deepEqual(summaries, [
+    ['old-cycle', { status: 'unavailable', code: 'SUMMARY_UNPAIRED' }],
+    ['new-cycle', { status: 'available', text: 'same-native-text' }],
+    ['third-cycle', { status: 'available', text: 'same-native-text' }],
+  ])
 })
