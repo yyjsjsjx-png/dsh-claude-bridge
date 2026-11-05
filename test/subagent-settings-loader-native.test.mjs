@@ -129,7 +129,7 @@ test('实际Loader设置：原Entry动态编辑、配置热重载、冷重载及
       ctx = await start()
       await verify(before)
     })
-    await t.test('gate卸载撤回依赖，重新启用恢复；移除整套gate后原生Host行为恢复', async () => {
+    await t.test('gate和整套overlay撤回再安装恢复正确策略且不改用户配置', async () => {
       const before = descriptor().value
       await gate().update({ disabled: true }); await ctx.loader.await()
       assert.equal(ctx.get(gateService), undefined)
@@ -150,6 +150,10 @@ test('实际Loader设置：原Entry动态编辑、配置热重载、冷重载及
       assert.deepEqual(descriptor().value, before)
       assert.deepEqual(await sample(false), modern ? [before.allowedModels] : [])
       assert.deepEqual(await sample(true), modern ? [before.allowedModels] : [])
+      assert.equal(await readFile(profile.patchPath, 'utf8'), saved)
+      await ctx.hmr.runExclusive(() => app.recomposeProfile(ctx, app.readProfilePatches('fixture', profile), 'fixture'))
+      assert.ok(ctx.get(gateService)); assert.ok(ctx.get('subagentModelSelection'))
+      await verify(before)
       assert.equal(await readFile(profile.patchPath, 'utf8'), saved)
     })
   })
