@@ -62,7 +62,11 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
   io.promptInput = createPromptInput({ type: 'user', ...(SESSION_ID.test(runId) ? { uuid: runId } : {}),
     message: { role: 'user', content: prompt }, parent_tool_use_id: null },
   () => new WorkerError('USER_INPUT_UNCONFIRMED', 'SDK 用户输入流已关闭，插话未确认送达。', { toolMayHaveExecuted: true }))
-  const releaseInput = () => { clearTimeout(confirmationTimer); io.promptInput.close() }
+  const releaseInput = () => {
+    clearTimeout(confirmationTimer); io.promptInput.close()
+    if (controller.signal.aborted) io.compactionSummaries?.stop()
+    else io.compactionSummaries?.finish()
+  }
   controller.signal.addEventListener('abort', releaseInput, { once: true })
   let result
   let contextSummary
@@ -98,8 +102,8 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
   function forward(message) {
     if (message?.type === 'assistant' && typeof message.error === 'string') assistantError = message.error
     if (compact) {
-      // A summary can contain private conversation text. Maintenance
-      // exposes only its confirmed outcome and sanitized numeric metrics.
+      // Maintenance keeps ordinary SDK messages private. Negotiated PostCompact
+      // text is returned only in the confirmed compaction result below.
       if (message?.type === 'auth_status' && typeof message.error === 'string' && message.error.length) query.authFlowFailed = true
     } else if (message?.type === 'auth_status') {
       if (typeof message.error === 'string' && message.error.length > 0) {
@@ -178,6 +182,14 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
       const tokens = message.compact_metadata.pre_tokens
       if (!Number.isSafeInteger(tokens) || tokens < 0) throw new WorkerError('COMPACT_UNCONFIRMED', 'SDK 压缩确认信息无效')
       compactMetadata = { status: 'compacted', preTokens: tokens }
+      if (query.params.compactionSummaries === true) {
+        compactMetadata.trigger = 'manual'
+        if (typeof message.uuid === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(message.uuid)) compactMetadata.boundaryUuid = message.uuid
+        for (const [key, source] of [['postTokens', 'post_tokens'], ['durationMs', 'duration_ms']]) {
+          const value = message.compact_metadata[source]
+          if (Number.isSafeInteger(value) && value >= 0) compactMetadata[key] = value
+        }
+      }
       diagnose('compact', 'confirmed')
     }
     if (message?.type === 'system' && message.subtype === 'status' && message.status === 'compacting') {
@@ -192,7 +204,11 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
       controller.abort()
       throw run.problem
     }
-    try { forward(message) } catch {
+    try {
+      forward(message)
+      // Publish a summary only after the authoritative boundary was queued.
+      io.compactionSummaries?.boundary(message)
+    } catch {
       run.problem = new WorkerError('SDK_EVENT_DELIVERY_FAILED', 'SDK 输出无法传回，执行状态需核实', { toolMayHaveExecuted: true })
       controller.abort()
       throw run.problem
@@ -223,6 +239,7 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
 
   /** Build the candidate outcome after the iterator exited, or throw why none exists. */
   function outcome() {
+    io.compactionSummaries?.finish()
     if (run.problem) throw run.problem
     if (controller.signal.aborted) throw new WorkerError('CANCELLED', '请求已取消')
     if (pendingUserInputs.size && (!result && turnResults.length || result?.subtype === 'success' && result.is_error !== true)) throw new WorkerError('USER_INPUT_UNCONFIRMED', 'SDK 未确认消费运行中插话，已停止；请核实后再继续。', { toolMayHaveExecuted: true })
@@ -240,6 +257,10 @@ export function createQueryStream({ query, compact, prompt, toolCalls, tools, io
     diagnose('sdk', 'completed')
     timing('completed')
     const metrics = resultMetrics(result, runId, contextSummary)
+    if (compactMetadata && query.params.compactionSummaries === true) {
+      compactMetadata.summary = io.compactionSummaries?.summaryFor(compactMetadata.boundaryUuid)
+        ?? { status: 'unavailable', code: 'SUMMARY_UNAVAILABLE' }
+    }
     return { sessionId, status: 'completed', ...(metrics ? { metrics } : {}),
       ...(compact ? { compaction: compactMetadata ?? { status: 'unchanged' } } : {}) }
   }
