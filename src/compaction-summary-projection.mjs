@@ -30,7 +30,16 @@ export function createCompactionSummaryRules() {
     // The native transcript can wrap or transform Hook text. Only compare
     // verbatim equality within one source; PostCompact owns the live wording.
     if (previous && source !== previousSource) {
-      entry = source === 'native-transcript' ? previous : { boundaryUuid: data.boundaryUuid, trigger: data.trigger, source, summary }
+      const candidate = { boundaryUuid: data.boundaryUuid, trigger: data.trigger, source, summary }
+      if (source === 'native-transcript') {
+        // Missing/unpaired Hook text is not evidence against a verified archive
+        // summary. An explicit Hook conflict remains an authoritative stop.
+        entry = previous.summary.status === 'available' || previous.summary.code === 'SUMMARY_CONFLICT'
+          || summary.status !== 'available' ? previous : candidate
+      } else {
+        entry = summary.status === 'available' || summary.code === 'SUMMARY_CONFLICT'
+          || previous.summary.status !== 'available' ? candidate : previous
+      }
     } else {
       if (previous?.summary.status === 'available') {
         if (summary.status !== 'available' && summary.code !== 'SUMMARY_CONFLICT') summary = previous.summary

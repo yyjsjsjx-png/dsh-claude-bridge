@@ -73,6 +73,35 @@ test('同来源同边界正文变化仍明确冲突，旧记录和未知source�
   assert.deepEqual(rules.lookup([legacy, lower].reduce(rules.apply, rules.initial()), card), legacy.data.summary)
 })
 
+test('跨来源可用性：存档正文可补Hook缺失或未配对，迟到Hook缺失也不清除可用存档', () => {
+  const archive = summaryRecord('boundary-a', available('可核对的合成存档摘要'), { source: 'native-transcript' })
+  for (const code of ['SUMMARY_MISSING', 'SUMMARY_UNPAIRED']) {
+    const missingHook = summaryRecord('boundary-a', { status: 'unavailable', code }, { source: 'sdk-postcompact' })
+    for (const events of [[missingHook, archive], [archive, missingHook]]) {
+      const state = events.reduce(rules.apply, rules.initial())
+      assert.deepEqual(rules.lookup(state, card), archive.data.summary)
+      assert.equal(state.summaries['$boundary-a'].source, 'native-transcript')
+    }
+  }
+})
+
+test('跨来源冲突优先级：Hook冲突禁止存档补正文，存档冲突可由真实Hook正文解除', () => {
+  const conflictHook = summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' }, { source: 'sdk-postcompact' })
+  const archive = summaryRecord('boundary-a', available('不得覆盖Hook冲突的存档摘要'), { source: 'native-transcript' })
+  for (const events of [[conflictHook, archive], [archive, conflictHook]]) {
+    const state = events.reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), { status: 'unavailable', code: 'SUMMARY_CONFLICT' })
+    assert.equal(state.summaries['$boundary-a'].source, 'sdk-postcompact')
+  }
+  const conflictArchive = summaryRecord('boundary-a', { status: 'unavailable', code: 'SUMMARY_CONFLICT' }, { source: 'native-transcript' })
+  const hook = summaryRecord('boundary-a', available('真实合成Hook原文'), { source: 'sdk-postcompact' })
+  for (const events of [[conflictArchive, hook], [hook, conflictArchive]]) {
+    const state = events.reduce(rules.apply, rules.initial())
+    assert.deepEqual(rules.lookup(state, card), hook.data.summary)
+    assert.equal(state.summaries['$boundary-a'].source, 'sdk-postcompact')
+  }
+})
+
 test('客户端按共享1MiB UTF8上限完整保留正文，超限/空白/异常事件不渲染私有内容', () => {
   const exact = 'a'.repeat(MAX_COMPACTION_SUMMARY_BYTES)
   assert.equal(rules.normalize(available(exact)).text, exact)
