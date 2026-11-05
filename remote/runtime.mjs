@@ -7,6 +7,7 @@ import { isModelCatalogAuthFailure } from '../src/catalog-cache-policy.mjs'
 import { AuthError, createAuthReader } from './auth.mjs'
 import { sdkErrorDetail } from './errors.mjs'
 import { createHistoryReader, createRunStore } from './history.mjs'
+import { createCompactionHistoryReader } from './compaction-history.mjs'
 import { createDiagnostics } from '../src/diagnostics.mjs'
 import { evaluateBridgeCompatibility } from '../src/bridge-compatibility.mjs'
 import { createRunObservations } from './run-observations.mjs'
@@ -78,6 +79,7 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
 
   // These pinned executables are the combination whose per-query TTL overrides were inspected.
   const promptCacheTtlSupported = cliVersion === '2.1.314' && sdkVersion === '0.3.314'
+  const compactionSummariesSupported = sdk.HOOK_EVENTS?.includes('PostCompact') === true
   const activeSessions = new Set()
   const activeRuns = new Map()
   const completedRuns = new Map()
@@ -87,6 +89,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   const planUsageReader = createPlanUsageReader({ sdk, sessionRoot, cliPath, childEnv })
   const authReader = injectedAuthReader ?? createAuthReader({ cliPath, childEnv })
   const readHistory = createHistoryReader({ sdk, sessionRoot, authorizedDeviceId, acquireLock, requireAuth, activeSessions })
+  const readCompactions = createCompactionHistoryReader({ sessionRoot, configDir, authorizedDeviceId,
+    acquireLock, requireAuth, activeSessions })
   const serverVersion = bridgeRelease?.serverVersion
   const minimumClientVersion = bridgeRelease?.minimumClientVersion ?? null
   let clientVersion
@@ -171,6 +175,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
         perDeviceSessions: true,
         contextSummary: true,
         manualCompact: true,
+        ...(compactionSummariesSupported ? { compactionSummaries: true } : {}),
+        compactionHistory: true,
         autoCompactWindow: true,
         nativeWebTools: true,
         nativeWebResultPages: true,
@@ -235,6 +241,12 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     const blocked = compatibilityFailure()
     if (blocked) return blocked
     return readHistory(params, context)
+  }
+
+  async function compactionHistory(params, context = {}) {
+    const blocked = compatibilityFailure()
+    if (blocked) return blocked
+    return readCompactions(params, context)
   }
 
   async function readObservabilityQuota(context = {}) {
@@ -337,6 +349,9 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
     const { params, run, runId, sessionId } = q
     const { controller } = run
     const { compact } = request
+    if (params.compactionSummaries === true && !compactionSummariesSupported) {
+      throw new WorkerError('COMPACTION_SUMMARY_UNSUPPORTED', '当前 SDK 不支持原生压缩摘要 Hook')
+    }
     const toolCalls = createToolCalls({ signal: controller.signal, eventTimeoutMs: toolEventTimeoutMs,
       createError: (code, message, details) => new WorkerError(code, message, details) })
     try {
@@ -495,5 +510,6 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   }
 
   return { handlers: { initialize, authStatus, catalog, planUsage, history, query, settle,
+    'compaction.history': compactionHistory,
     observabilityQuery, observabilityTiming }, readObservabilityQuota, close }
 }

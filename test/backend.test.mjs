@@ -19,6 +19,31 @@ const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
 const nextClientVersion = `${BigInt(currentClientVersion.split('.')[0]) + 1n}.0.0`
 
+test('压缩摘要按服务器能力协商，只追加展示记录，旧服务器不发送新字段', async t => {
+  for (const supported of [false, true]) {
+    const f = await fixture(t, async options => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true,
+        capabilities: supported ? { compactionSummaries: true } : {} }
+      assert.equal(method, 'query')
+      assert.equal(params.compactionSummaries, supported ? true : undefined)
+      if (supported) {
+        await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'system', subtype: 'compact_boundary',
+          uuid: 'confirmed-boundary', compact_metadata: { trigger: 'auto', pre_tokens: 900 } } })
+        await options.onNotification('sdk.message', { runId: params.runId, message: { type: 'bridge_compaction_summary',
+          boundaryUuid: 'confirmed-boundary', trigger: 'auto', source: 'sdk-postcompact',
+          summary: { status: 'available', text: '合成原生摘要' } } })
+      }
+      return { status: 'completed' }
+    } }, async close() {} }))
+    f.agent.session.snapshotEvents = () => f.records.map((event, index) => ({ ...event, seq: index + 1, ignorable: event.intent?.ignorable }))
+    await f.backend.runStep(f.agent, f.decision)
+    const summaries = f.records.filter(event => event.type === 'plugin:claude-bridge/compaction-summary')
+    assert.equal(summaries.length, supported ? 1 : 0)
+    if (supported) assert.deepEqual(summaries[0].data.summary, { status: 'available', text: '合成原生摘要' })
+    assert.equal(f.records.filter(event => event.type === 'user/message').some(event => JSON.stringify(event.data).includes('合成原生摘要')), false)
+  }
+})
+
 test('新版步骤准入随工具批次切换，batch结果仍由Bridge写日志，准备快照不被新选型改写', async t => {
   const closed = [], calls = []
   const initial = { dispose() { closed.push('initial') } }, next = { dispose() { closed.push('next') } }

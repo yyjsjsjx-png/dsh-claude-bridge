@@ -17,6 +17,7 @@ import { createWorkflowDepthGuard } from './workflow-depth-guard.mjs';
 import { createClaudeCatalogAdapter } from './catalog-adapter.mjs';
 import { createSessionStatusProjection } from '../src/session-status.mjs';
 import { createRunProgressProjection } from '../src/run-progress.mjs';
+import { createCompactionSummaryProjection } from '../src/compaction-summary-projection.mjs';
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
@@ -74,6 +75,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
     });
     ctx.sessionProjections.register(createSessionStatusProjection(z));
     ctx.sessionProjections.register(createRunProgressProjection(z));
+    ctx.sessionProjections.register(createCompactionSummaryProjection(z));
     ctx.sessionProjections.register(createResponseUsageProjection(z));
     ctx.sessionProjections.register(createResponseTimingProjection(z));
     ctx.sessionProjections.register(createModelCycleProjection(z));

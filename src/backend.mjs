@@ -45,6 +45,8 @@ import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.m
 import { RunStepLifecycle } from './step-lifecycle.mjs'
 import { assertPreparedInstructionAudit } from './instruction-audit.mjs'
 import { currentDshSelection, createStepToolAdmission, executeDshTool } from './dsh-tool-execution.mjs'
+import { createCompactionRecovery, appendCompactionSummary } from './compaction-recovery.mjs'
+import { COMPACTION_RECORD } from './compaction-summary.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const USER_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -72,6 +74,7 @@ export class BridgeBackend {
     this.ctx = ctx
     this.config = config
     this.helpers = helpers
+    this.compactionRecovery = createCompactionRecovery(helpers)
     this.createTransport = createTransport
     this.directory = config.stateDirectory ?? join(helpers.resolveDshHome(), 'claude-bridge')
     this.state = new BridgeState(this.directory)
@@ -674,6 +677,14 @@ export class BridgeBackend {
         if (cloud.status === 'waiting') return { status: 'waiting' }
         const { cursor, replay, added } = cloud
         const { updates, unresolvedTools } = this.reconcileRecoveredTools(agent, pending, cloud)
+        if (!withinRun && this.initialized?.capabilities?.compactionHistory === true) {
+          try { await this.compactionRecovery.sync({ session: agent.session, binding, transport, signal: combined }) }
+          catch (error) {
+            combined.throwIfAborted()
+            this.diagnostics.event('compact.history_unavailable', { sessionId: agent.id,
+              code: error.code ?? 'COMPACTION_HISTORY_UNAVAILABLE' })
+          }
+        }
         await this.checkpoint(agent.session)
         await this.state.reconcileRecovery(agent.id, updates, { ...cursor, replay, projectionVersion: 3 })
         await this.state.markStarted(agent.id)
@@ -910,6 +921,7 @@ export class BridgeBackend {
           run.requestStarted = true
           const result = await transport.peer.request('query', { action: 'compact', runId,
             ...contextPreferences,
+            ...(this.initialized?.capabilities?.compactionSummaries === true ? { compactionSummaries: true } : {}),
             deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
             projectPath: binding.projectPath, resume: true, model: selected.model,
             ...(selected.reasoningEffort ? { effort: selected.reasoningEffort } : {}),
@@ -925,6 +937,15 @@ export class BridgeBackend {
           }
           signal.throwIfAborted()
           if (result.compaction.status === 'compacted') await this.state.markRecoveryNotice(agent.id, null)
+          if (result.compaction.status === 'compacted' && typeof result.compaction.boundaryUuid === 'string') {
+            const data = { version: 1, runId, trigger: 'manual', boundaryUuid: result.compaction.boundaryUuid,
+              completedAt: Date.now() }
+            for (const name of ['preTokens', 'postTokens', 'durationMs']) {
+              if (Number.isSafeInteger(result.compaction[name]) && result.compaction[name] >= 0) data[name] = result.compaction[name]
+            }
+            const anchorSeq = this.helpers.appendPluginRecord(agent.session, COMPACTION_RECORD, data)
+            appendCompactionSummary(agent.session, { ...data, summary: result.compaction.summary, anchorSeq }, this.helpers)
+          }
           this.sessionStatus(agent, { model: selected.model, phase: 'completed', context: contextSnapshot(result.metrics?.context) })
           await this.checkpoint(agent.session)
           run.journalStatus = 'completed'
@@ -1211,6 +1232,7 @@ export class BridgeBackend {
     timing('request_sent')
     const result = await transport.peer.request('query', {
       ...contextPreferences,
+      ...(this.initialized?.capabilities?.compactionSummaries === true ? { compactionSummaries: true } : {}),
       runId, deviceId: binding.deviceId, dshSessionId: agent.id, sessionId: binding.sdkSessionId,
       resume: binding.started, projectPath: binding.projectPath, prompt, systemPrompt,
       tools: converted.tools,

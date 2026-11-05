@@ -8,6 +8,7 @@ import { RESPONSE_USAGE_RECORD, RUN_USAGE_RECORD, responseUsageFromSdk } from '.
 import { createResponseTimingTracker, RESPONSE_TIMING_RECORD } from './response-timing.mjs'
 import { observeResponseTiming } from './sdk-response-timing.mjs'
 import { MODEL_OBSERVATION_RECORD, sdkModelName } from './model-observation.mjs'
+import { appendCompactionSummary } from './compaction-recovery.mjs'
 
 // DSH followers require dense revisions across the attached Agent lifecycle,
 // including a stopped query followed by a fresh projection for the next turn.
@@ -97,7 +98,7 @@ export class SdkProjection {
       return
     }
     if (message.type === 'system' && message.subtype === 'init') await this.onStarted?.()
-    if (message.type === 'system' || message.type === 'bridge_context') await this.progress(message)
+    if (['system', 'bridge_context', 'bridge_compaction_summary'].includes(message.type)) await this.progress(message)
     if (message.type === 'stream_event') {
       const event = message.event
       const receivedAt = this.timingNow()
@@ -394,9 +395,12 @@ export class SdkProjection {
       this.helpers.appendPluginRecord(this.agent.session, 'plugin:claude-bridge/compaction', {
         version: 1, runId: this.runId, turn: this.turn, step: this.step,
         completedAt: count(compaction?.completedAt) ? compaction.completedAt : Date.now(),
+        ...(typeof message.uuid === 'string' ? { boundaryUuid: message.uuid } : {}),
         ...Object.fromEntries(Object.entries(event).filter(([key]) => key !== 'type')),
       })
       if (message.uuid) this.compactionIds.add(message.uuid)
+    } else if (message.type === 'bridge_compaction_summary') {
+      appendCompactionSummary(this.agent.session, message, this.helpers)
     } else if (message.type === 'bridge_context') {
       const observedAt = count(message.observedAt) ? message.observedAt : Date.now()
       const snapshot = contextSnapshot(message.context, observedAt)

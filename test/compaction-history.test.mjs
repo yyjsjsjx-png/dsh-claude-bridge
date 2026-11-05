@@ -35,6 +35,7 @@ test('只有确认边界才追加展示记录，同UUID去重，多次压缩保�
   assert.equal(f.records.length, 1)
   assert.ok(Number.isSafeInteger(f.records[0].data.completedAt))
   assert.deepEqual(f.records[0].data, { version: 1, runId: 'run-1', turn: 1, step: 1, completedAt: f.records[0].data.completedAt,
+    boundaryUuid: 'boundary-1',
     trigger: 'auto', preTokens: 900, postTokens: 100, durationMs: 1234 })
   await f.projection.accept(boundary('boundary-2'))
   assert.equal(f.records.length, 2)

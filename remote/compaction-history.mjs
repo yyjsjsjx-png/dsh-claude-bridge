@@ -56,7 +56,7 @@ export function createCompactionHistoryReader({ sessionRoot, configDir, authoriz
       const reply = await readCompactionTranscript({ configDir, cwd, sessionId, cursor: params.cursor, signal: context.signal })
       context.signal?.throwIfAborted()
       if (lock.held === false) throw problem('SESSION_LOCK_LOST', '云端记录读取期间会话锁已释放')
-      return reply
+      return reply.status === 'ok' ? { ...reply, sessionId } : reply
     }
     try { result = await read() }
     catch (error) {

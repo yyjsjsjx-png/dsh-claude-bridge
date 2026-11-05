@@ -21,6 +21,7 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/shell-native.test.mjs', 'test/workflow-depth-guard.test.mjs',
   'test/session-status.test.mjs', 'test/run-progress.test.mjs', 'test/compact-command.test.mjs',
   'test/compaction-history.test.mjs',
+  'test/compaction-summary-projection.test.mjs',
   'test/dsh-tool-execution.test.mjs',
   'test/recovery-command.test.mjs', 'test/update-plugin.test.mjs',
 ]);
