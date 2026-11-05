@@ -17,7 +17,7 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     process.env.DSH_AGENTS_HOME = join(directory, 'agents-home');
     const { Context, Service } = await import(resolveDshModule('@deepseek-ai/cordis'));
     const { LlmAdapter, createUserMessage } = await import(resolveDshModule('@deepseek-ai/dsh-llm'));
-    const { Loader } = await import(resolveDshModule('@deepseek-ai/cordis-plugin-loader'));
+    const { Loader, EntryTree } = await import(resolveDshModule('@deepseek-ai/cordis-plugin-loader'));
     const { RoutedAgentLoop } = await import('../plugin/agent-loop.mjs');
     const { BridgeBackend } = await import('../src/backend.mjs');
     const { createClaudeCatalogAdapter } = await import('../plugin/catalog-adapter.mjs');
@@ -49,6 +49,19 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
         : name === 'dsh-fs-local' ? { cwd: directory } : {});
     }
     if (typeof ctx.tools.setExecutor === 'function') await ctx.plugin(await official('dsh-tool-executor-native'), {});
+    const NativeSettings = await official('dsh-tool-subagent/model-selection-settings');
+    class SettingsTree extends EntryTree { write() {} }
+    const settingsTree = new SettingsTree(ctx.extend({ baseUrl: resolveDshModule('@deepseek-ai/dsh-session') }));
+    const nativeSettings = enabled => ({ id: 'subagent-model-selection-settings',
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings', inject: ['claudeSubagentPolicyGate'],
+      config: { enabled, allowedModels: [{ provider: 'ordinary', model: 'fixture' }] } });
+    await settingsTree.root.update([nativeSettings(true), { id: 'claude-subagent-settings-gate',
+      name: new URL('../plugin/subagent-settings.mjs', import.meta.url).href }]);
+    await settingsTree.await();
+    ctx.effect(() => () => settingsTree.root.stop(), 'fixture settings tree');
+    const settingsEntry = () => settingsTree.resolve('subagent-model-selection-settings');
+    assert.equal(settingsEntry().fiber.runtime.Config, NativeSettings.Config);
+    assert.ok(ctx.subagentModelSelection instanceof NativeSettings);
     await ctx.plugin(await official('dsh-session-persistence-jsonl'), { root: join(directory, 'sessions') });
     await ctx.agentPresets.register({ id: 'standard', plugins: [{ id: 'tool-subagent',
       name: pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href,
@@ -117,11 +130,16 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     await ctx.plugin(RoutedAgentLoop, { agents: [] });
     const activations = [], startActivation = ctx.subagents.startActivation;
     ctx.subagents.startActivation = function(spec) { activations.push(spec); return startActivation.call(this, spec); };
-    const create = async (id, reasoningEffort, ordinary = false) => (await ctx.agentLoop.createAgent(ctx, {
-      sessionId: id, meta: { agentPreset: ordinary ? 'standard' : 'claude-sdk-remote', cwd: directory },
-      agentOptions: { provider: ordinary ? 'ordinary' : 'claude-sdk-remote', model: ordinary ? 'fixture' : 'haiku', reasoningEffort },
-      setup: async inner => { await ctx.agentPresets.mount(inner, ordinary ? 'standard' : 'claude-sdk-remote'); },
-    })).agent;
+    const owners = new Map();
+    const create = async (id, reasoningEffort, ordinary = false) => {
+      const owner = await ctx.agentLoop.createAgent(ctx, {
+        sessionId: id, meta: { agentPreset: ordinary ? 'standard' : 'claude-sdk-remote', cwd: directory },
+        agentOptions: { provider: ordinary ? 'ordinary' : 'claude-sdk-remote', model: ordinary ? 'fixture' : 'haiku', reasoningEffort },
+        setup: async inner => { await ctx.agentPresets.mount(inner, ordinary ? 'standard' : 'claude-sdk-remote'); },
+      });
+      owners.set(id, owner);
+      return owner.agent;
+    };
     const signal = new AbortController().signal;
     const assemble = agent => ctx.systemPrompt.assemble({ agent, scope: agent, signal });
 
@@ -146,6 +164,7 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
     const policy = agent => ctx.sessionProjections.stateOf(agent.session, 'subagentModelSelectionPolicy');
     assert.deepEqual(policy(a).map(row => row.model), ['haiku', 'sonnet']);
     assert.deepEqual(policy(b).map(row => row.model), ['haiku']);
+    if (typeof ctx.tools.setExecutor === 'function') assert.deepEqual(policy(ordinary), [{ provider: 'ordinary', model: 'fixture' }]);
     const definition = agent => ctx.tools.get('subagent', agent);
     assert.notEqual(definition(a), definition(b));
     assert.match(definition(a).parameters.properties.reasoning_effort.description, /model-default/);
@@ -161,8 +180,20 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
       await child.activityDone;
       const query = queries.find(row => row.dshSessionId === child.id);
       assert.ok(query, child.session.snapshotEvents().filter(row => row.type.includes('error')));
+      assert.deepEqual(policy(child), policy(parent));
       return { child, query, config: child.session.requestHeader().config };
     };
+    await t.test('真实Host全局开关不采样远程策略，普通会话仍读取原生设置', async () => {
+      await settingsEntry().update({ config: nativeSettings(false).config });
+      assert.equal(policy(await create('ordinary-global-off', undefined, true)), null);
+      assert.deepEqual(policy(await create('remote-global-off', 'high')).map(row => row.model), ['haiku', 'sonnet']);
+      backend.displayCatalog = async () => { throw new Error('synthetic missing snapshot'); };
+      try { assert.equal(policy(await create('remote-global-off-offline', 'high')), null); }
+      finally { backend.displayCatalog = cachedDisplay; }
+      await settingsEntry().update({ config: nativeSettings(true).config });
+      const enabled = await create('ordinary-global-on', undefined, true);
+      if (typeof ctx.tools.setExecutor === 'function') assert.deepEqual(policy(enabled), [{ provider: 'ordinary', model: 'fixture' }]);
+    });
     await t.test('省略继承，以及同模型明确默认强度交错执行', async () => {
       const inherited = await run(a);
       assert.equal(inherited.child.options.reasoningEffort, 'high');
@@ -408,5 +439,44 @@ test('实际 rc5：远程子代理选型按Agent隔离并进入真实spawn/heade
         catalog = { status: 'ok', models: [haiku, sonnet] };
         await backend.saveModelPreferences({ enabledIds: ['haiku', 'sonnet'] });
       }
+    });
+    await t.test('恢复既有策略或无策略seeded历史时，不采样全局或扩展Claude允许列表', async () => {
+      const restore = async id => {
+        await owners.get(id).dispose();
+        const owner = await ctx.agentLoop.resume(ctx, { resumeSessionId: id,
+          agentOptions: { provider: 'claude-sdk-remote', model: 'haiku' },
+          setup: async inner => { await ctx.agentPresets.mount(inner, 'claude-sdk-remote'); } });
+        owners.set(id, owner);
+        return owner.agent;
+      };
+      const captured = await create('remote-policy-restored', 'high');
+      const before = policy(captured);
+      backend.displayCatalog = async () => ({ status: 'ok', models: [haiku] });
+      try {
+        const restored = await restore(captured.id);
+        assert.deepEqual(policy(restored), before);
+        assert.equal(restored.session.snapshotEvents().filter(row => row.type === 'subagent/model-selection-policy').length, 1);
+      } finally { backend.displayCatalog = cachedDisplay; }
+      for (const allowedModels of [undefined, [{ provider: 'claude-sdk-remote', model: 'haiku' }]]) {
+        const id = allowedModels ? 'remote-seeded-policy' : 'remote-seeded-no-policy';
+        const record = allowedModels
+          ? { type: 'subagent/model-selection-policy', data: { allowedModels } }
+          : { type: 'plugin:fixture/seed', ignorable: true, data: { version: 1 } };
+        const owner = await ctx.agentLoop.createAgent(ctx, { sessionId: id, seed: [{ seq: 0, time: 0, ...record }],
+          meta: { agentPreset: 'claude-sdk-remote', cwd: directory },
+          agentOptions: { provider: 'claude-sdk-remote', model: 'haiku' },
+          setup: async inner => { await ctx.agentPresets.mount(inner, 'claude-sdk-remote'); } });
+        owners.set(id, owner);
+        assert.deepEqual(policy(owner.agent), allowedModels ?? null);
+        assert.deepEqual(policy(await restore(id)), allowedModels ?? null);
+      }
+      // Disposing the wrapper releases the real native service and its listener;
+      // remounting the original service restores ordinary Host behavior.
+      const original = nativeSettings(true);
+      delete original.inject;
+      await settingsTree.root.update([original]);
+      await settingsTree.await();
+      const ordinaryRestored = await create('ordinary-native-restored', undefined, true);
+      if (typeof ctx.tools.setExecutor === 'function') assert.deepEqual(policy(ordinaryRestored), [{ provider: 'ordinary', model: 'fixture' }]);
     });
   });

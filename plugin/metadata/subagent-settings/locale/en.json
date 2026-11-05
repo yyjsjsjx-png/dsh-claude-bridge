@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote subagent policy isolation",
+    "description": "Keeps ordinary Host model settings and remote Claude account routes separate."
+  }
+}

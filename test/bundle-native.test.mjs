@@ -70,15 +70,22 @@ test('实际 rc5：标准 bundle 接受不同版本号并检查实际 Host 能�
   const files = boot.bundlePatchPaths(root, manifest.dsh.bundle)
   const patches = files.flatMap(path => boot.loadOverlayPatches('dsh', path))
   const rows = boot.composeEntries([patches.filter(patch => patch.insert)])
-  assert.equal(rows.length, 5)
+  assert.equal(rows.length, 6)
   const source = { id: 'agent-loop', name: '@deepseek-ai/dsh-agent-loop', config: {
     agents: [{ id: 'preserved', provider: 'ordinary', model: 'fixture' }], maxParallelToolCalls: 3,
   } }
-  const composed = boot.composeEntries([[{ insert: [source] }], patches])
+  const settings = { id: 'subagent-model-selection-settings', name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings',
+    config: { enabled: true, allowedModels: [{ provider: 'ordinary', model: 'fixture' }] } }
+  const composed = boot.composeEntries([[{ insert: [source, settings] }], patches])
   const inherited = composed.find(row => row.id === 'agent-loop')
   assert.equal(inherited.disabled, true)
   assert.deepEqual(inherited.config, source.config)
   assert.deepEqual(composed.find(row => row.id === 'claude-agent-loop').config, { sourceEntry: 'agent-loop' })
+  assert.equal(composed.find(row => row.id === settings.id).name, settings.name)
+  assert.deepEqual(composed.find(row => row.id === settings.id).inject, ['claudeSubagentPolicyGate'])
+  assert.deepEqual(composed.find(row => row.id === settings.id).config, settings.config)
+  await access(boot.resolvePluginResource('dsh-claude-bridge/subagent-settings', pathToFileURL(join(root, 'package.json')).href))
+  assert.deepEqual(boot.composeEntries([[{ insert: [settings] }]]).find(row => row.id === settings.id), settings)
   for (const row of rows) {
     assert.ok(row.name === manifest.name || row.name.startsWith(manifest.name + '/'))
     await access(boot.resolvePluginResource(row.name, pathToFileURL(join(root, 'package.json')).href))

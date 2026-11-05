@@ -20,6 +20,9 @@
     "./session-policy": "./plugin/session-controller.mjs",
     "./session-policy/locale/*": "./plugin/metadata/session-policy/locale/*",
     "./session-policy/icon": "./plugin/metadata/session-policy/icon.svg",
+    "./subagent-settings": "./plugin/subagent-settings.mjs",
+    "./subagent-settings/locale/*": "./plugin/metadata/subagent-settings/locale/*",
+    "./subagent-settings/icon": "./plugin/metadata/preset/icon.svg",
     "./preset": "./plugin/preset-service.mjs",
     "./preset/locale/*": "./plugin/metadata/preset/locale/*",
     "./preset/icon": "./plugin/metadata/preset/icon.svg"
