@@ -67,7 +67,8 @@ export function installRemoteNativeTitles(ctx, { normalizeSessionTitle, report =
           ? service.config.maxTitleBytes : 80
         const title = normalizeSessionTitle(value, maxBytes)
         if (!title) { diagnose('SDK_TITLE_INVALID'); return false }
-        const first = ctx.sessionProjections.stateOf(session, 'titleInput')?.first
+        const first = (typeof service.titleInputOf === 'function' ? service.titleInputOf(session)
+          : ctx.sessionProjections.stateOf(session, 'titleInput'))?.first
         if (!first || !Number.isSafeInteger(first.seq)) return false
         const current = service.get(session)
         // Matching fallback text still needs one durable confirmation that the

@@ -3,6 +3,7 @@ import {
   CLAUDE_PRESET, CLAUDE_PROVIDER, EnginePolicyError, planSessionCreation, decodeRemoteCreationSelection,
   assertModelForPreset, assertPresetUnchanged,
 } from './policy.mjs';
+import { currentDshSelection } from '../src/dsh-tool-execution.mjs';
 
 function remoteFailure(RemoteError, code, message, data = {}) {
   return new RemoteError(code, message, data);
@@ -33,14 +34,16 @@ async function attachedAgent(controller, sessionId) {
 
 function presetForAgent(ctx, RemoteError, agent) {
   return checkedPreset(RemoteError, agent.session,
-    ctx.sessionProjections.stateOf(agent.session, 'agentPreset'));
+    typeof ctx.agentPresets?.presetForSession === 'function' ? ctx.agentPresets.presetForSession(agent.session)
+      : ctx.sessionProjections.stateOf(agent.session, 'agentPreset'));
 }
 
 /** Read a preset without exposing or logging the session transcript. */
 async function existingPreset(ctx, RemoteError, sessionId) {
   const attached = ctx.sessions.get(sessionId);
   if (attached) return checkedPreset(RemoteError, attached,
-    ctx.sessionProjections.stateOf(attached, 'agentPreset'));
+    typeof ctx.agentPresets?.presetForSession === 'function' ? ctx.agentPresets.presetForSession(attached)
+      : ctx.sessionProjections.stateOf(attached, 'agentPreset'));
   let observation;
   try {
     observation = await ctx.sessionQuery.observeSession(sessionId);
@@ -82,7 +85,8 @@ async function restoreRemoteBlank(controller, ctx, RemoteError, input) {
   if (cwd !== undefined && agent.session.header.cwd !== cwd) {
     throw remoteFailure(RemoteError, 'session/model-unavailable', '原会话的工作目录与当前工作区不一致。', { sessionId });
   }
-  const boundary = ctx.sessionProjections.stateOf(agent.session, 'turnBoundary');
+  const boundary = typeof ctx.agents?.turnBoundaryOf === 'function' ? ctx.agents.turnBoundaryOf(agent.session)
+    : ctx.sessionProjections.stateOf(agent.session, 'turnBoundary');
   if (boundary !== undefined && (boundary.openTurnStartSeq !== null || boundary.lastTurn !== 0)) {
     throw remoteFailure(RemoteError, 'session/model-unavailable', '该会话已开始，不能作为新建会话复用。', { sessionId });
   }
@@ -174,8 +178,7 @@ export function makeGuardedSessionController(Base, RemoteError) {
       catch (error) { policyFailure(RemoteError, error, request.sessionId); }
       const backend = preset === CLAUDE_PRESET ? this.bridgeContext.get?.('claudeBridge')?.backend : undefined;
       if (typeof backend?.applyModelEffortPreference === 'function') {
-        const state = this.bridgeContext.sessionProjections.stateOf(agent.session, 'modelSelection');
-        const current = state?.pending ?? state?.lastUsed ?? agent.session.requestHeader?.()?.config;
+        const current = currentDshSelection(this.bridgeContext, agent);
         request = { ...request, ...await backend.applyModelEffortPreference(request, current) };
       }
       const selected = await super.selectModel(request);
@@ -193,7 +196,8 @@ export function makeGuardedSessionController(Base, RemoteError) {
       const state = ctx.sessionProjections.stateOf(agent.session, 'modelSelection');
       if (state === undefined) throw new Error('模型选择投影尚未就绪。');
       const header = agent.session.requestHeader();
-      const selection = state.pending ?? header?.config ?? ctx.agentDefaultModel.currentSelection();
+      const selection = typeof agent.model?.current === 'function' ? agent.model.current()
+        : state.pending ?? header?.config ?? ctx.agentDefaultModel.currentSelection();
       if (preset === CLAUDE_PRESET && state.pending === null && header === undefined) {
         throw remoteFailure(RemoteError, 'session/model-unavailable', '远程会话尚未记录初始模型。',
           { sessionId: request.sessionId });

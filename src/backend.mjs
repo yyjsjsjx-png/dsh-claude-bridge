@@ -44,6 +44,7 @@ import { catalogConnectionIdentity, catalogDisplayModels, readDisplayCatalog } f
 import { createRunProgressReporter, RUN_PROGRESS_RECORD } from './run-progress.mjs'
 import { RunStepLifecycle } from './step-lifecycle.mjs'
 import { assertPreparedInstructionAudit } from './instruction-audit.mjs'
+import { currentDshSelection, createStepToolAdmission, executeDshTool } from './dsh-tool-execution.mjs'
 
 const clientVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const USER_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -56,9 +57,8 @@ function failure(code, message) {
   return error
 }
 
-function selectionFor(ctx, agent) {
-  const projection = ctx.sessionProjections.stateOf(agent.session, 'modelSelection')
-  const selected = projection?.pending ?? agent.session.requestHeader()?.config ?? agent.options
+function selectionFor(ctx, agent, prepared) {
+  const selected = prepared ?? currentDshSelection(ctx, agent)
   if (selected?.provider !== CLAUDE_PROVIDER || typeof selected.model !== 'string' || !selected.model) {
     throw failure('ENGINE_SELECTION_REQUIRED', '请从新会话入口选择远程模型。')
   }
@@ -1023,9 +1023,9 @@ export class BridgeBackend {
       renderPrompt: assembly => this.helpers.renderPrompt(assembly) })
   }
 
-  prepareMessages(agent, assembly, messages, signal, continuation = false) {
+  prepareMessages(agent, assembly, messages, signal, continuation = false, modelSelection) {
     const prepared = prepareRequestMessages({ assembly, messages, continuation,
-      context: this.helpers.assembleContextFor(agent, signal),
+      context: { ...this.helpers.assembleContextFor(agent, signal), ...(modelSelection ? { modelSelection } : {}) },
       refreshContext: (accepted, context) => this.ctx.systemPrompt.refreshContext(accepted, context),
       renderContextSections: refreshed => this.helpers.renderContextSections(refreshed),
       joinContextSections: sections => this.helpers.joinContextSections(sections),
@@ -1039,6 +1039,12 @@ export class BridgeBackend {
   }
 
   async performRunStep(agent, decision) {
+    const admission = createStepToolAdmission(decision.toolSet)
+    try { return await this.performAdmittedRunStep(agent, decision, admission) }
+    finally { admission.close() }
+  }
+
+  async performAdmittedRunStep(agent, decision, admission) {
     const enteredAt = performance.now()
     const { phase, turn, step, signal, selected } = this.admitRunStep(agent, decision)
     const runId = randomUUID()
@@ -1051,6 +1057,7 @@ export class BridgeBackend {
     if (this.initialized?.capabilities?.historySync === true) binding = await this.syncRunHistory(agent, signal)
     timing('history_checked')
     const request = await this.prepareRunRequest(agent, decision, { selected, binding, signal, timing, nativeWebTools: contextPreferences.nativeWebTools === true, nativeWebResultPages: contextPreferences.nativeWebResultPages === true })
+    request.toolAdmission = admission
     const run = this.createRun(agent, { runId, phase, turn, step, signal, timing, selected, request })
     // Mutable per-run flow state shared by the start, failure and finish stages.
     const flow = { transport, onStop: undefined, startedAt: undefined }
@@ -1071,7 +1078,7 @@ export class BridgeBackend {
     if (phase?.kind !== 'running') throw failure('INVALID_AGENT_PHASE', '会话尚未进入执行阶段。')
     const { turn, step, abort: { signal } } = phase
     signal.throwIfAborted()
-    const selected = selectionFor(this.ctx, agent)
+    const selected = selectionFor(this.ctx, agent, decision.selection)
     // Fail before connecting or starting a model request. This is an admission
     // check, not an implicit command: actual executions retain native policy.
     const shell = requiredShellName()
@@ -1113,7 +1120,7 @@ export class BridgeBackend {
     timing('tools_converted')
     this.compatibility = converted.compatibility
     const { assembly } = prepared
-    const messages = this.prepareMessages(agent, assembly, decision.messages, signal)
+    const messages = this.prepareMessages(agent, assembly, decision.messages, signal, false, selected)
     const media = { attachments: this.ctx.attachments, signal,
       imageInput: converted.tools.some(tool => tool.name === 'read_image'),
       mapHostPath: path => this.ctx.fs.processPathFromHostPath(path) }
@@ -1134,6 +1141,7 @@ export class BridgeBackend {
       signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
       compatibility: converted.compatibility, requestedModel: selected.model, requestedEffort: selected.reasoningEffort,
+      requestedProvider: selected.provider, toolAdmission: request.toolAdmission,
       nativeWebTools: request.nativeWebTools, nativeWebResultPages: request.nativeWebResultPages, callEvents: new Map(), settledToolIds: new Set(), nativeApprovals: new Map(), nativeResultHashes: new Map(),
       toolNames: new Set(converted.tools.map(tool => tool.name)), concluded: false }
   }
@@ -1303,6 +1311,7 @@ export class BridgeBackend {
     if (run.preparationError) throw run.preparationError
     if (run.concluded || run.inputClosed) return { continue: false }
     this.requireSettledStepTools(run)
+    run.toolAdmission?.release()
     const { agent } = run
     if (typeof agent.preStep !== 'function') throw failure('DSH_PRE_STEP_UNAVAILABLE', '当前 DSH 未提供所需的步骤准备接口。')
     const pending = [...agent.inbox.nextStep]
@@ -1313,7 +1322,12 @@ export class BridgeBackend {
       decision = await agent.preStep('next-step', run.steps.beginPreparation())
       signal.throwIfAborted()
       if (decision.kind === 'reject') throw failure('DSH_PRE_STEP_REJECTED', 'DSH 拒绝继续当前步骤，已停止远端推理。')
-      const tools = await this.convertTools(decision.assembly, selectionFor(this.ctx, agent), run.catalogModels, run.nativeWebTools)
+      const selected = selectionFor(this.ctx, agent, decision.selection)
+      if (decision.selection && (selected.provider !== run.requestedProvider || selected.model !== run.requestedModel
+        || selected.reasoningEffort !== run.requestedEffort)) {
+        throw failure('QUERY_CONFIGURATION_CHANGED', '运行期间模型选择已更新，本轮已在安全边界停止；继续时将使用新选择。')
+      }
+      const tools = await this.convertTools(decision.assembly, selected, run.catalogModels, run.nativeWebTools)
       const prepared = this.prepareRequest(agent, decision, tools)
       const promptChanged = prepared.renderSystemPrompt() !== run.systemPrompt
       if (promptChanged || prepared.toolSignature !== run.toolSignature) {
@@ -1321,7 +1335,7 @@ export class BridgeBackend {
           ? '运行期间系统提示发生变化，本轮已在安全边界停止并保留原对话；恢复原预设配置后可继续。'
           : '运行期间工具集合已更新，本轮已在安全边界停止并保留当前对话；继续时将重新检查最新工具。')
       }
-      const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true)
+      const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true, selected)
       const additionalContexts = [], userMessages = []
       const capabilities = this.initialized?.capabilities
       let hasUserImages = false
@@ -1352,6 +1366,7 @@ export class BridgeBackend {
       if (run.inputClosed) throw failure('USER_INPUT_CLOSED', '当前运行已结束接收插话，未发送消息已保留。')
       for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
       run.projection.advanceStep(run.steps.completePreparation())
+      run.toolAdmission?.replace(decision.toolSet)
       accepted = true
       this.diagnostics.event('step.prepared', { runId: run.runId, stage: 'pre-step' })
       return { ...(additionalContexts.length ? { additionalContexts } : {}),
@@ -1362,6 +1377,8 @@ export class BridgeBackend {
       throw error
     } finally {
       if (!accepted) {
+        if (run.toolAdmission) run.toolAdmission.release(decision?.toolSet)
+        else decision?.toolSet?.dispose()
         // preStep claims from the durable inbox. Restore unsent context on a
         // rejected configuration or cancellation, including newly found files.
         const restore = [...pending, ...(decision?.messages ?? [])]
@@ -1431,9 +1448,9 @@ export class BridgeBackend {
           const finishPipeline = startLocalRunPhase({ runId: run.runId, stage: 'tool_pipeline', callId: params.callId,
             onTiming: fields => this.diagnostics.event('perf.local', fields) })
           try {
-            result = await this.ctx.agents.withInitiator(agent, () => this.ctx.tools.execute({
+            result = await this.ctx.agents.withInitiator(agent, () => executeDshTool(this.ctx.tools, {
               callId: params.callId, name: params.name, arguments: params.arguments, agent, signal,
-            }))
+            }, run.toolAdmission?.current))
           } finally { finishPipeline() }
         } catch (error) {
           if (!dispatched) {
@@ -1568,19 +1585,26 @@ export class BridgeBackend {
       try { parsed = JSON.parse(call.arguments) } catch { return deny }
       if (!isDeepStrictEqual(parsed, params.input)) return deny
       const tools = this.ctx.tools
-      if (typeof tools?.prepareScheduledExecution !== 'function' || typeof tools.get !== 'function') {
+      const Pipeline = this.helpers.ToolExecutionPipeline
+      if (typeof tools?.get !== 'function' || typeof tools.prepareScheduledExecution !== 'function'
+        && typeof Pipeline !== 'function') {
         return { behavior: 'deny', message: '当前 DSH 无法核对原生网页工具权限。' }
       }
       const signal = AbortSignal.any([run.signal, context.signal])
       const name = params.toolName === 'WebSearch' ? 'web_search' : 'web_fetch'
-      if (!tools.get(name, run.agent) || signal.aborted) return deny
+      if (!tools.get(name, run.agent, run.toolAdmission?.current) || signal.aborted) return deny
       const args = name === 'web_search' ? { queries: [parsed.query] } : { url: parsed.url }
       if (!run.nativeApprovals.has(params.toolUseId)) {
         // Run the actual DSH policy and guards, without invoking the DSH tool body.
         const request = this.ctx.agents.withInitiator(run.agent, async () => {
-          const prepared = await tools.prepareScheduledExecution({
+          const input = {
             agent: run.agent, name, callId: params.toolUseId, arguments: args, signal,
-          })
+            ...(run.toolAdmission?.current ? { toolSet: run.toolAdmission.current } : {}),
+          }
+          const prepare = typeof tools.prepareScheduledExecution === 'function'
+            ? value => tools.prepareScheduledExecution(value)
+            : value => (this.nativeToolPipeline ??= new Pipeline(this.ctx)).prepare(value)
+          const prepared = await prepare(input)
           return prepared?.kind === 'dispatch' && !signal.aborted ? { behavior: 'allow' } : deny
         })
         run.nativeApprovals.set(params.toolUseId, request)

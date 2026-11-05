@@ -19,6 +19,74 @@ const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
 const nextClientVersion = `${BigInt(currentClientVersion.split('.')[0]) + 1n}.0.0`
 
+test('新版步骤准入随工具批次切换，batch结果仍由Bridge写日志，准备快照不被新选型改写', async t => {
+  const closed = [], calls = []
+  const initial = { dispose() { closed.push('initial') } }, next = { dispose() { closed.push('next') } }
+  const selection = { provider, model: 'prepared-model', reasoningEffort: 'low' }
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    assert.equal(params.model, 'prepared-model')
+    const run = f.backend.runs.get(params.runId)
+    await run.projection.modelStart('first')
+    run.projection.committedToolCalls.set('call-a', { name: 'local_command', arguments: '{"command":"test"}' })
+    const reply = await handlers.handlers['tool.execute']({ runId: params.runId, callId: 'call-a',
+      name: 'local_command', arguments: { command: 'test' } }, { signal: new AbortController().signal })
+    assert.deepEqual(reply.content, [{ type: 'text', text: 'ok' }])
+    assert.deepEqual(closed, [])
+    await handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+    assert.deepEqual(closed, ['initial'])
+    await run.projection.modelStart('second')
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.decision.selection = selection; f.decision.toolSet = initial
+  f.agent.model = { current: () => ({ provider, model: 'later-model' }) }
+  f.agent.inbox = { nextStep: [], splice() { assert.fail('无需恢复') } }
+  f.agent.preStep = async () => ({ ...f.decision, toolSet: next, messages: [] })
+  f.ctx.tools.resolve = () => {}; f.ctx.tools.setExecutor = () => {}
+  f.ctx.tools.execute = async input => {
+    calls.push(input); assert.equal(input.toolSet, initial); assert.equal(input.log, undefined)
+    return { results: [{ callId: 'call-a', result: { content: [{ type: 'text', text: 'ok' }] } }], additionalContexts: [], concluded: false }
+  }
+  await f.backend.runStep(f.agent, f.decision)
+  assert.deepEqual(closed, ['initial', 'next']); assert.equal(calls.length, 1)
+  assert.equal(f.records.filter(event => event.type === 'tool/call').length, 1)
+  assert.equal(f.records.filter(event => event.type === 'tool/result').length, 1)
+})
+
+test('新版续步模型变化时释放新旧准入，停止SDK续推理且保留未发送输入', async t => {
+  const closed = []
+  const initial = { dispose() { closed.push('initial') } }, rejected = { dispose() { closed.push('rejected') } }
+  const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    const run = f.backend.runs.get(params.runId)
+    await run.projection.modelStart('first')
+    return handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+  } }, async close() {} }))
+  f.decision.selection = f.selection; f.decision.toolSet = initial
+  f.agent.inbox = { nextStep: [], splice() { assert.fail('本例没有新输入') } }
+  f.agent.preStep = async () => ({ ...f.decision, selection: { provider, model: 'changed' }, toolSet: rejected, messages: [] })
+  await assert.rejects(f.backend.runStep(f.agent, f.decision), { code: 'QUERY_CONFIGURATION_CHANGED' })
+  assert.deepEqual(closed, ['initial', 'rejected'])
+})
+
+test('新版原生网页使用公开Pipeline.prepare核对权限，携带本步准入且不执行工具正文', async () => {
+  const signal = new AbortController().signal, toolSet = {}, input = { query: 'fixture' }
+  const agent = {}, run = { signal, agent, step: 1, nativeWebTools: true, nativeApprovals: new Map(),
+    settledToolIds: new Set(), toolAdmission: { current: toolSet }, projection: { committedToolCalls: new Map([
+      ['web-a', { name: 'WebSearch', step: 1, arguments: JSON.stringify(input) }],
+    ]) } }
+  let prepared = 0
+  const backend = Object.assign(Object.create(BridgeBackend.prototype), { runs: new Map([['run-a', run]]),
+    ctx: { tools: { get(name, actual, admission) { assert.equal(name, 'web_search'); assert.equal(actual, agent); assert.equal(admission, toolSet); return {} } },
+      agents: { withInitiator(_agent, action) { return action() } } }, helpers: { ToolExecutionPipeline: class {
+      async prepare(value) { prepared++; assert.equal(value.toolSet, toolSet); assert.deepEqual(value.arguments, { queries: ['fixture'] }); return { kind: 'dispatch' } }
+    } } })
+  const params = { runId: 'run-a', toolUseId: 'web-a', toolName: 'WebSearch', input }
+  assert.deepEqual(await backend.dispatchApproval(params, { signal }), { behavior: 'allow' })
+  assert.deepEqual(await backend.dispatchApproval(params, { signal }), { behavior: 'allow' })
+  assert.equal(prepared, 1)
+})
+
 test('启动诊断保留 Host 证据分级，记录未自动实测项且不连接服务器', async t => {
   const checks = [
     { id: 'host-interfaces', evidence: 'interface', status: 'passed' },
