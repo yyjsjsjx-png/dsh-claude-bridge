@@ -6,6 +6,7 @@ import { nativeChat } from './fixtures/native-chat.mjs'
 import { strictSession } from './fixtures/native-persistence.mjs'
 import { resolveDshModule } from '../plugin/compat/resolve-dsh-module.mjs'
 import { createRunProgressReporter } from '../src/run-progress.mjs'
+import { createClient } from '../plugin/ui/client/entry.mjs'
 
 const record = 'plugin:claude-bridge/compaction'
 const native = Boolean(process.versions.electron && process.env.DSH_CLAUDE_BRIDGE_RESOURCES)
@@ -130,4 +131,41 @@ test('实际rc5：老进度重复采样去重，新旧标记共存不重复，�
     data: { ...f.records[0].data, runId: 'run-2' } }
   chat.append(otherRun)
   assert.equal(cards().length, 3)
+})
+
+test('实际原生排序：压缩前后文字按真实事件排列，卡片不越过已有输出，冷回放与实时一致', { skip: !native }, async () => {
+  const { Session, SESSION_FORMAT_VERSION, appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'))
+  const helpers = await import(resolveDshModule('@deepseek-ai/dsh-llm'))
+  for (const placement of ['before-first', 'after-earlier-step', 'after-same-step']) {
+    const session = Session.create(`compact-order-${placement}`, undefined, { version: SESSION_FORMAT_VERSION,
+      id: `compact-order-${placement}`, createdAt: 0, delegationDepth: 0, isSeeded: false, agentPreset: 'claude-sdk-remote' })
+    const append = (step, content) => session.append('assistant/message', { turn: 1, step, stream: [],
+      message: helpers.createAssistantMessage({ content, source: { provider: 'claude-sdk-remote', model: 'fixture' } }) },
+    { surfaceOp: 'append' })
+    session.append('turn/start', { turn: 1 }); session.append('step/start', { turn: 1, step: 1 })
+    if (placement !== 'before-first') {
+      append(1, [{ type: 'text', text: '合成压缩前输出' }])
+    }
+    if (placement === 'after-earlier-step') {
+      session.append('step/end', { turn: 1, step: 1 }); session.append('step/start', { turn: 1, step: 2 })
+    }
+    const step = placement === 'after-earlier-step' ? 2 : 1
+    const marker = appendPluginRecord(session, record, { version: 1, runId: 'run', turn: 1, step,
+      completedAt: 100, trigger: 'auto', preTokens: 900 })
+    append(step, [{ type: 'text', text: '合成压缩后说明' }, { type: 'tool-call', id: 'after', name: 'fixture', arguments: '{}' }])
+    session.append('tool/call', { turn: 1, step, callId: 'after', name: 'fixture', arguments: '{}' })
+    for (const lifecycle of ['cold', 'live']) {
+      const chat = await nativeChat(), f = fixture()
+      createClient({ createUsageProjectionBridge: () => () => {} }).installTranscriptOrder(chat.ctx)
+      f.install({ ...chat.ctx, ...f.slotContext })
+      if (lifecycle === 'cold') chat.replace(session.snapshotEvents())
+      else for (const event of session.snapshotEvents()) chat.append(event)
+      const order = chat.order().filter(node => ['assistant-step', 'claude-bridge-compaction', 'tool-call'].includes(node.kind))
+      const expected = placement === 'after-same-step' ? ['assistant-step', 'claude-bridge-compaction', 'tool-call']
+        : [...placement === 'after-earlier-step' ? ['assistant-step'] : [],
+          'claude-bridge-compaction', 'assistant-step', 'tool-call']
+      assert.deepEqual(Array.from(order, node => node.kind), expected, `${placement}/${lifecycle}`)
+      assert.equal(order.find(node => node.kind === 'claude-bridge-compaction').anchorSeq, marker, '卡片保留完成事件位置')
+    }
+  }
 })

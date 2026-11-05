@@ -1597,8 +1597,9 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
   const originalForEvent = registry.forEvent;
   const wrappedForEvent = function(type) {
     const routes = originalForEvent.call(this, repairs[type] ?? type);
-    const kind = repairs[type] === 'assistant/message' ? 'assistant-step' : 'tool-call';
-    return repairs[type] ? new Set([...routes].filter(route => route.definition.kind === kind).map(({ definition, match }) => ({
+    const kinds = repairs[type] === 'assistant/message' ? ['assistant-step', 'process-evidence']
+      : ['tool-call', 'process-evidence'];
+    return repairs[type] ? new Set([...routes].filter(route => kinds.includes(route.definition.kind)).map(({ definition, match }) => ({
       definition, match: event => match(eventView(event)),
     }))) : routes;
   };
@@ -1606,18 +1607,20 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
   const reconcile = () => {
     let changed = false;
     for (const definition of registry.entries()) {
-      if (!['assistant-step', 'tool-call'].includes(definition.kind) || installed.has(definition)) continue;
-      if (typeof definition.buildViewNode !== 'function' || typeof definition.update !== 'function') {
+      if (!['assistant-step', 'tool-call', 'process-evidence'].includes(definition.kind) || installed.has(definition)) continue;
+      if (typeof definition.update !== 'function' || definition.kind !== 'process-evidence'
+        && typeof definition.buildViewNode !== 'function') {
         throw new Error('远程会话插件无法加载：DSH 消息展示接口不兼容。');
       }
       const methods = new Map();
-      for (const name of ['update', 'buildViewNode', 'buildLocationData', 'publication']) {
+      for (const name of ['start', 'update', 'buildViewNode', 'buildLocationData', 'publication']) {
         const original = definition[name];
         if (typeof original !== 'function') continue;
         const wrapped = function(context, ...args) {
           if (name === 'publication') return original.call(this, matchView(context), ...args);
           context = contextView(context);
-          const result = original.call(this, context, ...(name === 'update' ? args.map(matchView) : args));
+          const result = original.call(this, context, ...(['start', 'update'].includes(name)
+            ? args.map((arg, index) => index === 0 ? matchView(arg) : arg) : args));
           if (name !== 'buildViewNode' || definition.kind !== 'assistant-step' || !result
             || !context.matches.some(({ event }) => event.type === 'assistant/message'
               && (event.data.message.source?.provider === 'claude-sdk-remote'
@@ -1630,8 +1633,14 @@ exports.installTranscriptOrder = function installTranscriptOrder(ctx) {
           }
           const start = context.start?.event.type === 'step/start' ? context.start.event
             : result.location?.kind === 'step' ? result.location.step.start : undefined;
-          const first = context.matches.find(({ event }) => event.type === 'assistant/message');
-          const anchor = start ? start.seq + 0.25 : first?.event.seq;
+          // A real message or stream owns its chronological position. Moving it
+          // back to step/start could cross a preceding SDK compaction boundary.
+          // Only a display repair without original evidence needs that fallback.
+          const first = context.matches.find(({ event }) => event.type === 'assistant/message'
+            && event.ignorable !== true);
+          const streamed = context.matches.some(({ event }) => event.type === 'assistant/live-chunk');
+          const anchor = first ? Math.min(result.anchorSeq, first.event.seq)
+            : streamed ? result.anchorSeq : start ? start.seq + 0.25 : result.anchorSeq;
           return Number.isFinite(anchor) && result.anchorSeq !== anchor ? { ...result, anchorSeq: anchor } : result;
         };
         definition[name] = wrapped;
