@@ -23,6 +23,7 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/compaction-history.test.mjs',
   'test/compaction-summary-projection.test.mjs',
   'test/dsh-tool-execution.test.mjs',
+  'test/standard-tool-results-native.test.mjs',
   'test/recovery-command.test.mjs', 'test/update-plugin.test.mjs',
 ]);
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
