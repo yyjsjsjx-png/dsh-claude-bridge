@@ -27,6 +27,9 @@ import { createModelCycleProjection, modelCycleRows } from '../src/model-cycle-p
 const { delegationDepthOf } = await import(resolveDshModule('@deepseek-ai/dsh-subagent'));
 const { z } = await import(resolveDshModule('zod'));
 const { appendPluginRecord } = await import(resolveDshModule('@deepseek-ai/dsh-session'));
+const toolModule = await import(resolveDshModule('@deepseek-ai/dsh-tools'));
+const ToolExecutionPipeline = typeof toolModule.ToolsService?.prototype?.resolve === 'function'
+  ? (await import(resolveDshModule('@deepseek-ai/dsh-tools/pipeline'))).ToolExecutionPipeline : undefined;
 const nativeTitle = await Promise.resolve().then(() => {
   const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'));
   return import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session-title')).href);
@@ -54,7 +57,7 @@ export class ClaudeBridgeService extends TypertRemoteService {
       resolveDshHome, credentialKey,
       renderPrompt, renderContextSections, joinContextSections, assembleContextFor,
       createAssistantMessage, createToolResultMessage, createSystemMessage, appendPluginRecord,
-      AssistantStreamAccumulator, BlockAssembler,
+      AssistantStreamAccumulator, BlockAssembler, ToolExecutionPipeline,
     };
     this.backend = new BridgeBackend(ctx, config, { helpers, hostCompatibility });
     ctx.inject(['sessionTitle'], titleCtx => {

@@ -1,0 +1,36 @@
+{
+  "package": "@deepseek-ai/dsh-agent-loop",
+  "version": "0.2.2-rc.1",
+  "license": "MIT",
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "commit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+  "sourceSha256": "a6fa8e0c7c90191caf5f4a3bb5c624a86e9845cf3c79d020b71420d0e20ae4c1",
+  "adaptedSha256": "10fcc91fd44b5525fc79db9d92a727ac8279941e80ee21d053cc9b23640ffd5b",
+  "officialImports": {
+    "@deepseek-ai/cordis": "dsh/node_modules/@deepseek-ai/cordis/lib/index.js",
+    "@deepseek-ai/schemastery": "dsh/node_modules/@deepseek-ai/schemastery/lib/index.mjs",
+    "zod": "dsh/node_modules/zod/index.js",
+    "@deepseek-ai/dsh-brand": "dsh/node_modules/@deepseek-ai/dsh-brand/lib/index.js",
+    "@deepseek-ai/dsh-llm": "dsh/node_modules/@deepseek-ai/dsh-llm/lib/index.js",
+    "@deepseek-ai/dsh-session": "dsh/node_modules/@deepseek-ai/dsh-session/lib/index.js",
+    "@deepseek-ai/dsh-session-persistence": "dsh/node_modules/@deepseek-ai/dsh-session-persistence/lib/index.js",
+    "@deepseek-ai/dsh-agent": "dsh/node_modules/@deepseek-ai/dsh-agent/lib/index.js",
+    "@deepseek-ai/dsh-util-values": "dsh/node_modules/@deepseek-ai/dsh-util-values/lib/index.js",
+    "@deepseek-ai/dsh-scope": "dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js",
+    "@deepseek-ai/dsh-system-prompt": "dsh/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js",
+    "@deepseek-ai/dsh-tools": "dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js",
+    "@deepseek-ai/dsh-api-session-controller": "dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/index.js",
+    "@deepseek-ai/dsh-agent-preset-registry": "dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js",
+    "@deepseek-ai/dsh-typert-protocol": "dsh/node_modules/@deepseek-ai/dsh-typert-protocol/lib/index.js",
+    "@deepseek-ai/cordis-plugin-include": "dsh/node_modules/@deepseek-ai/cordis-plugin-include/lib/index.js",
+    "js-yaml": "dsh/node_modules/js-yaml/dist/js-yaml.mjs",
+    "@deepseek-ai/dsh-home-paths": "dsh/node_modules/@deepseek-ai/dsh-home-paths/lib/index.js",
+    "@deepseek-ai/dsh-credentials": "dsh/node_modules/@deepseek-ai/dsh-credentials/lib/index.js"
+  },
+  "changes": [
+    "导入桥接构造器并传递原生 projections/lastTurn",
+    "仅远程 Agent 按动态 step 闭合",
+    "官方依赖绑定安装版 ESM 单例",
+    "加载前检查 Host 能力"
+  ]
+}

@@ -35,7 +35,7 @@ export const HOST_FUNCTIONS = Object.freeze({
 
 const HOST_METHODS = {
   '@deepseek-ai/dsh-agent-loop': {
-    AgentLoop: ['prepare', 'create', 'createAgent', 'resume', 'setupAndPublish', 'initializeAgent'],
+    AgentLoop: ['create', 'createAgent', 'resume', 'initializeAgent'],
   },
   '@deepseek-ai/cordis-plugin-loader': {
     EntryTree: ['resolve'],
@@ -96,7 +96,10 @@ export function assertHostModule(name, module, version) {
     }
   }
   if (name === '@deepseek-ai/dsh-tools') {
-    for (const key of ['TOOL_ABORTED_BEFORE_DISPATCH', 'TOOL_RUNTIME_SCHEDULER']) {
+    const modern = typeof module.ToolsService?.prototype?.resolve === 'function'
+      && typeof module.ToolsService?.prototype?.setExecutor === 'function';
+    for (const key of modern ? ['TOOL_ABORTED_BEFORE_DISPATCH', 'ToolBatchExecutionError']
+      : ['TOOL_ABORTED_BEFORE_DISPATCH', 'TOOL_RUNTIME_SCHEDULER']) {
       requireValue(module[key], `缺少 ${name}.${key}`, version);
     }
   }
@@ -107,6 +110,12 @@ export function assertHostModule(name, module, version) {
     requireValue(module.Entry.key, '缺少 Entry.key', version, 'symbol');
   }
   if (name === '@deepseek-ai/dsh-agent-loop') {
+    const prototype = module.AgentLoop.prototype;
+    if (prototype.prepare !== undefined || prototype.setupAndPublish !== undefined) {
+      for (const method of ['prepare', 'setupAndPublish']) {
+        requireValue(prototype[method], `缺少 AgentLoop.${method}()`, version, 'function');
+      }
+    }
     requireValue(module.AgentLoop.Config, '缺少 AgentLoop.Config', version);
     if (!Array.isArray(module.AgentLoop.inject)) {
       throw new DshCompatibilityError(version, '缺少 AgentLoop.inject');
