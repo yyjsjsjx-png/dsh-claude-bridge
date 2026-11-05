@@ -2,8 +2,11 @@
 window.__ModuleLoader__.load({ id: 'dsh-claude-bridge', factory: (require) => {
 const React = require('react');
 const { createPortal } = require('react-dom');
-const { useAnchoredPosition, useDismissOnOutsidePointer } = require('@deepseek-ai/dsh-client-ui-primitives');
+const { useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText } = require('@deepseek-ai/dsh-client-ui-primitives');
 const { z } = require('zod');
+const COMPACTION_SUMMARY_RECORD = "plugin:claude-bridge/compaction-summary";
+const MAX_COMPACTION_SUMMARY_BYTES = 1048576;
+const SUMMARY_CODES = ["SUMMARY_MISSING","SUMMARY_EMPTY","SUMMARY_TOO_LARGE","SUMMARY_UNPAIRED","SUMMARY_UNAVAILABLE","SUMMARY_CONFLICT"];
 
 function createStore(initial) {
   let snapshot = initial;
@@ -1513,10 +1516,68 @@ function createUsageProjectionBridge({ React }) {
   };
 }
 
-function createCompactionHistory({ React }) {
+function createCompactionSummaryRules() {
+  const count = value => Number.isSafeInteger(value) && value >= 0
+  const uuid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)
+  const own = (object, key) => Object.hasOwn(object, key) ? object[key] : undefined
+  const unavailable = code => ({ status: 'unavailable', code })
+  const normalize = value => {
+    if (value?.status !== 'available') return unavailable(SUMMARY_CODES.includes(value?.code) ? value.code : 'SUMMARY_UNAVAILABLE')
+    if (typeof value.text !== 'string') return unavailable('SUMMARY_MISSING')
+    if (new TextEncoder().encode(value.text).byteLength > MAX_COMPACTION_SUMMARY_BYTES) return unavailable('SUMMARY_TOO_LARGE')
+    if (!value.text.trim()) return unavailable('SUMMARY_EMPTY')
+    return { status: 'available', text: value.text }
+  }
+  const locator = data => typeof data.runId === 'string' && data.runId.length > 0
+    && count(data.completedAt) && count(data.anchorSeq ?? data.seq)
+    ? JSON.stringify([data.runId, data.completedAt, data.anchorSeq ?? data.seq]) : undefined
+  const initial = () => ({ summaries: {}, links: {} })
+  function apply(state, event) {
+    if (state === null || event.type !== COMPACTION_SUMMARY_RECORD || event.ignorable !== true) return state
+    const data = event.data
+    if (data?.version !== 1 || !uuid(data.boundaryUuid) || !['auto', 'manual', 'unknown'].includes(data.trigger)) return state
+    const key = `$${data.boundaryUuid}`, previous = own(state.summaries, key)
+    let summary = normalize(data.summary)
+    if (previous?.summary.status === 'available') {
+      if (summary.status !== 'available' && summary.code !== 'SUMMARY_CONFLICT') summary = previous.summary
+      else if (summary.text !== previous.summary.text) summary = unavailable('SUMMARY_CONFLICT')
+    } else if (previous?.summary.code === 'SUMMARY_CONFLICT') summary = previous.summary
+    if (previous && previous.trigger !== 'unknown' && data.trigger !== 'unknown' && previous.trigger !== data.trigger) {
+      summary = unavailable('SUMMARY_CONFLICT')
+    }
+    const entry = { boundaryUuid: data.boundaryUuid, trigger: previous?.trigger ?? data.trigger, summary }
+    const linkKey = locator(data), links = { ...state.links }
+    if (linkKey !== undefined) {
+      const previousLink = own(links, linkKey)
+      links[linkKey] = previousLink === undefined || previousLink === data.boundaryUuid ? data.boundaryUuid : null
+    }
+    return { summaries: { ...state.summaries, [key]: entry }, links }
+  }
+  function lookup(state, card) {
+    if (!state) return undefined
+    const linkKey = locator(card)
+    const boundaryUuid = uuid(card.boundaryUuid) ? card.boundaryUuid
+      : linkKey === undefined ? undefined : own(state.links, linkKey)
+    if (boundaryUuid === null || card.boundaryConflict) return unavailable('SUMMARY_CONFLICT')
+    if (!uuid(boundaryUuid)) return undefined
+    const entry = own(state.summaries, `$${boundaryUuid}`)
+    if (!entry) return undefined
+    if (card.trigger !== 'unknown' && entry.trigger !== 'unknown' && card.trigger !== entry.trigger) return unavailable('SUMMARY_CONFLICT')
+    return normalize(entry.summary)
+  }
+  return { initial, apply, lookup, normalize }
+}
+
+function createCompactionHistory({ React, MarkdownText, summaryRules }) {
   const kind = 'claude-bridge-compaction';
   const record = 'plugin:claude-bridge/compaction';
   const count = value => Number.isSafeInteger(value) && value >= 0;
+  const uuid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+  const markdownLabels = { code: { copyLabel: '复制', copiedLabel: '已复制',
+    toolbarLabels: { codeLabel: '代码', wrapLabel: '换行', unwrapLabel: '取消换行' } }, footnotes: '脚注' };
+  const unavailable = { SUMMARY_MISSING: '本次压缩没有返回摘要正文。', SUMMARY_EMPTY: '本次压缩返回的摘要正文为空。',
+    SUMMARY_TOO_LARGE: '摘要超过 1 MiB 显示上限，未截断或展示。', SUMMARY_UNPAIRED: '摘要未能与本次压缩边界可靠对应。',
+    SUMMARY_UNAVAILABLE: '原生摘要读取失败或暂不可用。', SUMMARY_CONFLICT: '同一压缩边界的摘要记录冲突，未展示正文。' };
   const dataOf = event => {
     const progress = event.data;
     // Older clients persisted the last boundary repeatedly during sampling.
@@ -1535,29 +1596,46 @@ function createCompactionHistory({ React }) {
       && ['auto', 'manual', 'unknown'].includes(data.trigger) && count(data.completedAt)
       && ['preTokens', 'postTokens', 'durationMs'].every(key => data[key] === undefined || count(data[key]));
   };
-  function CompactionMarker({ node }) {
+  function CompactionMarker({ node, useProjection }) {
     const data = node.data;
-    const label = data.trigger === 'auto' ? '自动压缩已完成'
+    const state = typeof useProjection === 'function' ? useProjection('claudeBridgeCompactionSummaries') : undefined;
+    const summary = summaryRules?.lookup(state, data);
+    const [expanded, setExpanded] = typeof React.useState === 'function' ? React.useState(false) : [false, () => {}];
+    const title = data.trigger === 'auto' ? '自动压缩已完成'
       : data.trigger === 'manual' ? '手动压缩已完成' : '上下文压缩已完成';
+    const label = data.recovered ? `${title} · 历史补录` : title;
     const details = [];
     if (count(data.preTokens)) details.push(`压缩前 ${data.preTokens.toLocaleString()} tokens`);
     if (count(data.postTokens)) details.push(`压缩后 ${data.postTokens.toLocaleString()} tokens`);
     if (count(data.durationMs)) details.push(`耗时 ${(data.durationMs / 1000).toFixed(1)} 秒`);
-    return React.createElement('details', { style: { padding: '8px 0',
+    const message = summary?.status === 'unavailable' ? unavailable[summary.code] ?? unavailable.SUMMARY_UNAVAILABLE
+      : state ? data.boundaryUuid ? '原生压缩摘要尚未送达。' : '旧记录尚未找到可可靠对应的原生摘要。'
+        : 'Claude 原生压缩已完成。当前接口未提供压缩摘要正文。';
+    return React.createElement('details', { onToggle: event => setExpanded(event.currentTarget.open), style: { padding: '8px 0',
       color: 'var(--dsw-alias-text-secondary, #777)', fontSize: '13px' } },
     React.createElement('summary', { style: { cursor: 'pointer' } }, label),
     React.createElement('div', { style: { padding: '8px 16px', whiteSpace: 'pre-wrap' } },
-      details.length ? `${details.join(' · ')}\n` : '',
-      'Claude 原生压缩已完成。当前接口未提供压缩摘要正文。'));
+      details.length ? `${details.join(' · ')}\n` : '', summary?.status === 'available'
+        ? expanded ? MarkdownText ? React.createElement(MarkdownText, { text: summary.text, labels: markdownLabels })
+          : React.createElement('pre', null, summary.text) : null : message));
   }
   return function installCompactionHistory(ctx) {
     const disposeEvent = ctx.uiConversation.events.register({
       kind, target: 'chat',
       match: event => valid(event) ? { id: `${dataOf(event).runId}:${dataOf(event).completedAt}`, role: 'start' } : null,
-      start: (_context, match) => ({ trigger: dataOf(match.event).trigger, seq: match.event.seq,
+      start: (_context, match) => ({ trigger: dataOf(match.event).trigger,
+        runId: dataOf(match.event).runId, completedAt: dataOf(match.event).completedAt,
+        ...(dataOf(match.event).recovered === true ? { recovered: true } : {}),
+        seq: count(dataOf(match.event).anchorSeq) ? dataOf(match.event).anchorSeq : match.event.seq,
+        ...(uuid(dataOf(match.event).boundaryUuid) ? { boundaryUuid: dataOf(match.event).boundaryUuid } : {}),
         ...Object.fromEntries(['preTokens', 'postTokens', 'durationMs']
           .filter(key => count(dataOf(match.event)[key])).map(key => [key, dataOf(match.event)[key]])) }),
-      update: context => context.state,
+      update: (context, match) => {
+        const boundaryUuid = dataOf(match.event)?.boundaryUuid;
+        if (!uuid(boundaryUuid)) return context.state;
+        if (context.state.boundaryUuid && context.state.boundaryUuid !== boundaryUuid) return { ...context.state, boundaryConflict: true };
+        return { ...context.state, boundaryUuid };
+      },
       buildViewNode: context => context.state === undefined ? null : {
         key: context.key, kind, id: context.id, target: 'chat', anchorSeq: context.state.seq,
         location: context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' },
@@ -1569,10 +1647,10 @@ function createCompactionHistory({ React }) {
   };
 }
 
-function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
+function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
   createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming,
-  createCompactionHistory }) {
+  createCompactionHistory, createCompactionSummaryRules }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -1670,7 +1748,8 @@ exports.installUsageProjection = createUsageProjectionBridge({ React, getClientT
 exports.apply = async function apply(ctx) {
   ctx.inject(['uiConversation'], ctx => {
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
-    if (ctx.uiConversation) ctx.effect(() => createCompactionHistory({ React })(ctx), '远程会话压缩记录');
+    if (ctx.uiConversation) ctx.effect(() => createCompactionHistory({ React, MarkdownText,
+      summaryRules: createCompactionSummaryRules() })(ctx), '远程会话压缩记录');
   });
   const json = { mode: 'src-json' };
   const descriptor = (method, parameters = []) => ({
@@ -1809,6 +1888,6 @@ exports.apply = async function apply(ctx) {
 return exports;
 }
 
-return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer,
-  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createClientReceiveTiming, createUsageProjectionBridge, createCompactionHistory });
+return createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText,
+  createStore, textError, createSettingsController, createModelController, createQuotaController, createPickerController, createMeterViews, createFormViews, createClientReceiveTiming, createUsageProjectionBridge, createCompactionSummaryRules, createCompactionHistory });
 } });
