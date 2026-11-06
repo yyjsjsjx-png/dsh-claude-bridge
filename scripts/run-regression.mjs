@@ -11,6 +11,7 @@ export const DESKTOP_VERSIONS = Object.freeze([RC5_VERSION, DEFAULT_DESKTOP_VERS
 export const RC5_NATIVE_TESTS = Object.freeze([
   'test/agent-loop-native.test.mjs',
   'test/instruction-audit-native.test.mjs',
+  'test/remote-environment-native.test.mjs',
   'test/subagent-selection-native.test.mjs',
   'test/subagent-settings-loader-native.test.mjs',
   'test/sdk-native-title-display-native.test.mjs',

@@ -2,6 +2,7 @@
 import { resolveDshModule } from './compat/resolve-dsh-module.mjs';
 import { loadRemoteComposition, publishRemotePresetStatus } from './preset-loading.mjs';
 import { installShellFailureGuard } from './shell-failure-guard.mjs';
+import { installRemoteEnvironmentContext } from './remote-environment.mjs';
 import { SUBAGENT_SETTINGS_GATE } from './presets/subagent-settings.mjs';
 
 const { EntryTree } = await import(resolveDshModule('@deepseek-ai/cordis-plugin-loader'));
@@ -78,6 +79,7 @@ export async function apply(ctx, config) {
     }, '远程预设清单清理');
   }
   ctx.effect(() => installShellFailureGuard(ctx, config.shell, scopeOf(ctx), HarnessError), '基础 shell 故障守卫');
+  installRemoteEnvironmentContext(ctx, { scope: scopeOf(ctx), shell: config.shell });
   ctx.systemPrompt.section({ name: 'claude-bridge:preset-capabilities', order: 10300, interpolate: false,
     text: [
       `Remote session preset: ${currentStatus.mode}. Only tools in the current tool catalog are available.`,
