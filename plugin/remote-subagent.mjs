@@ -7,13 +7,14 @@ import { resolveDshModule } from './compat/resolve-dsh-module.mjs';
 import { CLAUDE_PRESET, CLAUDE_PROVIDER } from './policy.mjs';
 import { MODEL_DEFAULT_EFFORT, subagentModels, assertRemoteSubagentRoute, withModelDefault } from './subagent-selection.mjs';
 import { remoteSubagentConfig, captureRemoteSubagentPolicy } from './presets/subagent-capabilities.mjs';
+import { SUBAGENT_SETTINGS_GATE } from './presets/subagent-settings.mjs';
 
 const require = createRequire(resolveDshModule('@deepseek-ai/dsh-session'));
 const native = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent')).href);
 const { scopeOf, scopeChainOf } = await import(resolveDshModule('@deepseek-ai/dsh-scope'));
 
 export const Config = native.Config;
-export const inject = [...native.inject, 'agents', 'llm', 'claudeBridge'];
+export const inject = [...native.inject, 'agents', 'llm', 'claudeBridge', SUBAGENT_SETTINGS_GATE];
 
 // Hiding every model is a valid display preference, independent of the full
 // account catalog captured by the native Session selection policy.

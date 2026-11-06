@@ -1,7 +1,12 @@
 # DSH bundle with runtime capability checks. Enable in a dedicated profile.
 - id: agent-loop
   disabled: true
+- id: subagent-model-selection-settings
+  name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+  inject: [claudeSubagentPolicyGate]
 - insert:
+    - id: claude-subagent-settings-gate
+      name: dsh-claude-bridge/subagent-settings
     - id: claude-agent-loop
       name: dsh-claude-bridge/agent-loop
       config:

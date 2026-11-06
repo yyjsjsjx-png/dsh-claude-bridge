@@ -12,6 +12,7 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/agent-loop-native.test.mjs',
   'test/instruction-audit-native.test.mjs',
   'test/subagent-selection-native.test.mjs',
+  'test/subagent-settings-loader-native.test.mjs',
   'test/sdk-native-title-display-native.test.mjs',
   'test/model-cycle-projection.test.mjs',
   'test/child-model-display-native.test.mjs',
@@ -23,6 +24,7 @@ export const RC5_NATIVE_TESTS = Object.freeze([
   'test/compaction-history.test.mjs',
   'test/compaction-summary-projection.test.mjs',
   'test/dsh-tool-execution.test.mjs',
+  'test/standard-tool-results-native.test.mjs',
   'test/recovery-command.test.mjs', 'test/update-plugin.test.mjs',
 ]);
 const project = dirname(dirname(fileURLToPath(import.meta.url)));

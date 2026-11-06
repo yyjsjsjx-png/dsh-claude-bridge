@@ -2,6 +2,7 @@
 import { resolveDshModule } from './compat/resolve-dsh-module.mjs';
 import { loadRemoteComposition, publishRemotePresetStatus } from './preset-loading.mjs';
 import { installShellFailureGuard } from './shell-failure-guard.mjs';
+import { SUBAGENT_SETTINGS_GATE } from './presets/subagent-settings.mjs';
 
 const { EntryTree } = await import(resolveDshModule('@deepseek-ai/cordis-plugin-loader'));
 const { prepareProfileEntries } = await import(resolveDshModule('@deepseek-ai/dsh-app-boot'));
@@ -44,7 +45,14 @@ export async function apply(ctx, config) {
     if (row.id === 'tool-subagent' && row.name === '@deepseek-ai/dsh-tool-subagent') {
       return { ...row, name: new URL('./remote-subagent.mjs', import.meta.url).href };
     }
-    return row.group && Array.isArray(row.config) ? { ...row, config: remoteEntries(row.config) } : row;
+    if (row.id === 'tool-web' && row.name === '@deepseek-ai/dsh-tool-web') {
+      return { ...row, name: new URL('./remote-web.mjs', import.meta.url).href };
+    }
+    if (!row.group || !Array.isArray(row.config)) return row;
+    const grouped = { ...row, config: remoteEntries(row.config) };
+    if (row.id !== 'delegation') return grouped;
+    return { ...grouped, inject: Array.isArray(row.inject) ? [...row.inject, SUBAGENT_SETTINGS_GATE]
+      : { ...row.inject, [SUBAGENT_SETTINGS_GATE]: {} } };
   });
   composition = await loadRemoteComposition({ ...config,
     createTree: () => new RemoteTree(ctx.extend({ baseUrl: config.baseUrl })),
