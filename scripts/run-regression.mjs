@@ -5,13 +5,13 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
-export const RC5_VERSION = '0.2.1-rc.5';
 export const DEFAULT_DESKTOP_VERSION = '0.2.2-rc.1';
-export const DESKTOP_VERSIONS = Object.freeze([RC5_VERSION, DEFAULT_DESKTOP_VERSION]);
-export const RC5_NATIVE_TESTS = Object.freeze([
+export const DESKTOP_VERSIONS = Object.freeze([DEFAULT_DESKTOP_VERSION]);
+export const NATIVE_TESTS = Object.freeze([
   'test/agent-loop-native.test.mjs',
   'test/instruction-audit-native.test.mjs',
   'test/remote-environment-native.test.mjs',
+  'test/remote-prompt-policy-native.test.mjs',
   'test/subagent-selection-native.test.mjs',
   'test/subagent-settings-loader-native.test.mjs',
   'test/sdk-native-title-display-native.test.mjs',
@@ -166,9 +166,9 @@ export async function main(argv = process.argv.slice(2)) {
             config.output, layer, process.platform === 'win32');
         } else {
           Object.assign(env, { NODE_OPTIONS: '', ELECTRON_RUN_AS_NODE: '1', DSH_CLAUDE_BRIDGE_RESOURCES: result.target.resources });
-          result.files = RC5_NATIVE_TESTS;
+          result.files = NATIVE_TESTS;
           execution = await execute(result.target.executable, ['--expose-internals', '--test', '--test-reporter=tap',
-            '--test-concurrency=1', ...RC5_NATIVE_TESTS], env, config.output, layer);
+            '--test-concurrency=1', ...NATIVE_TESTS], env, config.output, layer);
         }
         Object.assign(result, execution);
         if (execution.exitCode !== 0 || execution.summary.fail || execution.summary.cancelled
