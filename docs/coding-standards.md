@@ -10,7 +10,7 @@
 | `remote/` | VPS 上的父服务与每设备 worker | WebSocket 服务、worker 生命周期、SDK 调用、观测账本与额度采样 |
 | `plugin/` | DSH 插件入口、预设、兼容层、UI | 与 DSH 原生接口对接；UI 源码在 `plugin/ui/client/*.mjs` |
 | `scripts/` | 本机或 CI | 构建、更新、隔离启动、回归和只读查询工具 |
-| `test/` | 本机 Node 与 CI | `node:test` 用例；0.2.2-rc.1 与 0.2.1-rc.5 原生用例在 CI 的 Windows Electron 中执行 |
+| `test/` | 本机 Node 与 CI | `node:test` 用例；当前 0.2.2-rc.1 原生用例在 CI 的 Windows Electron 中执行 |
 
 - `src/` 不得依赖 `remote/`。两端共享的纯规则（如 schema、计量换算）放在 `src/`，由 `remote/` 引用。
 - `remote/` 模块不得读取客户端用户数据；`src/` 不得假设 VPS 文件系统路径。
@@ -73,7 +73,7 @@
   - 相关用例：`node --test test/<相关>.test.mjs`；
   - 改动跨模块或属于重构：`node --test test/*.test.mjs`，失败数为 0，通过数不得少于基线；
   - 改动 UI 源码：`node scripts/build-client.mjs --check`。
-- 原生行为以对应桌面基线的 Windows Electron 检查为准，CI 分别运行 0.2.2-rc.1 与 0.2.1-rc.5；本机未运行的层要在交付说明中写明。不得为测试安装浏览器、容器或新工具链，不得调用真实模型做常规回归。
+- 原生行为以当前维护桌面基线的 Windows Electron 检查为准，CI 只运行 0.2.2-rc.1；不为 rc.5 等旧桌面持续扩展适配或发布门槛。已有旧源码和记录暂留用于追溯，旧对话与 SDK 绑定的数据保护独立保留。本机未运行的层要在交付说明中写明。不得为测试安装浏览器、容器或新工具链，不得调用真实模型做常规回归。
 
 ## 9. 提交与 PR
 

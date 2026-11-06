@@ -1,6 +1,14 @@
 # 桌面回归入口
 
-默认基线为 DSH Desktop **0.2.2-rc.1**，同时保留 **0.2.1-rc.5** 回归。回归分为普通 Node 无密钥层和真实 Windows Electron／ASAR 原生层；两者均不调用 Claude SDK／CLI 模型，不读取现有账号凭据或用户聊天。下方历史[实际桌面与远程 SDK 替身验收](#本轮桌面夹具验收)只对应当时提交，不能替代新版或真实上游模型验收。
+当前唯一维护基线为 DSH Desktop **0.2.2-rc.1**，默认跟随实际推送的较新桌面。rc.5 等旧版本不再列入自动回归或发布门槛；本文件沿用历史文件名，旧结果仅供追溯。回归分为普通 Node 无密钥层和真实 Windows Electron／ASAR 原生层；两者均不调用 Claude SDK／CLI 模型，不读取现有账号凭据或用户聊天。下方历史[实际桌面与远程 SDK 替身验收](#本轮桌面夹具验收)只对应当时提交，不能替代新版或真实上游模型验收。
+
+## 开发候选：环境说明与提示词验证
+
+尚未正式发布或部署的客户端候选已完成 Node 全集 610 项：539 通过、71 项原生层预期跳过；当前 0.2.2-rc.1 的真实 Windows Electron／ASAR 原生层 138/138、零跳过。
+
+新增覆盖：实时客户端目录从项目根切换到子目录、原生 required context 续步恢复、作用域隔离与卸载、旧静态提示字节及摘要不变；精确匹配 3 个原生 section 与 2 个 context，同时保留同名自定义内容、persona suffix、工具 schema 与必需 cwd。Backend 与持久状态覆盖后台同步先建绑定、旧绑定尚未启动、恢复与续步固定策略，以及未知策略拒绝；既有 SDK 提示基线和未知副作用门禁继续由原用例验证。
+
+此处通过数字不代表真实模型一定不会误解环境；本轮没有启动真实 SDK／CLI、读取用户聊天或请求模型、额度、目录。后续自动矩阵只维护当前桌面，不再为旧桌面追加验收门槛。
 
 ## 本机使用
 
@@ -9,7 +17,6 @@
 ```powershell
 node scripts/run-regression.mjs --layer node --output .local/regression/node
 node scripts/run-regression.mjs --layer native --resources '现有DSH目录\resources' --executable '现有DSH目录\DeepSeek Harness.exe' --output .local/regression/native
-node scripts/run-regression.mjs --layer native --desktop-version 0.2.1-rc.5 --resources '旧版隔离DSH目录\resources' --output .local/regression/rc5
 ```
 
 `--layer all` 顺序执行两层；`--preflight-only` 只检查入口环境，不运行测试，报告状态为 `preflight-passed`，不能当作测试通过。路径也可由 `DSH_CLAUDE_BRIDGE_RESOURCES` 和 `DSH_CLAUDE_BRIDGE_EXECUTABLE` 提供。程序只操作测试自己的临时数据，不安装 DSH、不启动桌面图形窗口、不改变现有插件或服务。
@@ -24,6 +31,7 @@ UI 源码按状态控制器、视图和 DSH 接线维护在 `plugin/ui/client/`�
 | --- | --- |
 | Node | `npm test`：Backend／worker、工具与提示词转换、选型和控制器守卫、步骤追加、取消与 settle、台账和未知结果、恢复、传输、降级策略、UI 状态逻辑 |
 | 原生加载与注册 | `bundle-native`、`catalog-visibility`、`controller-native`：真实发布包接口、ASAR 模块及客户端身份、目录和 RPC、守卫卸载恢复 |
+| 环境与提示策略 | `remote-environment-native`、`remote-prompt-policy-native`：真实原生上下文、静态提示摘要不变、精确文案签名与同名自定义保留 |
 | 原生预设与 shell | `preset-native`、`shell-native`、`workflow-depth-guard`：Loader／作用域、可选失败隔离、基础回退、实际 PowerShell、审批服务、超时、取消、结果记录与普通会话隔离 |
 | 原生子代理设置 | `subagent-selection-native`、`subagent-settings-loader-native`：全局选型开关与远程策略隔离、首次捕获、无目录快照、父子继承、旧策略恢复，以及原生设置同条目写入、重载和卸载 |
 | 原生网页准入 | `dsh-tool-execution`、`backend`：首步能力握手、本机无凭据时的 SDK 网页准入；显式工具关闭、权限／审批、取消、换连接、准入释放和旧服务器回退均保留门禁 |
