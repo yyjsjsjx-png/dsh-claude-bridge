@@ -26,7 +26,10 @@ async function eventually(check) {
 
 test('实际Loader设置：原Entry动态编辑、配置热重载、冷重载及gate卸载不丢失设置归属',
   { skip: !native, timeout: 30000 }, async t => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), 'dsh-subagent-settings-loader-')))
+    // Windows runners may spell Temp with an 8.3 alias. Use one canonical
+    // parent for creation and the strict cleanup ownership check.
+    const temporaryRoot = await realpath(tmpdir())
+    const home = await realpath(await mkdtemp(join(temporaryRoot, 'dsh-subagent-settings-loader-')))
     const beforeHome = process.env.DSH_HOME
     process.env.DSH_HOME = home
     const roots = []
@@ -34,7 +37,7 @@ test('实际Loader设置：原Entry动态编辑、配置热重载、冷重载及
       for (const ctx of roots.reverse()) await ctx.fiber.dispose()
       if (beforeHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = beforeHome
-      assert.equal(dirname(resolve(home)), resolve(tmpdir()))
+      assert.equal(dirname(resolve(home)), temporaryRoot)
       assert.ok(basename(home).startsWith('dsh-subagent-settings-loader-'))
       await rm(home, { recursive: true, force: true })
     })
