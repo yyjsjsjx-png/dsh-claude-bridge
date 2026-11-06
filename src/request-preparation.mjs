@@ -1,14 +1,16 @@
 import { admittedRemoteAssembly, remoteCapabilityPrompt } from './remote-capabilities.mjs'
+import { applyRemotePromptPolicy } from './remote-prompt-policy.mjs'
 
 // rc.5 owns this header. Match only its leading notice, never quoted file text.
 const INSTRUCTION_BUDGET_HEADER = /^(?:<system-reminder>\r?\n)?(?:Workspace instruction budget \d+(?:\.\d+)? bytes: (?:omitted|truncated)\b|Workspace instructions were omitted or truncated to fit the configured byte budget\.(?=\r?\n|$))/
 
 /** Admit only the final callable collection; keep native declarations and prompt in sync. */
-export function prepareRequestAssembly({ assembly, converted, admitShell, renderPrompt }) {
+export function prepareRequestAssembly({ assembly, converted, admitShell, renderPrompt, promptPolicy }) {
   admitShell(assembly, converted)
-  const admitted = admittedRemoteAssembly(assembly, converted)
+  const admitted = applyRemotePromptPolicy(admittedRemoteAssembly(assembly, converted), promptPolicy)
   return {
     assembly: admitted,
+    promptPolicy,
     toolSignature: JSON.stringify(converted.tools),
     // The initial request renders after media preparation; continuation renders
     // before changing context projections. Leave that lifecycle to the caller.
@@ -18,8 +20,8 @@ export function prepareRequestAssembly({ assembly, converted, admitShell, render
 
 /** Refresh runtime facts once while retaining the accepted user/instruction messages. */
 export function prepareRequestMessages({ assembly, messages, context, refreshContext,
-  renderContextSections, joinContextSections, projectContext, continuation = false }) {
-  const refreshed = refreshContext(assembly, context)
+  renderContextSections, joinContextSections, projectContext, continuation = false, promptPolicy }) {
+  const refreshed = applyRemotePromptPolicy(refreshContext(assembly, context), promptPolicy)
   const sections = renderContextSections(refreshed)
   const runtime = projectContext(joinContextSections(sections), sections)
   const admitted = []

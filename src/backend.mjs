@@ -1058,14 +1058,15 @@ export class BridgeBackend {
     return error
   }
 
-  prepareRequest(agent, decision, converted) {
+  prepareRequest(agent, decision, converted, promptPolicy) {
     return prepareRequestAssembly({ assembly: decision.assembly, converted,
+      promptPolicy,
       admitShell: (assembly, tools) => this.admitRemoteShell(agent, assembly, tools),
       renderPrompt: assembly => this.helpers.renderPrompt(assembly) })
   }
 
-  prepareMessages(agent, assembly, messages, signal, continuation = false, modelSelection) {
-    const prepared = prepareRequestMessages({ assembly, messages, continuation,
+  prepareMessages(agent, assembly, messages, signal, continuation = false, modelSelection, promptPolicy) {
+    const prepared = prepareRequestMessages({ assembly, messages, continuation, promptPolicy,
       context: { ...this.helpers.assembleContextFor(agent, signal), ...(modelSelection ? { modelSelection } : {}) },
       refreshContext: (accepted, context) => this.ctx.systemPrompt.refreshContext(accepted, context),
       renderContextSections: refreshed => this.helpers.renderContextSections(refreshed),
@@ -1158,11 +1159,11 @@ export class BridgeBackend {
       { agent, toolSet: decision.toolSet, signal })
     // The full conversion can exclude the shell (for example, the global tool
     // count cap); the cheap initial probe cannot admit that final collection.
-    const prepared = this.prepareRequest(agent, decision, converted)
+    const prepared = this.prepareRequest(agent, decision, converted, binding.promptPolicy)
     timing('tools_converted')
     this.compatibility = converted.compatibility
     const { assembly } = prepared
-    const messages = this.prepareMessages(agent, assembly, decision.messages, signal, false, selected)
+    const messages = this.prepareMessages(agent, assembly, decision.messages, signal, false, selected, prepared.promptPolicy)
     const media = { attachments: this.ctx.attachments, signal,
       imageInput: converted.tools.some(tool => tool.name === 'read_image'),
       mapHostPath: path => this.ctx.fs.processPathFromHostPath(path) }
@@ -1182,6 +1183,7 @@ export class BridgeBackend {
     return { runId, agent, turn, steps, get step() { return steps.current },
       signal, timing, queryAbort: new AbortController(), media, calls: new Map(), toolQueue: Promise.resolve(),
       systemPrompt, toolSignature: prepared.toolSignature, catalogModels: converted.catalogModels,
+      promptPolicy: prepared.promptPolicy,
       compatibility: converted.compatibility, requestedModel: selected.model, requestedEffort: selected.reasoningEffort,
       requestedProvider: selected.provider, toolAdmission: request.toolAdmission,
       nativeWebTools: request.nativeWebTools, nativeWebResultPages: request.nativeWebResultPages, callEvents: new Map(), settledToolIds: new Set(), nativeApprovals: new Map(), nativeResultHashes: new Map(),
@@ -1372,14 +1374,14 @@ export class BridgeBackend {
       }
       const tools = await this.convertTools(decision.assembly, selected, run.catalogModels, run.nativeWebTools,
         { agent, toolSet: decision.toolSet, signal })
-      const prepared = this.prepareRequest(agent, decision, tools)
+      const prepared = this.prepareRequest(agent, decision, tools, run.promptPolicy)
       const promptChanged = prepared.renderSystemPrompt() !== run.systemPrompt
       if (promptChanged || prepared.toolSignature !== run.toolSignature) {
         throw failure('QUERY_CONFIGURATION_CHANGED', promptChanged
           ? '运行期间系统提示发生变化，本轮已在安全边界停止并保留原对话；恢复原预设配置后可继续。'
           : '运行期间工具集合已更新，本轮已在安全边界停止并保留当前对话；继续时将重新检查最新工具。')
       }
-      const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true, selected)
+      const messages = this.prepareMessages(agent, prepared.assembly, decision.messages, signal, true, selected, run.promptPolicy)
       const additionalContexts = [], userMessages = []
       const capabilities = this.initialized?.capabilities
       let hasUserImages = false

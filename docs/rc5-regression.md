@@ -1,6 +1,14 @@
 # 桌面回归入口
 
-默认基线为 DSH Desktop **0.2.2-rc.1**，同时保留 **0.2.1-rc.5** 回归。回归分为普通 Node 无密钥层和真实 Windows Electron／ASAR 原生层；两者均不调用 Claude SDK／CLI 模型，不读取现有账号凭据或用户聊天。下方历史[实际桌面与远程 SDK 替身验收](#本轮桌面夹具验收)只对应当时提交，不能替代新版或真实上游模型验收。
+当前唯一维护基线为 DSH Desktop **0.2.2-rc.1**，默认跟随实际推送的较新桌面。rc.5 等旧版本不再列入自动回归或发布门槛；本文件沿用历史文件名，旧结果仅供追溯。回归分为普通 Node 无密钥层和真实 Windows Electron／ASAR 原生层；两者均不调用 Claude SDK／CLI 模型，不读取现有账号凭据或用户聊天。下方历史[实际桌面与远程 SDK 替身验收](#本轮桌面夹具验收)只对应当时提交，不能替代新版或真实上游模型验收。
+
+## 环境说明与提示词验证
+
+v0.2.22 环境说明与提示词策略的本地验收完成 Node 全集 610 项：539 通过、71 项原生层预期跳过；当前 0.2.2-rc.1 的真实 Windows Electron／ASAR 原生层 138/138、零跳过。这些是本地行为证据，正式提交的托管 CI、发布和两端安装状态需分别核验。
+
+新增覆盖：实时客户端目录从项目根切换到子目录、原生 required context 续步恢复、作用域隔离与卸载、旧静态提示字节及摘要不变；精确匹配 3 个原生 section 与 2 个 context，同时保留同名自定义内容、persona suffix、工具 schema 与必需 cwd。Backend 与持久状态覆盖后台同步先建绑定、旧绑定尚未启动、恢复与续步固定策略，以及未知策略拒绝；既有 SDK 提示基线和未知副作用门禁继续由原用例验证。
+
+此处通过数字不代表真实模型一定不会误解环境；本轮没有启动真实 SDK／CLI、读取用户聊天或请求模型、额度、目录。自动回归只维护当前桌面，不再为旧桌面追加验收门槛。
 
 ## 本机使用
 
@@ -9,7 +17,6 @@
 ```powershell
 node scripts/run-regression.mjs --layer node --output .local/regression/node
 node scripts/run-regression.mjs --layer native --resources '现有DSH目录\resources' --executable '现有DSH目录\DeepSeek Harness.exe' --output .local/regression/native
-node scripts/run-regression.mjs --layer native --desktop-version 0.2.1-rc.5 --resources '旧版隔离DSH目录\resources' --output .local/regression/rc5
 ```
 
 `--layer all` 顺序执行两层；`--preflight-only` 只检查入口环境，不运行测试，报告状态为 `preflight-passed`，不能当作测试通过。路径也可由 `DSH_CLAUDE_BRIDGE_RESOURCES` 和 `DSH_CLAUDE_BRIDGE_EXECUTABLE` 提供。程序只操作测试自己的临时数据，不安装 DSH、不启动桌面图形窗口、不改变现有插件或服务。
@@ -24,6 +31,7 @@ UI 源码按状态控制器、视图和 DSH 接线维护在 `plugin/ui/client/`�
 | --- | --- |
 | Node | `npm test`：Backend／worker、工具与提示词转换、选型和控制器守卫、步骤追加、取消与 settle、台账和未知结果、恢复、传输、降级策略、UI 状态逻辑 |
 | 原生加载与注册 | `bundle-native`、`catalog-visibility`、`controller-native`：真实发布包接口、ASAR 模块及客户端身份、目录和 RPC、守卫卸载恢复 |
+| 环境与提示策略 | `remote-environment-native`、`remote-prompt-policy-native`：真实原生上下文、静态提示摘要不变、精确文案签名与同名自定义保留 |
 | 原生预设与 shell | `preset-native`、`shell-native`、`workflow-depth-guard`：Loader／作用域、可选失败隔离、基础回退、实际 PowerShell、审批服务、超时、取消、结果记录与普通会话隔离 |
 | 原生子代理设置 | `subagent-selection-native`、`subagent-settings-loader-native`：全局选型开关与远程策略隔离、首次捕获、无目录快照、父子继承、旧策略恢复，以及原生设置同条目写入、重载和卸载 |
 | 原生网页准入 | `dsh-tool-execution`、`backend`：首步能力握手、本机无凭据时的 SDK 网页准入；显式工具关闭、权限／审批、取消、换连接、准入释放和旧服务器回退均保留门禁 |
@@ -65,7 +73,7 @@ v0.2.20 引入 `PostCompact` 正文展示和旧会话历史回补。无密钥检
 | 0.2.2-rc.1 实际 Electron/ASAR 原生层 | 122 | 0 | 0 |
 | 0.2.1-rc.5 实际 Electron/ASAR 原生层 | 122 | 0 | 0 |
 
-使用各版本的真实桌面 EXE 和 ASAR，通过脚本接口完成工具、审批、取消、严格日志恢复、子代理选型及压缩卡片与正文投影回放；这些无密钥层没有启动日常图形会话、读取真实聊天或调用真实模型。独立的 SDK 验收见[原生压缩摘要补充验证](#原生压缩摘要补充验证)。CI 双版本矩阵已配置；上述本地结果不能代替对应发行提交的托管 CI，托管结果须单独核对。
+该历史回归使用各版本的真实桌面 EXE 和 ASAR，通过脚本接口完成工具、审批、取消、严格日志恢复、子代理选型及压缩卡片与正文投影回放；这些无密钥层没有启动日常图形会话、读取真实聊天或调用真实模型。独立的 SDK 验收见[原生压缩摘要补充验证](#原生压缩摘要补充验证)。v0.2.20 当时采用 CI 双版本矩阵；当前只维护 0.2.2-rc.1。上述本地结果不能代替对应发行提交的托管 CI，托管结果须单独核对。
 
 现有执行与恢复断言保持；原生测试夹具按新版实际依赖和等价公开接口装配。`verifiedVersions` 精确预期扩展为新旧两版本，压缩边界记录的精确预期增加 `boundaryUuid` 身份字段，均对应新增产品要求。子代理解析与同步夹具显式持有真实原生句柄，避免已完成子任务自动回收后的竞态，仍保留归属、空闲、拒绝普通解析及历史恢复断言。启动探针不冒充完整验收的断言保持。
 
@@ -102,7 +110,7 @@ v0.2.20 引入 `PostCompact` 正文展示和旧会话历史回补。无密钥检
 
 ## CI
 
-`.github/workflows/rc5-regression.yml` 对 main 推送、PR 和手动触发提供独立任务，只申请仓库只读权限。Node 任务使用 Ubuntu；原生任务使用 Windows 2025 runner，矩阵分别检查 0.2.1-rc.5 和 0.2.2-rc.1，工件按版本区分，一项失败不取消另一项。两者固定 Node `24.22.2`，不执行 `npm install` 或 SDK 安装。
+`.github/workflows/rc5-regression.yml` 对 main 推送、PR 和手动触发提供两个独立任务，只申请仓库只读权限：Ubuntu 上的 Node 无密钥层，以及 Windows 2025 runner 上唯一当前基线 0.2.2-rc.1 的原生层。工作流文件名沿用历史名称，不再运行 rc.5。工件分别为 `desktop-node-results` 和 `desktop-native-0.2.2-rc.1-results`。两个任务固定 Node `24.22.2`，不执行 `npm install` 或 SDK 安装。
 
 Windows 任务仅在 GitHub runner 的临时目录下载所选基线的官方 Windows 安装资产。`prepare-ci-dsh.mjs` 使用 runner 已有的 7zip 读取真实 NSIS 清单，唯一定位 `app*.7z` 后提取，再校验 EXE、ASAR 和版本；不执行安装器。布局不符、7zip 缺失或预检失败会明确失败。下载字节数和 SHA-256 写入报告用于追溯；这是本次下载的摘要，未冒充发布方签名。该下载脚本拒绝在普通本机环境运行，本机须提供现有安装路径。
 
@@ -117,4 +125,6 @@ CI 保存本次报告和测试日志 14 天，不上传下载的桌面程序、�
 
 ## 官方来源
 
-2026-11-01 核验：Node 官方 [24.x 发布列表](https://nodejs.org/dist/index.json) 中当前 LTS 补丁为 `24.22.2`；工作流动作固定到官方 [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1)、[setup-node v7.1.0](https://github.com/actions/setup-node/releases/tag/v7.1.0)、[upload-artifact v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2) 的实际 commit SHA。Windows 2025 [官方 runner 清单](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md) 包含 7zip，脚本仍在每次运行时检查工具存在。[DSH rc.5 发布](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.5) 对应源码提交 `b830ec950faba0a46dda564be3e2d854afed94f1`。
+当前维护的 [DSH 0.2.2-rc.1 发布](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.1) 对应官方源码提交 `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`。[DSH rc.5 发布](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.5) 及源码提交 `b830ec950faba0a46dda564be3e2d854afed94f1` 仅保留历史溯源。
+
+2026-11-01 核验的 Node 官方 [24.x 发布列表](https://nodejs.org/dist/index.json) LTS 补丁为 `24.22.2`；工作流动作固定到官方 [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1)、[setup-node v7.1.0](https://github.com/actions/setup-node/releases/tag/v7.1.0)、[upload-artifact v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2) 的实际 commit SHA。Windows 2025 [官方 runner 清单](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md) 包含 7zip，脚本仍在每次运行时检查工具存在。

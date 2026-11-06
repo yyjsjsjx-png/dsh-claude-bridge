@@ -1,6 +1,7 @@
 import { mkdir, open, readFile, rename } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { REMOTE_PROMPT_POLICY } from './remote-prompt-policy.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const RUN_STATES = new Set(['prepared', 'sent', 'completed', 'cancelled', 'failed', 'unknown', 'not-sent'])
@@ -37,6 +38,9 @@ export class BridgeState {
         if (!session || typeof session !== 'object' || !UUID.test(session.sdkSessionId)
           || typeof session.projectPath !== 'string' || !session.projectPath
           || typeof session.started !== 'boolean') throw new Error('会话绑定无效')
+        if (session.promptPolicy !== undefined && !['legacy', REMOTE_PROMPT_POLICY].includes(session.promptPolicy)) {
+          throw new Error('会话提示词策略不受支持')
+        }
         if (session.historyCursor !== undefined && (!session.historyCursor
           || !position(session.historyCursor.offset) || session.historyCursor.offset > 100_000
           || (session.historyCursor.offset > 0 && !safeId(session.historyCursor.lastUuid))
@@ -95,7 +99,7 @@ export class BridgeState {
       if (!Object.hasOwn(state.sessions, dshSessionId)) {
         state.sessions[dshSessionId] = {
           sdkSessionId: randomUUID(), projectPath, started: false,
-          createdAt: new Date().toISOString(), usage: {},
+          createdAt: new Date().toISOString(), usage: {}, promptPolicy: REMOTE_PROMPT_POLICY,
         }
       }
       const binding = state.sessions[dshSessionId]

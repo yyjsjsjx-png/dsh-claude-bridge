@@ -4,9 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { DEFAULT_DESKTOP_VERSION, DESKTOP_VERSIONS, desktopVersion, regressionOptions } from '../scripts/run-regression.mjs';
 import { DESKTOP_URL, desktopDownloadUrl, preparationOptions } from '../scripts/prepare-ci-dsh.mjs';
 
-test('原生证据入口默认新版，旧版可明确选择，不接受未经审查的版本或注入文本', () => {
+test('原生证据入口只维护当前新版，不接受旧版或未经审查的版本与注入文本', () => {
   assert.equal(DEFAULT_DESKTOP_VERSION, '0.2.2-rc.1');
-  assert.deepEqual(DESKTOP_VERSIONS, ['0.2.1-rc.5', '0.2.2-rc.1']);
+  assert.deepEqual(DESKTOP_VERSIONS, ['0.2.2-rc.1']);
   assert.equal(regressionOptions([]).desktopVersion, DEFAULT_DESKTOP_VERSION);
   for (const version of DESKTOP_VERSIONS) {
     assert.equal(regressionOptions(['--layer', 'native', '--desktop-version', version]).desktopVersion, version);
@@ -14,7 +14,7 @@ test('原生证据入口默认新版，旧版可明确选择，不接受未经�
     assert.equal(desktopDownloadUrl(version), `https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-${version}-win-x64.exe`);
   }
   assert.equal(DESKTOP_URL, desktopDownloadUrl(DEFAULT_DESKTOP_VERSION));
-  for (const version of ['latest', '0.2.2-alpha.3', "';process.exit(0);//"]) {
+  for (const version of ['0.2.1-rc.5', 'latest', '0.2.2-alpha.3', "';process.exit(0);//"]) {
     assert.throws(() => desktopVersion(version), /桌面回归基线/);
     assert.throws(() => desktopDownloadUrl(version), /桌面回归基线/);
     assert.throws(() => regressionOptions(['--desktop-version', version]), /桌面回归基线/);
@@ -31,9 +31,10 @@ test('回归与下载入口拒绝未知参数、缺值以及以另一个选项�
   assert.throws(() => regressionOptions(['--layer', 'unexpected']), /--layer/);
 });
 
-test('CI 双桌面矩阵对下载与执行传递同一基线，工件按版本区分', async () => {
+test('CI 只运行当前桌面基线，下载与执行一致且不保留旧版发布门槛', async () => {
   const workflow = await readFile(new URL('../.github/workflows/rc5-regression.yml', import.meta.url), 'utf8');
   for (const version of DESKTOP_VERSIONS) assert.ok(workflow.includes(`'${version}'`));
+  assert.doesNotMatch(workflow, /0\.2\.1-rc\.5/);
   assert.match(workflow, /fail-fast: false/);
   assert.match(workflow, /prepare-ci-dsh\.mjs --desktop-version \$\{\{ matrix\.desktop-version \}\}/);
   assert.match(workflow, /run-regression\.mjs --layer native --desktop-version \$\{\{ matrix\.desktop-version \}\}/);
