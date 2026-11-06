@@ -1,10 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { BridgeState } from '../src/state.mjs'
 import { createHash } from 'node:crypto'
+import { REMOTE_PROMPT_POLICY } from '../src/remote-prompt-policy.mjs'
 
 async function withDirectory(action) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-bridge-state-'))
@@ -27,7 +28,43 @@ test('设备与原生会话绑定重启后保持，多会话不串用', async ()
   assert.equal(restored.sdkSessionId, a.sdkSessionId)
   assert.equal(restored.deviceId, a.deviceId)
   assert.equal(restored.started, true)
+  assert.equal(a.promptPolicy, REMOTE_PROMPT_POLICY)
+  assert.equal(restored.promptPolicy, REMOTE_PROMPT_POLICY)
   await assert.rejects(restarted.binding('dsh-a', 'D:\\other'), { code: 'SESSION_BINDING_MISMATCH' })
+}))
+
+test('旧绑定无提示词策略时保留原始身份和渲染，不因后台读取或续聊升级', async () => withDirectory(async directory => {
+  const saved = { version: 1, deviceId: '11111111-2222-4333-8444-555555555555', sessions: {
+    started: { sdkSessionId: '22222222-2222-4333-8444-555555555555', projectPath: 'D:\\project', started: true, usage: {} },
+    prepared: { sdkSessionId: '33333333-2222-4333-8444-555555555555', projectPath: 'D:\\project', started: false, usage: {} },
+  } }
+  await writeFile(join(directory, 'state.json'), JSON.stringify(saved))
+  const state = new BridgeState(directory)
+  for (const id of ['started', 'prepared']) {
+    const binding = await state.binding(id, 'D:\\project')
+    assert.equal(Object.hasOwn(binding, 'promptPolicy'), false)
+    assert.equal(binding.sdkSessionId, saved.sessions[id].sdkSessionId)
+    await state.markStarted(id)
+  }
+  const fresh = await state.binding('new', 'D:\\project')
+  assert.equal(fresh.promptPolicy, REMOTE_PROMPT_POLICY)
+  const persisted = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'))
+  assert.equal(persisted.deviceId, saved.deviceId)
+  for (const id of ['started', 'prepared']) assert.equal(Object.hasOwn(persisted.sessions[id], 'promptPolicy'), false)
+  const restored = await new BridgeState(directory).binding('started', 'D:\\project')
+  assert.equal(Object.hasOwn(restored, 'promptPolicy'), false)
+  assert.equal(restored.sdkSessionId, saved.sessions.started.sdkSessionId)
+}))
+
+test('未知持久提示词策略明确阻止加载，不改写原状态或降回legacy', async () => withDirectory(async directory => {
+  for (const promptPolicy of ['remote-v99', null, 1, {}, []]) {
+    const text = JSON.stringify({ version: 1, deviceId: '11111111-2222-4333-8444-555555555555', sessions: {
+      old: { sdkSessionId: '22222222-2222-4333-8444-555555555555', projectPath: 'D:\\project', started: true, promptPolicy },
+    } })
+    await writeFile(join(directory, 'state.json'), text)
+    await assert.rejects(new BridgeState(directory).ready, { code: 'LOCAL_STATE_UNAVAILABLE' })
+    assert.equal(await readFile(join(directory, 'state.json'), 'utf8'), text)
+  }
 }))
 
 test('状态损坏不生成新身份；重放用量不重复累计', async () => withDirectory(async directory => {

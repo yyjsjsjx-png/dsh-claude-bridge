@@ -27,7 +27,9 @@ test('实际原生提示策略：已知原文、scoped自定义和必需cwd在�
       return module.default ?? module
     }
     const ctx = new Context()
+    let scope
     t.after(async () => {
+      await scope?.dispose()
       await ctx.fiber.dispose()
       assert.equal(dirname(resolve(directory)), temporaryRoot)
       assert.ok(basename(directory).startsWith('dsh-remote-prompt-policy-'))
@@ -45,7 +47,7 @@ test('实际原生提示策略：已知原文、scoped自定义和必需cwd在�
     const session = Session.create(id, undefined, { id, version: SESSION_FORMAT_VERSION, createdAt: 0,
       isSeeded: false, agentPreset: 'claude-sdk-remote', cwd: directory })
     const agent = { id, session, inject() { assert.fail('已存在的临时cwd不应触发恢复通知') } }
-    const scope = createScope(ctx, agent)
+    scope = createScope(ctx, agent)
     agent.ctx = scope.ctx
     let scopedPrompt
     await scope.ctx.inject(['systemPrompt'], inner => { scopedPrompt = inner.systemPrompt })

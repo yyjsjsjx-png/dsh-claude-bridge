@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { getEventListeners } from 'node:events'
@@ -10,14 +10,100 @@ import { planUsageSnapshot } from '../src/plan-usage.mjs'
 import { BridgeState } from '../src/state.mjs'
 import { assistantIdentity, UNKNOWN_TOOL_TEXT } from '../src/history-sync.mjs'
 import { HISTORY_ASSISTANT, HISTORY_TOOL_RESULT } from '../src/history-records.mjs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { requiredShellName } from '../src/remote-capabilities.mjs'
 import { prepareRequestMessages } from '../src/request-preparation.mjs'
 import { MODEL_CATALOG_CACHE_MS } from '../src/catalog-cache-policy.mjs'
+import { REMOTE_PROMPT_POLICY } from '../src/remote-prompt-policy.mjs'
 
 const provider = 'claude-sdk-remote'
 const currentClientVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version
 const nextClientVersion = `${BigInt(currentClientVersion.split('.')[0]) + 1n}.0.0`
+
+test('新绑定精简原生身份，旧绑定保留原始系统提示且续步不切换策略', async t => {
+  for (const [name, legacy, started] of [['既有已启动绑定', true, true], ['既有未启动绑定', true, false], ['新绑定', false, false]]) await t.test(name, async t => {
+    const identity = { name: 'harness:identity', text: 'You are an AI agent powered by DeepSeek Harness.' }
+    const persona = { name: 'deployment:persona-prefix', text: 'Synthetic remote persona.' }
+    const userSection = { name: 'project:rules', text: 'USER_RULE_MUST_REMAIN' }
+    const savedBinding = legacy ? { sdkSessionId: randomUUID(), projectPath: 'D:\\project', started, usage: {} } : undefined
+    let observedPolicy
+    const f = await fixture(t, async handlers => ({ peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+      assert.equal(method, 'query')
+      assert.equal(params.resume, started)
+      assert.equal(params.systemPrompt.includes(identity.text), legacy)
+      assert.ok(params.systemPrompt.includes(persona.text))
+      assert.ok(params.systemPrompt.includes(userSection.text))
+      observedPolicy = (await f.backend.state.binding(f.agent.id, 'D:\\project')).promptPolicy
+      const prepared = await handlers.handlers['step.prepare']({ runId: params.runId }, { signal: new AbortController().signal })
+      assert.deepEqual(prepared, {})
+      assert.equal((await f.backend.state.binding(f.agent.id, 'D:\\project')).promptPolicy, observedPolicy)
+      return { status: 'completed' }
+    } }, async close() {} }), undefined, undefined, savedBinding)
+    f.decision.assembly.sections = [identity, persona, userSection]
+    f.agent.session.header.isSeeded = legacy
+    f.helpers.renderPrompt = assembly => assembly.sections.map(section => section.text).join('\n\n')
+    f.agent.inbox = { nextStep: [], splice() { assert.fail('本轮没有待恢复消息') } }
+    f.agent.preStep = async () => ({ ...f.decision, messages: [] })
+    assert.deepEqual(await f.backend.runStep(f.agent, f.decision), { kind: 'completed' })
+    assert.equal(observedPolicy, legacy ? undefined : REMOTE_PROMPT_POLICY)
+    assert.deepEqual(f.decision.assembly.sections, [identity, persona, userSection])
+  })
+})
+
+test('空会话首次后台同步先持久确定提示词策略，首次query复用同一绑定', async t => {
+  let connections = 0, queries = 0
+  const f = await fixture(t, async () => {
+    connections++
+    return { peer: { async request(method, params) {
+      if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+      assert.equal(method, 'query')
+      queries++
+      assert.equal(params.systemPrompt, 'REMOTE_PERSONA')
+      return { status: 'completed' }
+    } }, async close() {} }
+  })
+  const phase = f.agent.phase
+  f.agent.phase = { kind: 'idle' }
+  assert.deepEqual(await f.backend.syncSession(f.agent), { status: 'empty' })
+  assert.equal(connections, 0)
+  const before = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+  assert.equal(before.promptPolicy, REMOTE_PROMPT_POLICY)
+  f.agent.phase = phase
+  f.decision.assembly.sections = [
+    { name: 'harness:identity', text: 'You are an AI agent powered by DeepSeek Harness.' },
+    { name: 'deployment:persona-prefix', text: 'REMOTE_PERSONA' },
+  ]
+  f.helpers.renderPrompt = assembly => assembly.sections.map(section => section.text).join('\n\n')
+  assert.deepEqual(await f.backend.runStep(f.agent, f.decision), { kind: 'completed' })
+  const after = await f.backend.state.binding(f.agent.id, f.agent.session.header.cwd)
+  assert.equal(after.promptPolicy, before.promptPolicy)
+  assert.equal(after.sdkSessionId, before.sdkSessionId)
+  assert.equal(queries, 1)
+})
+
+test('刷新运行时上下文后仍按绑定策略保留用户同名上下文和工具目录', async t => {
+  const identity = { name: 'harness:identity', text: 'You are an AI agent powered by DeepSeek Harness.' }
+  const custom = { name: 'harness:source', text: 'USER_CUSTOM_SOURCE_CONTEXT' }
+  const cwd = { name: 'working-directory:current', text: 'Current working directory: "D:\\\\project\\\\child".' }
+  const f = await fixture(t, async () => ({ peer: { async request(method, params) {
+    if (method === 'initialize') return { protocolVersion: 1, authenticated: true }
+    assert.equal(params.systemPrompt, 'REMOTE_PERSONA_ONLY')
+    assert.equal(params.tools.some(tool => tool.name === requiredShellName()), true)
+    const texts = params.prompt.filter(block => block.type === 'text').map(block => block.text).join('\n')
+    assert.ok(texts.includes(custom.text))
+    assert.ok(texts.includes(cwd.text))
+    return { status: 'completed' }
+  } }, async close() {} }))
+  f.decision.assembly.sections = [identity, { name: 'deployment:persona-prefix', text: 'REMOTE_PERSONA_ONLY' }]
+  f.decision.assembly.contexts = []
+  f.helpers.renderPrompt = assembly => assembly.sections.map(section => section.text).join('\n\n')
+  f.ctx.systemPrompt.refreshContext = assembly => ({ ...assembly, contexts: [custom, cwd] })
+  f.helpers.renderContextSections = assembly => assembly.contexts
+  f.helpers.joinContextSections = sections => sections.map(section => section.text).join('\n')
+  f.agent.runtimeContext.project = text => ({ role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text }] })
+  assert.deepEqual(await f.backend.runStep(f.agent, f.decision), { kind: 'completed' })
+})
 
 test('压缩摘要按服务器能力协商，只追加展示记录，旧服务器不发送新字段', async t => {
   for (const supported of [false, true]) {
@@ -1078,7 +1164,7 @@ test('成功query的SDK标题在主checkpoint后投影，旧服务无字段与�
   })
 })
 
-async function fixture(t, makeTransport, execute, hostCompatibility) {
+async function fixture(t, makeTransport, execute, hostCompatibility, savedBinding) {
   const parent = resolve(tmpdir())
   const directory = await mkdtemp(join(parent, 'dsh-bridge-backend-'))
   t.after(async () => {
@@ -1131,6 +1217,8 @@ async function fixture(t, makeTransport, execute, hostCompatibility) {
     } }] },
     messages: [{ id: 'user-1', role: 'user', source: { kind: 'human' }, content: [{ type: 'text', text: '测试' }] }],
   }
+  if (savedBinding) await writeFile(join(directory, 'state.json'), JSON.stringify({ version: 1,
+    deviceId: randomUUID(), sessions: { [agent.id]: savedBinding } }))
   const backend = new BridgeBackend(ctx, { stateDirectory: directory }, { helpers, createTransport: makeTransport, hostCompatibility })
   return { backend, agent, decision, records, phaseAbort, ctx, helpers, selection }
 }
