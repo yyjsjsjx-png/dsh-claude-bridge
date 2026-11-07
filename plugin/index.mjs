@@ -49,6 +49,7 @@ import { createCompactionSummaryProjection } from '../src/compaction-summary-pro
 import { createResponseUsageProjection } from '../src/response-usage.mjs';
 import { createResponseTimingProjection } from '../src/response-timing.mjs';
 import { createModelObservationProjection } from '../src/model-observation.mjs';
+import { createModelRouteProjection } from '../src/model-route.mjs';
 import { installRemoteNativeTitles } from './remote-native-titles.mjs';
 import { createClientTimingRecorder } from '../src/client-timing-diagnostics.mjs';
 import { createModelCycleProjection, modelCycleRows } from '../src/model-cycle-projection.mjs';
@@ -148,6 +149,7 @@ let ClaudeBridgeService = (() => {
             ctx.sessionProjections.register(createResponseTimingProjection(z));
             ctx.sessionProjections.register(createModelCycleProjection(z));
             ctx.sessionProjections.register(createModelObservationProjection(z));
+            ctx.sessionProjections.register(createModelRouteProjection(z));
             const backend = this.backend;
             const adapter = new ClaudeCatalogAdapter(backend, ctx);
             this.catalogAdapter = adapter;

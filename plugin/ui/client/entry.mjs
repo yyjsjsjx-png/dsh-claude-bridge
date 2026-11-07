@@ -2,7 +2,7 @@
 export function createClient({ React, z, createPortal, useAnchoredPosition, useDismissOnOutsidePointer, MarkdownText,
   createStore, textError, createSettingsController, createModelController, createQuotaController,
   createPickerController, createMeterViews, createFormViews, createUsageProjectionBridge, createClientReceiveTiming,
-  createCompactionHistory, createCompactionSummaryRules }) {
+  createCompactionHistory, createCompactionSummaryRules, createModelRouteDisplay }) {
 const exports = {};
 const ABSENT_STATUS = Object.freeze({ getSnapshot: () => undefined, subscribe: () => () => {} });
 
@@ -98,7 +98,9 @@ exports.inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'remote', 'r
 exports.installUsageProjection = createUsageProjectionBridge({ React, getClientTiming: () => exports.clientReceiveTiming });
 
 exports.apply = async function apply(ctx) {
+  const installModelRoute = createModelRouteDisplay({ React });
   ctx.inject(['uiConversation'], ctx => {
+    if (ctx.uiConversation) ctx.effect(() => installModelRoute(ctx), '远程会话模型路由显示');
     if (ctx.uiConversation) ctx.effect(() => exports.installTranscriptOrder(ctx), '远程会话对话排序');
     if (ctx.uiConversation) ctx.effect(() => createCompactionHistory({ React, MarkdownText,
       summaryRules: createCompactionSummaryRules() })(ctx), '远程会话压缩记录');
@@ -217,6 +219,10 @@ exports.apply = async function apply(ctx) {
       return { sessionId, hooks: { modelDirectory: directory ?? ABSENT_STATUS } };
     },
   }, SessionModelBadge));
+  ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock', id: 'dsh-claude-model-route', order: 95,
+    inject: sessionId => ({ sessionId }),
+  }, installModelRoute.Marker));
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay', id: 'dsh-claude-session-picker',
     inject: () => ({ hooks: { dialog: picker.store }, dismiss: picker.close,

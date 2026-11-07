@@ -302,6 +302,7 @@ test('客户端在RPC挂载后安装唯一观察器，严格descriptor保留wire
   const tracker = { install(sessions) { assert.equal(sessions, ctx.sessions); order.push('install') },
     dispose() { disposed++ } }
   const client = createClient({ React: {}, createUsageProjectionBridge: () => () => () => {},
+    createModelRouteDisplay: () => Object.assign(() => () => {}, { Marker: () => null }),
     createClientReceiveTiming({ report }) { order.push('create'); report({ version: 1 }); return tracker },
     createSettingsController: () => ({ store, models: {}, readStatus() {} }),
     createQuotaController: () => ({ store }), createPickerController: () => ({ store }),

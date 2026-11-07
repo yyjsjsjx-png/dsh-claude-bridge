@@ -24,6 +24,7 @@ import { CLIENT_MODEL_TIMING_RECORD } from './model-cycle-projection.mjs'
 import { RESPONSE_TIMING_RECORD } from './response-timing.mjs'
 import { RESPONSE_USAGE_RECORD } from './response-usage.mjs'
 import { MODEL_OBSERVATION_RECORD } from './model-observation.mjs'
+import { MODEL_ROUTE_PROJECTION } from './model-route.mjs'
 import { isModelCatalogAuthFailure } from './catalog-cache-policy.mjs'
 import { ModelCatalogState, DisplayCatalogState } from './catalog-state.mjs'
 import { PlanUsageState } from './plan-usage-state.mjs'
@@ -1211,6 +1212,7 @@ export class BridgeBackend {
       writeStatus: patch => this.sessionStatus(agent, patch),
       writeProgress: value => this.helpers.appendPluginRecord(agent.session, RUN_PROGRESS_RECORD, value) })
     run.projection = new SdkProjection({ agent, helpers: this.helpers, runId, turn, step, model: selected.model,
+      modelRoute: this.ctx.sessionProjections?.stateOf?.(agent.session, MODEL_ROUTE_PROJECTION)?.open,
       onResponseRecord: (type, data) => this.recordResponseDiagnostic(run, type, data),
       onStarted: () => this.state.markStarted(agent.id),
       onProgress: event => run.progress.accept(event),

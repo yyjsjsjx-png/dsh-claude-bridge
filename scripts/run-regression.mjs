@@ -22,7 +22,7 @@ export const NATIVE_TESTS = Object.freeze([
   'test/preset-native.test.mjs', 'test/sdk-projection.test.mjs',
   'test/shell-native.test.mjs', 'test/workflow-depth-guard.test.mjs',
   'test/session-status.test.mjs', 'test/run-progress.test.mjs', 'test/compact-command.test.mjs',
-  'test/compaction-history.test.mjs',
+  'test/compaction-history.test.mjs', 'test/model-route.test.mjs',
   'test/compaction-summary-projection.test.mjs',
   'test/dsh-tool-execution.test.mjs',
   'test/standard-tool-results-native.test.mjs',
