@@ -61,6 +61,7 @@ test('只有远程子页显示请求配置与SDK返回事实，主会话即使�
 test('唯一dock标签复用实际pane标准hooks，不依赖header/root binding或替换factory且不加载目录', async () => {
   const store = { getSnapshot: () => ({}), subscribe: () => () => {} }
   const client = createClient({ React, createUsageProjectionBridge: () => () => {}, createMeterViews,
+    createModelRouteDisplay: () => Object.assign(() => () => {}, { Marker: () => null }),
     createSettingsController: () => ({ store, models: {}, async readStatus() {} }),
     createQuotaController: () => ({ store }), createPickerController: () => ({ store }),
     createFormViews: () => ({}) })

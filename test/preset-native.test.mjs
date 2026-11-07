@@ -293,6 +293,27 @@ export function apply(ctx) {
         assert.ok(mounted.assembly.sections.some(section => section.name === 'claude-bridge:preset-capabilities'));
       } finally { await mounted.scope.dispose(); }
     });
+    await t.test('实际标准预设的组件改名后，挂载结果与原声明等价', async () => {
+      const read = () => loadYaml(shipped.content, { schema: entryListSchema })
+        .flatMap(row => row.insert ?? []).find(row => row.id === 'preset-standard').config;
+      const summary = assembly => ({ tools: assembly.tools.map(tool => tool.name).sort(),
+        sections: assembly.sections.map(section => section.name).sort() });
+      const original = await mount(createRemoteClaudePreset(read()).plugins);
+      let expected;
+      try { expected = { ...summary(original.assembly), status: remotePresetStatus(ctx) }; }
+      finally { await original.scope.dispose(); }
+      const renamedRows = rows => rows.map(row => ({ ...row, id: `upstream-${row.id}`,
+        ...(row.group === true && Array.isArray(row.config) ? { config: renamedRows(row.config) } : {}) }));
+      const standard = read();
+      standard.plugins = renamedRows(standard.plugins);
+      const renamed = await mount(createRemoteClaudePreset(standard).plugins);
+      try {
+        assert.deepEqual(summary(renamed.assembly), { tools: expected.tools, sections: expected.sections });
+        assert.equal(remotePresetStatus(ctx).mode, expected.status.mode);
+        assert.deepEqual(remotePresetStatus(ctx).disabledComponents.map(row => row.reason),
+          expected.status.disabledComponents.map(row => row.reason));
+      } finally { await renamed.scope.dispose(); }
+    });
     await t.test('真实 PowerShell 启动失败经原生工具层保留可停止执行的错误码', async () => {
       const mounted = await mount(basicPlugins);
       const previous = ctx.shell.config;

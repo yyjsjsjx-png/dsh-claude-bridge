@@ -13,12 +13,13 @@ import { createClient } from '../plugin/ui/client/entry.mjs';
 import { createUsageProjectionBridge } from '../plugin/ui/client/usage-projection.mjs';
 import { createClientReceiveTiming } from '../plugin/ui/client/client-receive-timing.mjs';
 import { createCompactionHistory } from '../plugin/ui/client/compaction-history.mjs';
+import { createModelRouteDisplay } from '../plugin/ui/client/model-route-display.mjs';
 import { createCompactionSummaryRules } from '../src/compaction-summary-projection.mjs';
 import { COMPACTION_SUMMARY_RECORD, MAX_COMPACTION_SUMMARY_BYTES, MAX_COMPACTION_SUMMARY_JSON_BYTES, SUMMARY_CODES } from '../src/compaction-summary.mjs';
 
 const factories = [createStore, textError, createSettingsController, createModelController,
   createQuotaController, createPickerController, createMeterViews, createFormViews,
-  createClientReceiveTiming, createUsageProjectionBridge, createCompactionSummaryRules, createCompactionHistory, createClient];
+  createClientReceiveTiming, createUsageProjectionBridge, createCompactionSummaryRules, createCompactionHistory, createModelRouteDisplay, createClient];
 const target = new URL('../plugin/ui/client.js', import.meta.url);
 const normalize = source => source.replace(/\r\n/g, '\n');
 

@@ -9,6 +9,7 @@ import { createResponseTimingTracker, RESPONSE_TIMING_RECORD } from './response-
 import { observeResponseTiming } from './sdk-response-timing.mjs'
 import { MODEL_OBSERVATION_RECORD, sdkModelName } from './model-observation.mjs'
 import { appendCompactionSummary } from './compaction-recovery.mjs'
+import { createModelRouteTracker } from './model-route.mjs'
 
 // DSH followers require dense revisions across the attached Agent lifecycle,
 // including a stopped query followed by a fresh projection for the next turn.
@@ -16,7 +17,7 @@ const revisions = new WeakMap()
 
 /** Project SDK text/thinking into DSH's existing live and durable renderers. */
 export class SdkProjection {
-  constructor({ agent, helpers, turn, step, model, runId, timingNow, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText, onResponseRecord }) {
+  constructor({ agent, helpers, turn, step, model, runId, timingNow, modelRoute, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText, onResponseRecord }) {
     Object.assign(this, { agent, helpers, turn, step, model, onStarted, onUsage, onProgress, onModelStart, onFirstToken, onFirstText, onResponseRecord })
     this.runId = runId ?? `turn:${turn}:step:${step}`
     this.requestedModel = model
@@ -24,6 +25,8 @@ export class SdkProjection {
     this.timingNow = timingNow ?? (() => performance.now())
     this.responseTiming = createResponseTimingTracker({ runId: this.runId, turn, now: this.timingNow,
       onRecord: record => this.recordMetadata(RESPONSE_TIMING_RECORD, record) })
+    this.modelRoute = createModelRouteTracker({ runId: this.runId, open: modelRoute ?? null,
+      append: (type, data) => this.recordMetadata(type, data) })
     this.active = undefined
     this.blocks = new Map()
     this.committedToolIds = new Set()
@@ -126,6 +129,7 @@ export class SdkProjection {
           this.streamUsage.output_tokens = Math.max(previous.output_tokens, this.streamUsage.output_tokens)
         }
         this.streamUsageFinal = Number.isFinite(event.usage.output_tokens)
+        if (event.delta?.stop_reason === 'refusal' && message.parent_tool_use_id == null) this.modelRoute.refusalStop(response?.id)
         if (response) {
           response.usage = this.streamUsage
           response.final ||= this.streamUsageFinal
@@ -173,6 +177,9 @@ export class SdkProjection {
       }
     }
     if (message.type === 'assistant') {
+      if (message.parent_tool_use_id == null) this.modelRoute.frame({ uuid: message.uuid, responseId: message.message?.id ?? this.messageId,
+        toolCalls: Array.isArray(message.message?.content) ? message.message.content.filter(item => item?.type === 'tool_use').length : 0,
+        supersedes: message.supersedes, refusal: message.message?.stop_reason === 'refusal' })
       if (isNoResponsePlaceholder(message.message)) return
       const content = message.message?.content
       if (!Array.isArray(content)) return
@@ -337,6 +344,8 @@ export class SdkProjection {
       runId: this.runId, responseId: sdkModelName(response.id), turn: response.turn, step: response.step,
       requestedModel: this.requestedModel, actualModel: actual, source: actual === null ? null : source })
     response.recordedModel = actual
+    this.modelRoute.response({ requestedModel: this.requestedModel, actualModel: actual, responseId: response.id },
+      { turn: response.turn, step: response.step })
   }
 
   confirmedUsage() {
@@ -399,6 +408,8 @@ export class SdkProjection {
         ...Object.fromEntries(Object.entries(event).filter(([key]) => key !== 'type')),
       })
       if (message.uuid) this.compactionIds.add(message.uuid)
+    } else if (message.type === 'system' && ['model_refusal_fallback', 'model_refusal_no_fallback'].includes(message.subtype)) {
+      this.modelRoute.notice(message, { requestedModel: this.requestedModel }, { turn: this.turn, step: this.step })
     } else if (message.type === 'bridge_compaction_summary') {
       appendCompactionSummary(this.agent.session, message, this.helpers)
     } else if (message.type === 'bridge_context') {

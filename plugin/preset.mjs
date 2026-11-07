@@ -85,8 +85,54 @@ export function containRemotePreset(preset, { baseUrl, mode = 'full', reasons = 
   }] };
 }
 
+const PACKAGE = Object.freeze({
+  persona: '@deepseek-ai/dsh-persona',
+  instructions: '@deepseek-ai/dsh-agent-instructions',
+  planMode: '@deepseek-ai/dsh-plan-mode',
+  timeContext: '@deepseek-ai/dsh-time-context',
+  subagent: '@deepseek-ai/dsh-tool-subagent',
+  web: '@deepseek-ai/dsh-tool-web',
+});
+const COMPACTION_PACKAGE = /^@deepseek-ai\/dsh-(?:compaction(?:-|$)|command-compact$)/u;
+const SHELL_PACKAGE = /^@deepseek-ai\/dsh-tool-(bash|pwsh)$/u;
+
+function childRows(row) {
+  return row.group === true && Array.isArray(row.config) ? row.config : undefined;
+}
+
+function isPresetRow(row) {
+  return row !== null && typeof row === 'object' && !Array.isArray(row)
+    && typeof row.name === 'string' && row.name.length > 0;
+}
+
+function isSpawnRow(row) {
+  return row.name === PACKAGE.subagent && row.config?.provider === 'spawn';
+}
+
+function* walkRows(rows) {
+  for (const row of rows) {
+    if (!isPresetRow(row)) throw new TypeError('DSH 标准预设包含无效的插件条目。');
+    yield row;
+    const children = childRows(row);
+    if (children) yield* walkRows(children);
+  }
+}
+
+/** Downstream loading and status reports address these capabilities by stable ids. */
+function stableId(row) {
+  if (row.name === PACKAGE.persona) return 'persona';
+  if (row.name === PACKAGE.instructions) return 'agent-instructions';
+  if (row.name === PACKAGE.web) return 'tool-web';
+  if (isSpawnRow(row)) return 'tool-subagent';
+  const shell = SHELL_PACKAGE.exec(row.name)?.[1];
+  if (shell) return `tool-${shell}`;
+  if (childRows(row)?.some(child => isPresetRow(child) && isSpawnRow(child))) return 'delegation';
+  return row.id;
+}
+
 /**
- * Build from the verified shipped DSH standard preset, retaining its order.
+ * Build from the installed DSH standard preset, retaining its order. Components
+ * are recognized by package, so compatible moves and renames keep following it.
  * Plan mode cannot safely transition inside an SDK query; DSH transcript forks
  * are not SDK forks. Fresh children inherit the parent unless explicitly selected.
  */
@@ -96,56 +142,38 @@ export function createRemoteClaudePreset(standard, subagentFields) {
     throw new TypeError('需要 DSH 标准预设的完整插件列表。');
   }
 
-  const one = (rows, id) => {
-    const matches = rows.filter(row => row?.id === id);
-    if (matches.length !== 1) throw new TypeError(`DSH 标准预设的 ${id} 条目不唯一或不存在。`);
-    return matches[0];
-  };
-  const persona = one(standard.plugins, 'persona');
-  const planning = one(standard.plugins, 'planning');
-  const compaction = one(standard.plugins, 'compaction');
-  const delegation = one(standard.plugins, 'delegation');
-  if (persona.name !== '@deepseek-ai/dsh-persona' || typeof persona.config?.prefix !== 'string'
-    || planning.name !== 'cordis:group' || planning.group !== true
-    || compaction.name !== 'cordis:group' || compaction.group !== true
-    || delegation.name !== 'cordis:group' || delegation.group !== true
-    || !Array.isArray(delegation.config)) {
-    throw new TypeError('DSH 标准预设的身份、规划、压缩或委托配置不受支持。');
+  const rows = [...walkRows(standard.plugins)];
+  const personas = rows.filter(row => row.name === PACKAGE.persona);
+  if (personas.length !== 1 || typeof personas[0].config?.prefix !== 'string') {
+    throw new TypeError('DSH 标准预设的身份配置不受支持。');
   }
-  const spawn = one(delegation.config, 'tool-subagent');
-  const fork = one(delegation.config, 'tool-subagent-fork');
-  subagentFields ??= Object.hasOwn(spawn.config ?? {}, 'modelSelection')
+  const spawn = rows.find(isSpawnRow);
+  subagentFields ??= Object.hasOwn(spawn?.config ?? {}, 'modelSelection')
     ? { modelSelection: true, modelDiscovery: true } : { modelSelectionSettings: true };
-  if (spawn.name !== '@deepseek-ai/dsh-tool-subagent' || spawn.config?.provider !== 'spawn'
-    || fork.name !== '@deepseek-ai/dsh-tool-subagent' || fork.config?.provider !== 'fork'
-    || fork.config?.toolName !== 'subagent_fork') {
-    throw new TypeError('DSH 标准预设的子代理配置不受支持。');
-  }
 
-  const plugins = standard.plugins
-    .filter(entry => entry?.id !== 'compaction')
-    .map((entry) => {
-      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)
-        || typeof entry.name !== 'string' || entry.name.length === 0) {
-        throw new TypeError('DSH 标准预设包含无效的插件条目。');
-      }
-      // Keep Loader-owned expression values intact; JSON cloning loses !!js.
-      if (entry.id === 'persona') return { ...entry, config: { ...entry.config, prefix: REMOTE_PERSONA_PREFIX } };
-      if (entry.id === 'planning') return { ...entry, disabled: true };
-      if (entry.name === '@deepseek-ai/dsh-time-context') return { ...entry, disabled: true };
-      if (entry.id !== 'delegation') return { ...entry };
-      return {
-        ...entry,
-        config: entry.config.map((child) => {
-          if (child.id === 'tool-subagent-fork') return { ...child, disabled: true };
-          if (child.id === 'tool-subagent') {
-            return { ...child, config: remoteSubagentConfig(child.config, subagentFields) };
-          }
-          return { ...child };
-        }),
-      };
-    });
+  const adapt = (row) => {
+    if (row.id === 'compaction' || COMPACTION_PACKAGE.test(row.name)) return undefined;
+    const children = childRows(row);
+    const id = stableId(row);
+    // Keep Loader-owned expression values intact; JSON cloning loses !!js.
+    const entry = id === undefined ? { ...row } : { ...row, id };
+    if (row.id === 'planning' || row.name === PACKAGE.planMode
+      || (children?.length && children.every(child => child.name === PACKAGE.planMode))
+      || row.name === PACKAGE.timeContext) return { ...entry, disabled: true };
+    if (row.name === PACKAGE.persona) return { ...entry, config: { ...row.config, prefix: REMOTE_PERSONA_PREFIX } };
+    if (isSpawnRow(row)) return { ...entry, config: remoteSubagentConfig(row.config, subagentFields) };
+    // Forks and unknown providers have no verified remote execution path.
+    if (row.name === PACKAGE.subagent) return { ...entry, disabled: true };
+    if (!children) return entry;
+    const adapted = children.map(adapt).filter(Boolean);
+    return children.length > 0 && adapted.length === 0 ? undefined : { ...entry, config: adapted };
+  };
+  const plugins = standard.plugins.map(adapt).filter(Boolean);
   plugins.push(...remoteCommands());
+
+  // A collision would make a stable id address the wrong component downstream.
+  const ids = [...walkRows(plugins)].map(row => row.id).filter(id => id !== undefined);
+  if (new Set(ids).size !== ids.length) throw new TypeError('DSH 标准预设的组件 id 不唯一。');
 
   return {
     id: CLAUDE_PRESET,
