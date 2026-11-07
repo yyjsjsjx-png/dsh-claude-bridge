@@ -91,6 +91,56 @@ test('远程预设关闭计划与分叉，允许独立子代理显式选型', ()
   assert.throws(() => createRemoteClaudePreset({ plugins: [{ id: 'bad' }] }), TypeError);
 });
 
+test('标准预设组件改名或移动后，远程预设仍按包名转换并保留新组件', () => {
+  const standard = { plugins: [
+    { id: 'identity', name: '@deepseek-ai/dsh-persona', config: { prefix: 'fixture', extra: true } },
+    { id: 'project-rules', name: '@deepseek-ai/dsh-agent-instructions', config: { maxBytes: 1 } },
+    { id: 'shell', name: '@deepseek-ai/dsh-tool-pwsh' },
+    { id: 'modes', name: 'cordis:group', group: true, config: [
+      { id: 'plan', name: '@deepseek-ai/dsh-plan-mode', config: { section: 'x' } },
+    ] },
+    { id: 'context', name: 'cordis:group', group: true, config: [
+      { id: 'basic', name: '@deepseek-ai/dsh-compaction-basic' },
+      { id: 'command', name: '@deepseek-ai/dsh-command-compact' },
+    ] },
+    { id: 'mixed', name: 'cordis:group', group: true, config: [
+      { id: 'pruner', name: '@deepseek-ai/dsh-compaction-tool-result-pruner' },
+      { id: 'future-context', name: 'future-context' },
+    ] },
+    { id: 'agents', name: 'cordis:group', group: true, isolate: { workflowEngine: true }, config: [
+      { id: 'spawn', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'spawn', toolName: 'subagent' } },
+      { id: 'fork', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'fork', toolName: 'subagent_fork' } },
+      { id: 'future-provider', name: '@deepseek-ai/dsh-tool-subagent', config: { provider: 'future' } },
+    ] },
+    { id: 'browse', name: '@deepseek-ai/dsh-tool-web', config: { fetch: true } },
+    { id: 'future-tool', name: 'future-tool', config: { kept: true } },
+  ] };
+  const before = structuredClone(standard);
+  const preset = createRemoteClaudePreset(standard, { modelSelection: {}, modelDiscovery: {} });
+  assert.deepEqual(preset.plugins.map(row => row.id), ['persona', 'agent-instructions', 'tool-pwsh', 'modes', 'mixed',
+    'delegation', 'tool-web', 'future-tool', 'claude-sdk-compact', 'claude-sdk-recovery']);
+  const row = id => preset.plugins.find(item => item.id === id);
+  assert.deepEqual(row('persona').config, { prefix: 'You are a coding agent powered by Claude through the remote Claude Agent SDK.', extra: true });
+  assert.equal(row('modes').disabled, true);
+  assert.deepEqual(row('mixed').config.map(item => item.id), ['future-context']);
+  assert.deepEqual(row('delegation').isolate, { workflowEngine: true });
+  const children = row('delegation').config;
+  assert.deepEqual(children.map(item => [item.id, item.disabled]), [['tool-subagent', undefined], ['fork', true], ['future-provider', true]]);
+  assert.deepEqual(children[0].config, { provider: 'spawn', toolName: 'subagent', modelSelection: true, modelDiscovery: true });
+  assert.deepEqual(row('future-tool'), standard.plugins[8]);
+  assert.deepEqual(standard, before);
+});
+
+test('上游移除可选分组时继续跟随，缺少身份或组件 id 冲突才退回', () => {
+  const persona = { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'fixture' } };
+  assert.deepEqual(createRemoteClaudePreset({ plugins: [persona, { id: 'tool-fs', name: 'tool-fs' }] }).plugins.map(row => row.id),
+    ['persona', 'tool-fs', 'claude-sdk-compact', 'claude-sdk-recovery']);
+  assert.throws(() => createRemoteClaudePreset({ plugins: [{ id: 'tool-fs', name: 'tool-fs' }] }), TypeError);
+  assert.throws(() => createRemoteClaudePreset({ plugins: [persona, { ...persona, id: 'second' }] }), TypeError);
+  assert.throws(() => createRemoteClaudePreset({ plugins: [persona, { id: 'persona', name: 'custom' }] }), /id 不唯一/);
+  assert.throws(() => createRemoteClaudePreset({ plugins: [persona, { id: 'group', name: 'cordis:group', group: true, config: [{ id: 'bad' }] }] }), TypeError);
+});
+
 test('远程预设仅按原生 time-context 包名禁用，改名 id 仍关闭且不改变标准预设', () => {
   const standard = { plugins: [
     { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: 'fixture' } },
