@@ -89,8 +89,8 @@ v0.2.20 的隔离验收使用 Haiku 5.5／low 完成原生手动压缩、Hook �
 | --- | --- |
 | 当前维护的 DSH Desktop | **[0.2.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.1)**；默认使用实际推送的较新版本，不承诺旧桌面继续兼容 |
 | 兼容代码来源提交 | 新版 `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`；旧版 `b830ec950faba0a46dda564be3e2d854afed94f1` |
-| Claude Agent SDK（仅服务器） | `0.3.314` |
-| Claude Code（仅服务器） | `2.1.314` |
+| Claude Agent SDK（仅服务器） | `0.3.319` |
+| Claude Code（仅服务器） | `2.1.319` |
 | Node.js（服务器或开发启动脚本） | `>=24.9` |
 
 插件包含构建好的运行文件。目前围绕 DSH 桌面端实际推送的 **0.2.2-rc.1** 维护；已验证范围和限制见 [功能与兼容性](docs/compatibility-inventory.md)。运行时按实际工厂与工具接口选择驱动，不按版本字符串或安装版源码摘要拒绝加载；同时检查 RPC 参数、原生会话回放协议，并读取安装版标准预设。接口检查通过不代表所有行为完全兼容，也不构成对所有旧版或未来版本的支持承诺。

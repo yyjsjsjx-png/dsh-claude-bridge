@@ -11,10 +11,12 @@
 | 客户端插件 | 使用已发布正式版；是否需要升级以服务端声明的最低版本为准 |
 | DSH Desktop | 当前适配 `0.2.2-rc.1`，保留 `0.2.1-rc.5` 回归；其他版本按接口能力检查，仍需实际确认 |
 | 服务器 Node.js | `>=24.9`，须准备可独立执行的 Node 和 npm |
-| Claude Agent SDK | 锁定 `0.3.314` |
-| 官方 Claude Code CLI | 锁定 `2.1.314` |
+| Claude Agent SDK | 锁定 `0.3.319` |
+| 官方 Claude Code CLI | 锁定 `2.1.319` |
 
 这些是本项目的兼容范围，不表示它们是上游最新版。不要为升级本插件顺便升级 SDK 或 CLI；其他版本需要重新验证。
+
+缓存有效期覆盖仅对桥接已验证的 CLI／SDK 配对开放。覆盖随每次查询传入，分别设置主会话与子代理的 TTL；跟随 Claude Code 时沿用 CLI 的默认策略。CLI 支持的取值和优先级见 [Claude Code 环境变量](https://code.claude.com/docs/en/env-vars)。
 
 ### 桥接程序版本与最低客户端要求
 
@@ -79,18 +81,18 @@ cd /home/bridge/dsh-claude-bridge/remote
 npm ci --omit=optional --ignore-scripts
 ```
 
-安装后可在 `remote` 目录用 `npm ls @anthropic-ai/claude-agent-sdk --depth=0` 核对 SDK 为 `0.3.314`。本机 DSH 客户端不需要安装这些依赖。
+安装后可在 `remote` 目录用 `npm ls @anthropic-ai/claude-agent-sdk --depth=0` 核对 SDK 为 `0.3.319`。本机 DSH 客户端不需要安装这些依赖。
 
 ## 官方 CLI 与独立登录
 
 官方原生安装器支持指定版本，具体方式见 [Claude Code 官方安装说明](https://code.claude.com/docs/en/setup#install-a-specific-version)。全新独立服务用户可执行：
 
 ```sh
-curl -fsSL https://claude.ai/install.sh | bash -s 2.1.314
-"$HOME/.local/share/claude/versions/2.1.314" --version
+curl -fsSL https://claude.ai/install.sh | bash -s 2.1.319
+"$HOME/.local/share/claude/versions/2.1.319" --version
 ```
 
-本项目默认直接使用上述带版本的二进制路径，不使用可能指向新版的 `claude` 快捷入口；如果实际安装路径不同，在服务中设置 `BRIDGE_CLAUDE_PATH`。先确认输出以 `2.1.314` 开头。固定版本无法取得时停止部署并明确记录缺口，不把其他版本当作实测版本。
+本项目默认直接使用上述带版本的二进制路径，不使用可能指向新版的 `claude` 快捷入口；如果实际安装路径不同，在服务中设置 `BRIDGE_CLAUDE_PATH`。先确认输出以 `2.1.319` 开头。固定版本无法取得时停止部署并明确记录缺口，不把其他版本当作实测版本。
 
 在部署根目录、仍以服务用户创建独立私有目录：
 
@@ -105,7 +107,7 @@ chmod 700 private sessions claude-config observability
 
 ```sh
 cd /home/bridge/dsh-claude-bridge
-CLAUDE_CONFIG_DIR="$PWD/claude-config" DISABLE_AUTOUPDATER=1 "$HOME/.local/share/claude/versions/2.1.314"
+CLAUDE_CONFIG_DIR="$PWD/claude-config" DISABLE_AUTOUPDATER=1 "$HOME/.local/share/claude/versions/2.1.319"
 ```
 
 只完成登录即可退出，不必发送聊天请求。使用你本人、具备 Claude Code 使用权限的 claude.ai 订阅账号登录。当前版本只接受这一种登录方式；API Key、Console、云服务商或网关登录暂未开放（维护者尚无测试环境，已列入后续计划），检测到这些方式时服务会以 `AUTH_METHOD_UNSUPPORTED` 明确报错，不会尝试使用。官方流程见 [认证说明](https://code.claude.com/docs/en/authentication)。不要把授权 URL、登录令牌、认证文件或账号信息发给任何人，也不要复制到客户端。
@@ -131,7 +133,7 @@ stat -c '%U %a %n' private/service-token
 | `BRIDGE_PORT` | 回环服务端口，默认 `18944` |
 | `BRIDGE_TOKEN_FILE` | 私有桥接口令文件的绝对路径 |
 | `BRIDGE_CLAUDE_PATH` | 可选，固定版本 CLI 的绝对路径 |
-| `BRIDGE_CLAUDE_VERSION` | 默认 `2.1.314`；升级须重新验证兼容性 |
+| `BRIDGE_CLAUDE_VERSION` | 默认 `2.1.319`；升级须重新验证兼容性 |
 | `BRIDGE_MAX_BUDGET_USD` | 可选，明确配置正数时才向 SDK 设置美元费用估算上限；不配置或留空默认不设额外美元预算。不是订阅剩余额度 |
 | `BRIDGE_WORKER_PATH` | 可选，独立 worker 的绝对路径 |
 
@@ -139,7 +141,7 @@ worker 仅接收必要的白名单配置，不继承桥接口令；CLI/SDK 版�
 
 v0.1.4 及更早的服务器代码曾默认设置每轮 0.15 美元上限，这是开发阶段遗留配置，可能在已输出正文后仍以 `BUDGET_EXHAUSTED` 结束。从 v0.1.5 起默认不再向 SDK 传入 `maxBudgetUsd`。升级时等待活动任务结束，更新远端源码后重启自己的 systemd 服务；保留 `sessions`、`claude-config`、`private` 和已有运行依赖。若单元或环境文件曾明确配置 `BRIDGE_MAX_BUDGET_USD`，须同时移除该配置才会停用它。仅更新 DSH 插件不能修复仍运行旧代码的服务器。
 
-命令行入口 `remote/server.mjs` 不提供 host 参数，也不读取 `BRIDGE_HOST`，始终监听 `127.0.0.1`。不要将修改该环境变量当成开放公网的方式。上表列出的配置通过 systemd 的 `Environment=` 设置；默认 CLI 路径不同时，额外增加 `Environment=BRIDGE_CLAUDE_PATH=/自己的绝对路径/2.1.314`。
+命令行入口 `remote/server.mjs` 不提供 host 参数，也不读取 `BRIDGE_HOST`，始终监听 `127.0.0.1`。不要将修改该环境变量当成开放公网的方式。上表列出的配置通过 systemd 的 `Environment=` 设置；默认 CLI 路径不同时，额外增加 `Environment=BRIDGE_CLAUDE_PATH=/自己的绝对路径/2.1.319`。
 
 也可在前台先核对服务能否监听，使用另一终端检查后按 Ctrl+C 退出，再交给 systemd：
 

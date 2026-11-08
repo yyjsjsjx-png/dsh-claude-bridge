@@ -9,8 +9,8 @@ import { createWorkerHandlers, parseServiceBudget } from './runtime.mjs'
 import { createWorkerObservability } from './observability-worker.mjs'
 
 const execFileAsync = promisify(execFile)
-const expectedSdkVersion = '0.3.314'
-const defaultCliVersion = '2.1.314'
+const expectedSdkVersion = '0.3.319'
+const defaultCliVersion = '2.1.319'
 let stage = 'config'
 
 class StartupError extends Error {

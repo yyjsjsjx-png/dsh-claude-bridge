@@ -78,7 +78,8 @@ export function createWorkerHandlers({ sdk, zod, sessionRoot, configDir, cliPath
   if (!Number.isSafeInteger(inputConfirmationTimeoutMs) || inputConfirmationTimeoutMs < 1 || inputConfirmationTimeoutMs > 120_000) throw new TypeError('用户输入确认等待时间无效')
 
   // These pinned executables are the combination whose per-query TTL overrides were inspected.
-  const promptCacheTtlSupported = cliVersion === '2.1.314' && sdkVersion === '0.3.314'
+  const promptCacheTtlSupported = (cliVersion === '2.1.319' && sdkVersion === '0.3.319')
+    || (cliVersion === '2.1.314' && sdkVersion === '0.3.314')
   const compactionSummariesSupported = sdk.HOOK_EVENTS?.includes('PostCompact') === true
   const activeSessions = new Set()
   const activeRuns = new Map()
