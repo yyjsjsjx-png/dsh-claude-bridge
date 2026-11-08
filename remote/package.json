@@ -1,6 +1,6 @@
 {
   "name": "dsh-claude-bridge-remote",
-  "version": "0.2.23",
+  "version": "0.2.24",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,7 +10,7 @@
     "minimumClientVersion": null
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.314",
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
     "ws": "8.22.0",
     "zod": "4.6.7"
   }

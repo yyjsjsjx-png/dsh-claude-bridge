@@ -530,8 +530,8 @@ async function fixture(t, queryImplementation, overrides = {}) {
   }
   const config = {
     sdk, zod, sessionRoot: join(root, 'sessions'), configDir: '/isolated/claude-config',
-    cliPath: '/desktop/.local/share/claude/versions/2.1.314', homeDir: '/desktop',
-    sdkVersion: '0.3.314', cliVersion: '2.1.314', acquireLock,
+    cliPath: '/desktop/.local/share/claude/versions/2.1.319', homeDir: '/desktop',
+    sdkVersion: '0.3.319', cliVersion: '2.1.319', acquireLock,
     authReader: { async read() { state.authReads++; return { loggedIn: true, authMethod: 'claude.ai' } } },
     ...workerOverrides,
   }
@@ -1039,9 +1039,12 @@ test('缓存有效期覆盖只作用于对应 Query，默认与不支持的服�
   const invalid = await f.worker.handlers.query({ ...f.params, runId: 'ttl-invalid', promptCacheTtl: '2h' }, f.context)
   assert.equal(invalid.code, 'INVALID_PROMPT_CACHE_TTL')
 
-  const older = await fixture(t, async function* () { assert.fail('不支持的覆盖不能派发') }, { cliVersion: '2.1.293' })
-  assert.equal((await older.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.promptCacheTtl, undefined)
-  const refused = await older.worker.handlers.query({ ...older.params, promptCacheTtl: '1h' }, older.context)
+  const previous = await fixture(t, async function* () { assert.fail('初始化不能派发查询') },
+    { sdkVersion: '0.3.314', cliVersion: '2.1.314' })
+  assert.equal((await previous.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.promptCacheTtl, true)
+  const mixed = await fixture(t, async function* () { assert.fail('不支持的覆盖不能派发') }, { cliVersion: '2.1.314' })
+  assert.equal((await mixed.worker.handlers.initialize({ protocolVersion: 1 })).capabilities.promptCacheTtl, undefined)
+  const refused = await mixed.worker.handlers.query({ ...mixed.params, promptCacheTtl: '1h' }, mixed.context)
   assert.equal(refused.code, 'PROMPT_CACHE_TTL_UNSUPPORTED')
 })
 
